@@ -6906,6 +6906,22 @@ async fn usb_send_speech(
 }
 
 #[tauri::command]
+fn usb_bubble_pixels_ready(app: tauri::AppHandle,
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>, ready: bool) {
+    usb_manager.set_bubble_renderer(if ready { Some(Arc::new(move |event| {
+        let _ = app.emit("usb-bubble-render", event);
+    })) } else { None });
+}
+
+#[tauri::command]
+async fn usb_send_bubble_pixels(usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    frame: usb_serial::BubbleFrame) -> Result<(), String> {
+    let manager = usb_manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.send_bubble_pixels(frame))
+        .await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn usb_send_command(
     usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
     command: String,
@@ -10812,6 +10828,8 @@ pub fn run() {
             wifi_tcp_status,
             wifi_tcp_send,
             usb_send_speech,
+            usb_bubble_pixels_ready,
+            usb_send_bubble_pixels,
             usb_send_command,
             usb_audio_capture_control,
             usb_get_status,
