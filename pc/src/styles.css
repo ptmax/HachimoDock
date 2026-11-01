@@ -13888,48 +13888,60 @@ select:focus-visible {
   align-items: center;
   gap: var(--space-2);
   flex-shrink: 0;
-  font-size: var(--font-size-sm);
-  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
   white-space: nowrap;
 }
 
-.channel-row__approval-timeout-select {
+.channel-row__approval-timeout-control {
   position: relative;
   display: inline-flex;
   align-items: center;
 }
 
-.channel-row__approval-timeout-select > svg {
-  position: absolute;
-  left: var(--space-2);
-  color: var(--text-soft);
-  pointer-events: none;
+.channel-row__approval-timeout-trigger {
+  min-height: var(--control-height-sm);
+  padding: 4px 12px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: var(--font-weight-semibold);
 }
 
-.channel-row__approval-timeout select {
-  appearance: none;
-  -webkit-appearance: none;
-  min-height: var(--control-height-sm);
-  padding: 0 var(--space-3) 0 30px;
+.channel-row__approval-timeout-trigger > svg {
+  color: var(--text-soft);
+}
+
+.channel-row__approval-timeout-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  display: grid;
+  min-width: 112px;
+  padding: 4px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
   background: var(--surface);
+  box-shadow: var(--shadow-popover, 0 12px 32px rgba(34, 26, 20, 0.18));
+}
+
+.channel-row__approval-timeout-option {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
   color: var(--text);
-  font-family: inherit;
-  font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-semibold);
-  line-height: 1;
-  cursor: pointer;
+  font-size: 12px;
+  font-weight: var(--font-weight-medium);
+  text-align: left;
+  white-space: nowrap;
 }
 
-.channel-row__approval-timeout select:hover:not(:disabled) {
-  border-color: var(--line-strong);
+.channel-row__approval-timeout-option:hover,
+.channel-row__approval-timeout-option.is-selected {
   background: var(--surface-muted);
-}
-
-.channel-row__approval-timeout select:disabled {
-  opacity: var(--disabled-opacity);
-  cursor: default;
 }
 
 .channel-row__follow {

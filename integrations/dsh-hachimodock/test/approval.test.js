@@ -262,3 +262,15 @@ test('the large never sentinel never expires and still accepts a decision', asyn
   assert.equal(decided.status, 200)
   assert.equal(await outcome, 'allowed-once')
 })
+
+test('native cancel/deny carries the decision outcome for the device cue', async (t) => {
+  const { bridge, ctx, session, sse } = await fixtures(t)
+  const outcome = answer(ctx, createApprovalRequest(session))
+  const prompt = await sse.next()
+  assert.equal(bridge.server.cancelApproval(prompt.data.requestId, 'rejected'), true)
+  const cancelled = await sse.next()
+  assert.equal(cancelled.event, 'approval-cancel')
+  assert.equal(cancelled.data.requestId, prompt.data.requestId)
+  assert.equal(cancelled.data.outcome, 'rejected')
+  assert.equal(await outcome, 'unavailable')
+})

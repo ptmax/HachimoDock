@@ -2616,8 +2616,15 @@ bool pet_p4_handle_line(
     const char *request_id = json_string(payload, "requestId");
     if (request_id[0]
         && strcmp(request_id, state->approval_request_id) == 0) {
+      const char *outcome = json_string(payload, "outcome");
       pet_p4_state_clear_approval(state);
-      (void) pet_p4_audio_play_event_cue("permission_expired");
+      if (strcmp(outcome, "allowed-once") == 0) {
+        (void) pet_p4_audio_play_event_cue("permission_approved");
+      } else if (strcmp(outcome, "rejected") == 0) {
+        (void) pet_p4_audio_play_event_cue("permission_denied");
+      } else {
+        (void) pet_p4_audio_play_event_cue("permission_expired");
+      }
       state->last_update_ms += 1;
     }
     return true;

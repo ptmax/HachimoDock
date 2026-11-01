@@ -2536,6 +2536,11 @@ def test_p4_dsh_approval_modal_is_single_shot_and_bounded():
         in approval_handler
     )
     assert 'send_protocol_ack(send_line, ctx, "approval/request"' in approval_handler
+    assert 'const char *outcome = json_string(payload, "outcome");' in protocol
+    assert 'pet_p4_audio_play_event_cue("permission_approved")' in protocol
+    assert 'pet_p4_audio_play_event_cue("permission_denied")' in protocol
+    assert 'pet_p4_audio_play_event_cue("permission_expired")' in protocol
+
     deadline_source = protocol[
         protocol.index("static unsigned long long approval_deadline_ms("):
         protocol.index("static void send_topic_payload(")

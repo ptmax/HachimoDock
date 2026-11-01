@@ -195,13 +195,11 @@ window.__ModuleLoader__.load({
           try { dismissNativeApproval() } catch { /* best effort */ }
         }
         source.addEventListener('approval-expired', onApprovalExpired)
-        source.addEventListener('approval-cancel', onApprovalExpired)
         ctx.effect(() => () => {
           source.removeEventListener('approval-resolved', onResolved)
           source.removeEventListener('voice-insert', onVoiceInsert)
           source.removeEventListener('voice-submit', onVoiceSubmit)
           source.removeEventListener('approval-expired', onApprovalExpired)
-          source.removeEventListener('approval-cancel', onApprovalExpired)
           source.close()
         }, 'hachimodock: device approval dismissal')
       },
