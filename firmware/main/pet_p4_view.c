@@ -58,7 +58,10 @@ static bool should_wait_for_session_card(const pet_p4_runtime_state_t *state) {
   if (strcmp(state->active_agent, "deepseek-harness") == 0 || is_dsh_state_event(state)) {
     return false;
   }
-  return status_from_state(state) != PET_P4_VIEW_STATUS_IDLE;
+  /* Never replace an active lifecycle with the idle "休息中" placeholder just
+   * because a session card has not arrived. This affected DSH and, after
+   * switching, Claude/Codex too. */
+  return false;
 }
 
 static const char *conversation_hint(const char *conversation_state) {

@@ -227,6 +227,8 @@ static void restore_idle_session_view(
   const char *event
 ) {
   if (!state || state->session_queue_count != 0) return;
+  /* Active lifecycle from any agent must survive an empty session snapshot. */
+  if (lifecycle_is_active(runtime_lifecycle(state))) return;
   /* The bridge has no DSH session snapshot; an empty snapshot must not erase
    * the working/tool/done state carried by state/deepseek-harness. */
   if (strcmp(state->active_agent, "deepseek-harness") == 0

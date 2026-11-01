@@ -471,7 +471,16 @@ async function injectToSession(bridge, args) {
       forward({ type: 'error', code: 'agent-unsupported', message: 'agent does not expose followup()' })
       return
     }
+    // Capture the pre-followup state: real and fake agents switch to running
+    // synchronously inside followup(). A turn already in progress can take
+    // minutes; device PTT must be accepted into the queue immediately rather
+    // than holding the bridge HTTP request until that turn ends.
+    const wasRunning = agent.status === 'running' || agent.running === true
     agent.followup(message)
+    if (wasRunning) {
+      forward({ type: 'done', sessionId: target.id, tokens: 0, queued: true })
+      return
+    }
     await waitForAgentIdle(bridge, agent, args.signal)
     forward({ type: 'done', sessionId: target.id, tokens: tokens > 0 ? tokens : mirroredChars })
   } catch (error) {
