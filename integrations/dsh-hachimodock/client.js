@@ -10,19 +10,7 @@
 window.__ModuleLoader__.load({
   id: '@hachimodock/dsh-bridge',
   factory(require) {
-    const React = require('react')
     const EVENT_URL = 'http://127.0.0.1:17892/events?role=client'
-    let composerActions = null
-
-    function VoiceDock(props) {
-      React.useEffect(() => {
-        composerActions = props.inputActions ?? null
-        return () => {
-          if (composerActions === props.inputActions) composerActions = null
-        }
-      }, [props.inputActions])
-      return null
-    }
 
     function findComposer() {
       const candidates = Array.from(document.querySelectorAll('[contenteditable="true"]'))
@@ -33,15 +21,6 @@ window.__ModuleLoader__.load({
     }
 
     function insertIntoComposer(text, attempt = 0) {
-      if (composerActions && typeof composerActions.captureInsertion === 'function'
-          && typeof composerActions.insertText === 'function') {
-        try {
-          const span = composerActions.captureInsertion()
-          if (composerActions.insertText(text, span)) return true
-        } catch {
-          /* fall through to the DOM adapter */
-        }
-      }
       const composer = findComposer()
       if (!composer) {
         if (attempt < 20) setTimeout(() => insertIntoComposer(text, attempt + 1), 150)
@@ -76,14 +55,6 @@ window.__ModuleLoader__.load({
     }
 
     function submitComposer() {
-      if (composerActions && typeof composerActions.submit === 'function') {
-        try {
-          composerActions.submit()
-          return true
-        } catch {
-          /* fall through to the DOM adapter */
-        }
-      }
       const composer = findComposer()
       if (!composer) return false
       composer.focus()
@@ -139,13 +110,6 @@ window.__ModuleLoader__.load({
     return {
       apply(ctx) {
         if (typeof EventSource !== 'function') return
-        if (ctx.slots && typeof ctx.slots.inject === 'function') {
-          ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
-            name: 'conversation.composer.dock',
-            id: 'hachimodock-voice-dock',
-            order: 999,
-          }, VoiceDock))
-        }
         const source = new EventSource(EVENT_URL)
         const onResolved = (event) => {
           try {

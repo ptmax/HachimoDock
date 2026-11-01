@@ -30,10 +30,7 @@
     },
     "client": {
       "platform": "web",
-      "immediately": true,
-      "inject": [
-        "@deepseek-ai/dsh-client-ui-conversation"
-      ]
+      "immediately": true
     }
   },
   "exports": {
