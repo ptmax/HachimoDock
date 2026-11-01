@@ -12,28 +12,11 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const EVENT_URL = 'http://127.0.0.1:17892/events?role=client'
-    const DEBUG_URL = 'http://127.0.0.1:17892/client-debug'
     let composerActions = null
-    function debug(stage, extra) {
-      try {
-        fetch(DEBUG_URL, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ stage, ...extra }),
-        }).catch(() => {})
-      } catch {
-        /* diagnostics must never affect the UI */
-      }
-    }
 
     function VoiceDock(props) {
       React.useEffect(() => {
         composerActions = props.inputActions ?? null
-        debug('actions-captured', {
-          hasActions: Boolean(props.inputActions),
-          hasInsert: Boolean(props.inputActions && props.inputActions.insertText),
-          hasSubmit: Boolean(props.inputActions && props.inputActions.submit),
-        })
         return () => {
           if (composerActions === props.inputActions) composerActions = null
         }
@@ -54,10 +37,7 @@ window.__ModuleLoader__.load({
           && typeof composerActions.insertText === 'function') {
         try {
           const span = composerActions.captureInsertion()
-          if (composerActions.insertText(text, span)) {
-            debug('insert', { path: 'inputActions' })
-            return true
-          }
+          if (composerActions.insertText(text, span)) return true
         } catch {
           /* fall through to the DOM adapter */
         }
@@ -99,13 +79,11 @@ window.__ModuleLoader__.load({
       if (composerActions && typeof composerActions.submit === 'function') {
         try {
           composerActions.submit()
-          debug('submit', { path: 'inputActions' })
           return true
         } catch {
           /* fall through to the DOM adapter */
         }
       }
-      debug('submit', { path: 'dom' })
       const composer = findComposer()
       if (!composer) return false
       composer.focus()

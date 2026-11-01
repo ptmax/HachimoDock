@@ -1189,15 +1189,33 @@ fn release_completed_voice_for_desktop_task(board: &str) -> Result<(), &'static 
 const DSH_BRIDGE_URL: &str = "http://127.0.0.1:17892";
 
 fn dsh_voice_post(path: &str, body: &serde_json::Value) -> Result<(), String> {
-    let url = format!("{DSH_BRIDGE_URL}{path}");
-    let client = lan_http_client(Duration::from_secs(2))?;
-    let response = client
-        .post(&url)
-        .json(body)
-        .send()
-        .map_err(|error| format!("DSH voice request failed: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("DSH voice request returned HTTP {}", response.status()));
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    const DSH_PORT: u16 = 17892;
+    let payload = body.to_string();
+    let address = ("127.0.0.1", DSH_PORT)
+        .to_socket_addrs()
+        .map_err(|error| format!("DSH voice address failed: {error}"))?
+        .next()
+        .ok_or_else(|| "DSH voice address unavailable".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(800))
+        .map_err(|error| format!("DSH voice connect failed: {error}"))?;
+    stream.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    stream.set_write_timeout(Some(Duration::from_millis(800))).ok();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{DSH_PORT}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("DSH voice write failed: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("DSH voice read failed: {error}"))?;
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        return Err(format!("DSH voice HTTP failed: {}", response.lines().next().unwrap_or("empty")));
     }
     Ok(())
 }
@@ -1439,29 +1457,20 @@ fn stage_device_voice_final(
                 "VISIBLE_COMPOSER_UNAVAILABLE",
             );
         } else {
-            realtime_chat_log::record(
-                &context.utterance_id,
-                "device_voice_timing",
-                serde_json::json!({
-                    "stage": "dsh_branch",
-                    "agentId": context.target.agent_id,
-                    "sessionId": context.target.session_id,
-                    "composerMode": device_voice_composer_mode(&context),
-                }),
-            );
             context.draft_ready.store(true, Ordering::SeqCst);
             emit_device_voice_transcript(&context, "draft_ready", revision, &text, true, true, "");
             if context.target.agent_id == "deepseek-harness" {
-                let insert_result = insert_dsh_voice_draft(&text);
-                realtime_chat_log::record(
-                    &context.utterance_id,
-                    "device_voice_timing",
-                    serde_json::json!({
-                        "stage": "dsh_draft_insert",
-                        "ok": insert_result.is_ok(),
-                        "error": insert_result.as_ref().err().cloned().unwrap_or_default(),
-                    }),
-                );
+                if let Err(error) = insert_dsh_voice_draft(&text) {
+                    report_device_voice_delivery_failure(
+                        &context,
+                        revision,
+                        &text,
+                        &error,
+                        "DSH 输入框草稿插入失败",
+                        "DSH_COMPOSER_DRAFT_FAILED",
+                    );
+                    return;
+                }
             }
         }
         return;
@@ -1648,17 +1657,7 @@ fn confirm_pending_device_voice_draft(topic: &str, payload: &serde_json::Value) 
                 cancel_device_voice_context(&context, "DSH voice target changed before submit");
                 return true;
             }
-            let submit_result = submit_dsh_voice_composer(&device_voice_session_id(&context));
-            realtime_chat_log::record(
-                &context.utterance_id,
-                "device_voice_timing",
-                serde_json::json!({
-                    "stage": "dsh_submit",
-                    "ok": submit_result.is_ok(),
-                    "error": submit_result.as_ref().err().cloned().unwrap_or_default(),
-                }),
-            );
-            if let Err(error) = submit_result {
+            if let Err(error) = submit_dsh_voice_composer(&device_voice_session_id(&context)) {
                 report_device_voice_delivery_failure(
                     &context,
                     revision,

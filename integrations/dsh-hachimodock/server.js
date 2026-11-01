@@ -539,44 +539,17 @@ class BridgeServer {
       if (method !== 'GET') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
       return this.handleEvents(req, res, url)
     }
-    if (path === '/client-debug') {
-      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
-      const body = await readJsonBody(req).catch(() => ({}))
-      try {
-        require('node:fs').appendFileSync('/tmp/hachimodock-client-debug.jsonl', JSON.stringify(body) + '\n')
-      } catch {
-        /* diagnostic log is best effort */
-      }
-      return sendJson(res, 200, { ok: true })
-    }
     if (path === '/voice/draft' || path === '/voice/submit') {
       if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
       const body = await readJsonBody(req).catch(() => ({}))
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
       if (path === '/voice/draft') {
         if (!text.trim()) return sendJson(res, 400, { ok: false, error: 'invalid-text' })
-        try {
-          require('node:fs').appendFileSync('/tmp/hachimodock-voice-draft-requests.jsonl', JSON.stringify({ ts: Date.now(), text }) + '\n')
-        } catch {
-          /* diagnostic log is best effort */
-        }
         this.publish('voice-insert', { text })
       } else {
         this.publish('voice-submit', { sessionId: typeof body?.sessionId === 'string' ? body.sessionId : '' })
       }
       return sendJson(res, 200, { ok: true })
-    }
-    if (path === '/prototype/submit') {
-      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
-      this.publish('voice-submit', {})
-      return sendJson(res, 200, { ok: true, published: 'voice-submit' })
-    }
-    if (path === '/prototype/insert') {
-      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
-      const body = await readJsonBody(req).catch(() => ({}))
-      const text = typeof body?.text === 'string' ? body.text : 'HACHIMO COMPOSER PROTOTYPE'
-      this.publish('voice-insert', { text: text.slice(0, 2000) })
-      return sendJson(res, 200, { ok: true, published: 'voice-insert' })
     }
     if (path === '/approval/decision') {
       if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
