@@ -239,7 +239,7 @@ wins over config; config wins over the defaults.
 |---|---|---|---|
 | `port` | `HACHIMODOCK_DSH_PORT` | `17892` | Loopback port |
 | `approvalTimeoutMs` | `HACHIMODOCK_DSH_APPROVAL_TIMEOUT_MS` | `30000` | Fail-closed approval wait |
-| `approvalFallback` | `HACHIMODOCK_DSH_APPROVAL_FALLBACK` | `unavailable` | `unavailable` (contract) or `delegate` (`next()` when no bridge is attached) |
+| `approvalFallback` | `HACHIMODOCK_DSH_APPROVAL_FALLBACK` | `unavailable` in the package; Desktop bundle sets `delegate` | `delegate` keeps the normal DSH approval UI when no HachimoDock `/events` subscriber is attached; `unavailable` is the strict headless fail-closed stance |
 
 The server always binds `127.0.0.1`; there is no option to bind elsewhere.
 Additional internal option: `injectTimeoutMs` / `HACHIMODOCK_DSH_INJECT_TIMEOUT_MS`
