@@ -95,11 +95,12 @@ export function isDeviceSessionTargetUnique(selectedSession, sessions) {
 
 export function formatDeviceSessionContent(session, title = "") {
   if (normalizeText(session?.state).toLowerCase() === "stopped") return "已停止";
-  const liveContent = normalizeText(session?.displayContent);
+  const liveContent = flattenMarkdownForDevice(normalizeText(session?.displayContent));
   if (liveContent) return clampUtf8Text(liveContent, 383);
-  const summary = normalizeText(session?.summary);
-  if (!summary || summary.startsWith("<recommended_plugins>")) return "";
-  if (summary === normalizeText(title)) return "";
+  const rawSummary = normalizeText(session?.summary);
+  if (!rawSummary || rawSummary.startsWith("<recommended_plugins>")) return "";
+  const summary = flattenMarkdownForDevice(rawSummary);
+  if (!summary || summary === normalizeText(title)) return "";
   return clampUtf8Text(summary, 383);
 }
 

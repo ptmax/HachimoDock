@@ -89,6 +89,13 @@ test("P4 card content prefers live text, suppresses plugin payloads, and respect
   );
 });
 
+test("device body flattens Markdown before transport", () => {
+  assert.equal(
+    formatDeviceSessionContent({ state: "working", displayContent: "## 小字\n**粗体**" }, "Task"),
+    "小字\n粗体",
+  );
+});
+
 test("stopped sessions render an explicit stopped body", () => {
   assert.equal(
     formatDeviceSessionContent({ state: "stopped", displayContent: "old reply" }, "Build"),

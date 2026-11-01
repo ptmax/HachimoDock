@@ -2413,16 +2413,22 @@ static void handle_session_current(pet_p4_runtime_state_t *state, const cJSON *p
           candidate.terminal_until_ms = 0;
         }
       } else if (lifecycle_is_terminal(candidate.state)) {
+        bool stopped_transition = lifecycle_is(candidate.state, "stopped");
         copy_text(
           candidate.state,
           sizeof(candidate.state),
           lifecycle_is(candidate.state, "error")
             ? "error"
-            : lifecycle_is(candidate.state, "stopped") ? "stopped" : "done"
+            : stopped_transition ? "stopped" : "done"
         );
         if (candidate.transition_revision > 0) {
           if (revision_is_same) {
-            if (!lifecycle_is_terminal(previous->state)
+            /* A stopped snapshot can share a revision with the active snapshot
+             * on the wire. It is still an explicit user stop and must not be
+             * discarded as stale, otherwise the card keeps its spinner. */
+            if (stopped_transition && lifecycle_is_active(previous->state)) {
+              candidate.terminal_until_ms = now_ms + PET_P4_DONE_HOLD_MS;
+            } else if (!lifecycle_is_terminal(previous->state)
                 || previous->terminal_until_ms <= now_ms) {
               candidate = *previous;
             } else {
