@@ -2427,6 +2427,7 @@ static void handle_session_current(pet_p4_runtime_state_t *state, const cJSON *p
              * on the wire. It is still an explicit user stop and must not be
              * discarded as stale, otherwise the card keeps its spinner. */
             if (stopped_transition && lifecycle_is_active(previous->state)) {
+              (void) pet_p4_audio_play_event_cue("session_terminated");
               candidate.terminal_until_ms = now_ms + PET_P4_DONE_HOLD_MS;
             } else if (!lifecycle_is_terminal(previous->state)
                 || previous->terminal_until_ms <= now_ms) {
@@ -2528,6 +2529,8 @@ static void handle_session_current(pet_p4_runtime_state_t *state, const cJSON *p
     copy_text(state->current_session_notice, sizeof(state->current_session_notice), notice);
     state->session_notice_until_ms = now_ms + PET_P4_SESSION_NOTICE_MS;
   }
+  /* Content-only session updates must still wake the render task. */
+  state->last_update_ms += 1;
 }
 
 static bool handle_widget_topic(

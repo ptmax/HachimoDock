@@ -601,7 +601,7 @@ fn validate_p4_session_transition_metadata(
     }
     let terminal = matches!(
         state,
-        "done" | "error" | "failed" | "complete" | "completed"
+        "done" | "error" | "failed" | "complete" | "completed" | "stopped"
     );
     if terminal_remaining_ms > 0 && !terminal {
         return Err("非终态设备会话不能携带终态保留时间".to_string());
@@ -837,6 +837,19 @@ fn pc_audio_board_binding() -> &'static Mutex<PcAudioBoardBinding> {
 fn p4_session_binding() -> &'static Mutex<P4SessionBinding> {
     static BINDING: OnceLock<Mutex<P4SessionBinding>> = OnceLock::new();
     BINDING.get_or_init(|| Mutex::new(P4SessionBinding::default()))
+}
+
+/// Last time the foreground WebView successfully requested a P4 binding.
+/// The native feed takes over only after this goes stale, so foreground and
+/// background never race to own the same device card.
+static P4_FRONTEND_SESSION_SYNC_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn unix_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn active_device_voice_context() -> &'static Mutex<Option<Arc<DeviceVoiceContext>>> {
@@ -4115,6 +4128,10 @@ fn set_p4_session_binding_blocking(
     input: SetP4SessionBindingInput,
     usb_manager: usb_serial::UsbSerialManager,
 ) -> Result<P4SessionBinding, String> {
+    P4_FRONTEND_SESSION_SYNC_MS.store(
+        unix_epoch_ms(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let board_device_id = input.board_device_id.trim().to_string();
     let agent_id = normalize_agent_id(&input.agent_id)
         .ok_or_else(|| "请选择一个受支持的 Agent".to_string())?;
@@ -4213,15 +4230,9 @@ fn set_p4_session_binding_blocking(
     let mut binding = p4_session_binding()
         .lock()
         .map_err(|error| error.to_string())?;
-    if should_preserve_exact_auto_binding(
-        &binding,
-        &board_device_id,
-        &agent_id,
-        &session_id,
-        input.auto_follow,
-    ) {
-        return Ok(binding.clone());
-    }
+    // Do not return early here. Even when the auto-follow target is preserved,
+    // the P4 still needs the refreshed session queue; returning skipped the
+    // entire session/current USB packet and left the device bubble stale.
     let target_changed = binding.board_device_id != board_device_id
         || binding.agent_id != agent_id
         || binding.session_id != session_id
@@ -10173,6 +10184,138 @@ fn forward_usb_speech_updates(
 }
 
 /// Keep the board's host lease alive independently from state and speech scans.
+fn start_native_session_feed(usb_manager: usb_serial::UsbSerialManager) {
+    thread::spawn(move || {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(1800))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("[p4-session] native feed client unavailable: {error}");
+                return;
+            }
+        };
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            let now = unix_epoch_ms();
+            let last_frontend = P4_FRONTEND_SESSION_SYNC_MS
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if now.saturating_sub(last_frontend) < 7_000 {
+                continue;
+            }
+            let binding = match p4_session_binding().lock() {
+                Ok(binding) => binding.clone(),
+                Err(_) => continue,
+            };
+            if binding.board_device_id.is_empty() || binding.agent_id.is_empty() {
+                continue;
+            }
+            let status = usb_manager.status();
+            if !status.connected || status.board_device_id != binding.board_device_id {
+                continue;
+            }
+            let response = match client
+                .get("http://127.0.0.1:8181/agent/sessions")
+                .query(&[("agentId", binding.agent_id.as_str())])
+                .send()
+                .and_then(|response| response.error_for_status())
+            {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            let body: serde_json::Value = match response.json() {
+                Ok(body) => body,
+                Err(_) => continue,
+            };
+            let rows = body
+                .get("sessions")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut sessions = Vec::new();
+            let mut active_ids = Vec::new();
+            for row in rows.iter().take(8) {
+                let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let state = row
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("idle")
+                    .to_ascii_lowercase();
+                let is_active = matches!(
+                    state.as_str(),
+                    "working" | "thinking" | "tool_running" | "active" | "speaking"
+                );
+                if id.is_empty() || !is_active {
+                    continue;
+                }
+                let title = row
+                    .get("name")
+                    .or_else(|| row.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let content = row
+                    .get("displayContent")
+                    .or_else(|| row.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if title.is_empty() && content.is_empty() {
+                    continue;
+                }
+                let revision = row
+                    .get("transitionRevision")
+                    .or_else(|| row.get("statusUpdatedAt"))
+                    .or_else(|| row.get("lastModified"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                active_ids.push(id.to_string());
+                sessions.push(serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "content": content,
+                    "state": state,
+                    "transitionRevision": revision,
+                    "terminalRemainingMs": 0,
+                }));
+            }
+            let selected = if !binding.session_id.is_empty()
+                && sessions.iter().any(|session| session["id"] == binding.session_id.as_str())
+            {
+                binding.session_id.clone()
+            } else {
+                sessions
+                    .first()
+                    .and_then(|session| session["id"].as_str())
+                    .unwrap_or("auto")
+                    .to_string()
+            };
+            let title = sessions
+                .iter()
+                .find(|session| session["id"] == selected.as_str())
+                .and_then(|session| session["title"].as_str())
+                .unwrap_or("");
+            let payload = serde_json::json!({
+                "sessionId": selected,
+                "title": title,
+                "index": 0,
+                "count": sessions.len(),
+                "sessions": sessions,
+                "agentId": binding.agent_id,
+                "activeSessionIds": active_ids,
+                "displayEnabled": true,
+                "notice": "",
+            });
+            let _ = usb_manager.send_to_board(
+                &binding.board_device_id,
+                "session/current",
+                &payload,
+            );
+        }
+    });
+}
+
 fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
@@ -10653,6 +10796,7 @@ pub fn run() {
         eprintln!("[usb-identity] desktop id unavailable: {}", error);
     }
     start_usb_host_heartbeat(usb_manager.clone());
+    start_native_session_feed(usb_manager.clone());
     start_usb_state_forwarder(usb_manager.clone());
     dsh_approval::start(usb_manager.clone());
     }
@@ -10671,6 +10815,19 @@ pub fn run() {
                 return Ok(());
             }
             desktop_window::fit(app.handle(),true);
+            // Keep the dashboard session feed alive when the macOS WebView is
+            // occluded and its JS timers are throttled. The frontend reacts to
+            // this heartbeat by refreshing the local Agent Bus snapshot.
+            let session_heartbeat_app = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if session_heartbeat_app
+                    .emit("agent-session-heartbeat", ())
+                    .is_err()
+                {
+                    break;
+                }
+            });
             let bundled=app.path().resource_dir()?.join("builtin-clawpkgs");
             #[cfg(debug_assertions)]
             let bundled=if bundled.is_dir(){bundled}else{PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../builtin-clawpkgs")};
