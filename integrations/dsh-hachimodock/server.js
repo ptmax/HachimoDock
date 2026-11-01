@@ -555,6 +555,11 @@ class BridgeServer {
       const text = typeof body?.text === 'string' ? body.text.slice(0, 4000) : ''
       if (path === '/voice/draft') {
         if (!text.trim()) return sendJson(res, 400, { ok: false, error: 'invalid-text' })
+        try {
+          require('node:fs').appendFileSync('/tmp/hachimodock-voice-draft-requests.jsonl', JSON.stringify({ ts: Date.now(), text }) + '\n')
+        } catch {
+          /* diagnostic log is best effort */
+        }
         this.publish('voice-insert', { text })
       } else {
         this.publish('voice-submit', { sessionId: typeof body?.sessionId === 'string' ? body.sessionId : '' })
