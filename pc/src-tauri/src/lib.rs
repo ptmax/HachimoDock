@@ -110,6 +110,7 @@ mod reference_image;
 mod realtime_chat_log;
 mod usb_audio;
 mod usb_serial;
+mod wifi_transport;
 mod voice_chat_settings;
 mod volcengine_asr;
 
@@ -2529,6 +2530,15 @@ fn handle_incoming_usb_message(
     topic: String,
     payload: serde_json::Value,
 ) {
+    handle_incoming_device_message(emitter, topic, payload, "usb");
+}
+
+fn handle_incoming_device_message(
+    emitter: &tauri::AppHandle,
+    topic: String,
+    payload: serde_json::Value,
+    transport: &str,
+) {
     resolve_button_config_ack(&topic, &payload);
     if topic=="app/event"{component_app::device_event(&payload);return;}
     music_player::observe_capture(&topic,&payload);
@@ -2568,7 +2578,7 @@ fn handle_incoming_usb_message(
         if topic != "audio/chunk" {
             let _ = emitter.emit(
                 "usb-message",
-                serde_json::json!({"topic": topic, "payload": payload}),
+                serde_json::json!({"topic": topic, "payload": payload, "transport": transport}),
             );
         }
         if let Some(event) = relay_event {
@@ -2672,7 +2682,7 @@ fn handle_incoming_usb_message(
 
     let _ = emitter.emit(
         "usb-message",
-        serde_json::json!({"topic": topic, "payload": payload}),
+        serde_json::json!({"topic": topic, "payload": payload, "transport": transport}),
     );
 
     if confirm_pending_device_voice_draft(&topic, &payload) {
@@ -6392,6 +6402,61 @@ async fn usb_send_state(
     payload: serde_json::Value,
 ) -> Result<(), String> {
     usb_manager.send_state(&source, &payload)
+}
+
+/// Send an arbitrary JSON topic to the connected board. Used by the optional
+/// Wi-Fi provisioning/status panel; USB remains the provisioning path.
+#[tauri::command]
+async fn usb_send_topic(
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    topic: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    usb_manager.send(&topic, &payload)
+}
+
+/// Optional PC-side Wi-Fi TCP transport. The firmware sends a hello line on
+/// connect; this layer keeps the TCP socket alive and forwards JSONL messages
+/// through the same `usb-message` event shape used by the USB bridge.
+#[tauri::command]
+async fn wifi_tcp_connect(
+    app: tauri::AppHandle,
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+    ip: String,
+    port: Option<u16>,
+) -> Result<wifi_transport::WifiConnectionStatus, String> {
+    let emitter = app.clone();
+    let handler: wifi_transport::WifiMessageHandler =
+        std::sync::Arc::new(move |topic: &str, payload: &serde_json::Value| {
+            // Reuse the shared device pipeline so session/state listeners see
+            // Wi-Fi messages, tagged with their actual transport.
+            handle_incoming_device_message(&emitter, topic.to_string(), payload.clone(), "wifi");
+        });
+    transport.connect(&ip, port.unwrap_or(3232), handler)
+}
+
+#[tauri::command]
+async fn wifi_tcp_disconnect(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+) -> Result<(), String> {
+    transport.disconnect();
+    Ok(())
+}
+
+#[tauri::command]
+async fn wifi_tcp_status(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+) -> Result<wifi_transport::WifiConnectionStatus, String> {
+    Ok(transport.status())
+}
+
+#[tauri::command]
+async fn wifi_tcp_send(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+    topic: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    transport.send(&topic, &payload)
 }
 
 #[tauri::command]
@@ -10248,6 +10313,7 @@ pub fn run() {
             Ok(())
         })
         .manage(usb_manager)
+        .manage(wifi_transport::WifiTransport::new())
         .invoke_handler(tauri::generate_handler![
             reference_image::reference_image_mount,
             reference_image::reference_image_action,
@@ -10327,6 +10393,11 @@ pub fn run() {
             usb_connect,
             usb_disconnect,
             usb_send_state,
+            usb_send_topic,
+            wifi_tcp_connect,
+            wifi_tcp_disconnect,
+            wifi_tcp_status,
+            wifi_tcp_send,
             usb_send_speech,
             usb_send_command,
             usb_audio_capture_control,
@@ -12327,7 +12398,7 @@ mod tests {
     fn openclaw_cli_detection_stays_ready_with_or_without_bridge_identity() {
         for has_status_bridge_identity in [true, false] {
             let (detected, status, _) =
-                openclaw_detection(Some("/usr/local/bin/openclaw"), has_status_bridge_identity);
+                openclaw_detection(Some("/tmp/openclaw"), has_status_bridge_identity);
             assert!(detected);
             assert_eq!(status, "ready");
         }
@@ -13920,4 +13991,6 @@ mod tests {
         assert_eq!(read_live_managed_pid(&pid_path), None);
         assert!(!pid_path.exists());
     }
+
+
 }
