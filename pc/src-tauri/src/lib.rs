@@ -1417,11 +1417,6 @@ fn stage_device_voice_final(
         } else {
             context.draft_ready.store(true, Ordering::SeqCst);
             emit_device_voice_transcript(&context, "draft_ready", revision, &text, true, true, "");
-            // DSH has no visible composer/draft UI. Match the expected
-            // push-to-talk behavior: release submits immediately.
-            if context.target.agent_id == "deepseek-harness" {
-                submit_device_voice_via_agent_bus(context, text.clone());
-            }
         }
         return;
     };
