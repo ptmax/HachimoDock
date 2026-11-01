@@ -245,6 +245,21 @@ The server always binds `127.0.0.1`; there is no option to bind elsewhere.
 Additional internal option: `injectTimeoutMs` / `HACHIMODOCK_DSH_INJECT_TIMEOUT_MS`
 (default 10 minutes) bounds one `/inject` stream.
 
+## Client half is part of the same bundle
+
+The package has both halves:
+
+- `index.js` + `dsh-bridge.js` + `server.js` — **Host** (Plugins page row `dsh-bridge`);
+- `client.js` — **Client/Web UI** half, declared by `dsh.client` in `package.json`.
+
+The DSH Plugins page therefore shows **one** row, `dsh-bridge`; there is no
+separate `client` row. After a DSH restart the Web UI loads `client.js` and it
+opens `/events?role=client` from the renderer. On macOS this is visible as a
+DeepSeek Harness Helper (Renderer) TCP connection to `127.0.0.1:17892`.
+
+If that renderer connection is absent, the client half did not load; restart
+DSH and re-select/reinstall the bundle.
+
 ## Installation
 
 > **Do not install this package into a running DSH profile as part of
