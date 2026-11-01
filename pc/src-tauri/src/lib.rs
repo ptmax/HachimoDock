@@ -10870,6 +10870,41 @@ pub fn run() {
                 let _ = get_npm_global_bin();
                 let _ = get_full_shell_path();
             });
+            let auto_flash_arg = std::env::args()
+                .skip_while(|arg| arg != "--flash")
+                .nth(1);
+            let auto_flash_path = std::env::var("HACHIMO_AUTO_FLASH").ok().or(auto_flash_arg);
+            if let Some(firmware_path) = auto_flash_path {
+                let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("queued {}\n", firmware_path));
+                let flash_manager = usb_for_auto.clone();
+                let flash_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let status = flash_manager.status();
+                        if status.connected && status.runtime.eq_ignore_ascii_case("esp-p4") {
+                            eprintln!("[auto-flash] flashing {} to {}", firmware_path, status.board_device_id);
+                            let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("flashing {} to {}\n", firmware_path, status.board_device_id));
+                            match run_usb_firmware_update(
+                                flash_handle.clone(),
+                                flash_manager.clone(),
+                                PathBuf::from(&firmware_path),
+                                status.board_device_id.clone(),
+                            ).await {
+                                Ok(result) => {
+                                    eprintln!("[auto-flash] complete: {:?}", result);
+                                    let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("complete: {:?}\n", result));
+                                }
+                                Err(error) => {
+                                    eprintln!("[auto-flash] failed: {error}");
+                                    let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("failed: {error}\n"));
+                                }
+                            }
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                });
+            }
             let handle = app.handle().clone();
             start_usb_auto_connect(usb_for_auto, handle.clone());
             start_p4_ready_migration(handle.clone());
