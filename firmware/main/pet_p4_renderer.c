@@ -935,13 +935,14 @@ static int utf8_text_width(const char *text, int byte_limit, int scale) {
 }
 
 static bool device_markdown_marker(uint32_t codepoint) {
-  return codepoint == '#' || codepoint == '*' || codepoint == '_'
+  return codepoint == '#' || codepoint == '*'
     || codepoint == '`' || codepoint == '~' || codepoint == '|' || codepoint == '>';
 }
 
 static void draw_lvgl_glyph(uint32_t codepoint, uint32_t next_codepoint, int x, int y, uint16_t color, int scale) {
   lv_font_glyph_dsc_t glyph = {0};
   if (codepoint == 0xFE0F || codepoint == 0x200D || device_markdown_marker(codepoint)) return;
+  if (codepoint < 0x20) return;
   if (!scaled_glyph_dsc(codepoint, next_codepoint, &glyph, &scale)) {
     if (scale < 1) scale = 1;
     if (codepoint == 0x00B7) {
@@ -1088,6 +1089,7 @@ static void draw_lvgl_glyph_medium(
 ) {
   lv_font_glyph_dsc_t glyph = {0};
   if (codepoint == 0xFE0F || codepoint == 0x200D || device_markdown_marker(codepoint)) return;
+  if (codepoint < 0x20) return;
   if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
     if (codepoint == 0x00B7) {
       fill_ellipse(x + 9, y + 13, 2, 2, color);
@@ -1139,6 +1141,11 @@ static const char *draw_text_line_medium(
     const char *next_cursor = cursor;
     uint32_t codepoint = utf8_next(&next_cursor);
     uint32_t next_codepoint = utf8_peek(next_cursor);
+    if (codepoint == '\n' || codepoint == '\r') {
+      cursor = next_cursor;
+      while (*cursor == '\n' || *cursor == '\r') cursor += 1;
+      return cursor;
+    }
     int glyph_advance = medium_glyph_width(codepoint, next_codepoint);
     int advance = glyph_advance > 0 ? glyph_advance + 1 : 0;
     if (used_px + advance + reserve_px > max_px) break;
@@ -3166,16 +3173,10 @@ static void draw_session_queue(
     g_session_overlay_cache_valid = false;
     return;
   }
-  for (unsigned i = 0; i < state->session_queue_count && i < PET_P4_SESSION_QUEUE_MAX; i++)
-    session_text(&state->session_queue[i], now_ms, NULL);
-  uint64_t signature = session_overlay_signature(state);
-  if ((!g_session_overlay_cache_valid || signature != g_session_overlay_signature)
-      && !rebuild_session_overlay_cache(state, now_ms, signature)) {
-    draw_session_queue_uncached(state, now_ms, true);
-    return;
-  }
-  copy_session_overlay_cache();
-  draw_session_queue_working_markers(state, now_ms);
+  /* Direct-draw experiment: bypass the cached overlay while validating the
+   * zero-to-one session transition that intermittently fails to appear. */
+  g_session_overlay_cache_valid = false;
+  draw_session_queue_uncached(state, now_ms, true);
 }
 
 typedef struct {

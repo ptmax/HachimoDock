@@ -13,11 +13,35 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { startBubblePixelService } from "./lib/bubble-pixels.js";
+import {
+  TEXT_RENDERING_CHANGE_EVENT,
+  textRenderingModeForTransport,
+} from "./lib/text-rendering-settings.js";
 
 if (isTauri() && getCurrentWindow().label === "main") {
-  // Local MiSans experiment: bubble text is flattened on the PC and rendered
-  // entirely by the P4; do not start the host text-image service.
-  void startBubblePixelService;
+  let stopHostTextRendering = null;
+  let syncing = false;
+  const syncHostTextRendering = async () => {
+    if (syncing) return;
+    syncing = true;
+    try {
+      const useApp = textRenderingModeForTransport("usb") === "app";
+      if (useApp && !stopHostTextRendering) {
+        stopHostTextRendering = await startBubblePixelService({ listen, invoke });
+      } else if (!useApp && stopHostTextRendering) {
+        const stop = stopHostTextRendering;
+        stopHostTextRendering = null;
+        stop();
+      }
+    } catch (error) {
+      stopHostTextRendering = null;
+      console.warn("Device text rendering unavailable; retaining client rendering.", error);
+    } finally {
+      syncing = false;
+    }
+  };
+  void syncHostTextRendering();
+  window.addEventListener(TEXT_RENDERING_CHANGE_EVENT, syncHostTextRendering);
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(

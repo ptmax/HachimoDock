@@ -12,6 +12,14 @@ export function flattenMarkdownForDevice(value) {
   const lines = [];
   let fence = "";
   for (let line of source.split("\n")) {
+    // A complete fence on one line is a code span, not an opening block.
+    // ```123``` must become 123 instead of an empty body.
+    const inlineFence = line.match(/^\s*(`{3,}|~{3,})([\s\S]*?)\1\s*$/);
+    if (inlineFence) {
+      const code = inlineFence[2].trim();
+      if (code) lines.push(code);
+      continue;
+    }
     const boundary = line.match(FENCE);
     if (boundary) {
       if (!fence) { fence = boundary[1][0]; continue; }
@@ -29,13 +37,16 @@ export function flattenMarkdownForDevice(value) {
     line = line.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
     line = line.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
     line = line.replace(/`+([^`]*?)`+/g, "$1");
-    line = line.replace(/(\*\*|__)(.*?)\1/g, "$2");
-    line = line.replace(/(\*|_)(.*?)\1/g, "$2");
+    // Underscores are ordinary identifier characters in device text
+    // (foo_bar_baz). Only star emphasis is flattened; underscore emphasis is
+    // intentionally left untouched so snake_case survives.
+    line = line.replace(/\*\*(.*?)\*\*/g, "$1");
+    line = line.replace(/\*(.*?)\*/g, "$1");
     line = line.replace(/~~(.*?)~~/g, "$1");
     line = line.replace(/<[^>]*>/g, "");
     line = line.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "");
     // Plain-device mode intentionally drops residual Markdown punctuation.
-    line = line.replace(/[#*_`~|>]/g, "");
+    line = line.replace(/[#*`~|>]/g, "");
     line = line.replace(/^---+\s*$/, "");
     lines.push(line.replace(/\s+$/, ""));
   }

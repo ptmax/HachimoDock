@@ -48,6 +48,10 @@ import { buildUsageHelp } from "./lib/usage-help.js";
 import PersonaVoiceModal from "./PersonaVoiceModal.jsx";
 import { useToast } from "./shell/ToastStack.jsx";
 import DeviceStatusBar from "./dashboard/DeviceStatusBar.jsx";
+import {
+  loadTextRenderingSettings,
+  toggleTextRenderingSetting,
+} from "./lib/text-rendering-settings.js";
 import ChannelMatrixCard from "./dashboard/ChannelMatrixCard.jsx";
 import BoardButtonPanel from "./dashboard/BoardButtonPanel.jsx";
 import VoiceAssistantPanel, { buildVoiceSummary, formatVoiceSessionOption } from "./dashboard/VoiceAssistantPanel.jsx";
@@ -786,6 +790,10 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   const { deviceVoiceFlow } = useDeviceVoiceRouter({
     onAudioActivity: onDeviceVoiceAudioActivity,
   });
+  const [textRenderingSettings, setTextRenderingSettings] = useState(loadTextRenderingSettings);
+  const toggleTextRendering = useCallback((key) => {
+    setTextRenderingSettings((current) => toggleTextRenderingSetting(current, key));
+  }, []);
   const [voiceConfig, setVoiceConfig] = useState(loadVoiceConfigFromStorage);
   const voiceConfigRef = useRef(voiceConfig);
   // 实时对话键是否已绑到某个按键（提示文案用；真正的按键事件由 Rust 处理）
@@ -1518,6 +1526,8 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
           onUnbind={onUnbindClick}
           onDeviceReturnHome={onDeviceReturnHome}
           onForceSyncAppearance={onForceSyncAppearance}
+          textRenderingSettings={textRenderingSettings}
+          onToggleTextRendering={toggleTextRendering}
           onUpdateFirmware={usb.connected && usb.runtime === P4_RUNTIME_ID
             ? () => {
               setFirmwareTargetBoardDeviceId(usb.boardDeviceId || "");
