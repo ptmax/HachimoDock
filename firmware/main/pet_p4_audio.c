@@ -947,6 +947,9 @@ void pet_p4_audio_process(
   const pet_p4_asset_entry_t *entry = index >= 0 && index < state->asset_catalog.count
     ? &state->asset_catalog.entries[index] : NULL;
   const char *family = pet_p4_system_cue_family(lifecycle) ? lifecycle : entry ? entry->family : "";
+  /* Temporary quiet-hours mute: normal completion must not wake the user.
+   * Stop/error/waiting/permission event cues remain available. */
+  if (strcmp(family, "done") == 0) return;
   /* Status cues do not depend on a matching animation being installed. */
   if (entry && strcmp(entry->family, family)) entry = NULL;
   if (g_playback_asset_revision == state->asset_revision
