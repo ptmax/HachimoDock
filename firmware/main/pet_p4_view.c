@@ -45,6 +45,12 @@ static bool should_wait_for_session_card(const pet_p4_runtime_state_t *state) {
       || state->session_voice_active) {
     return false;
   }
+  /* DSH has no P4 session-queue snapshot; its state/tool events are the
+   * authoritative status source. Do not replace working/tool_running with the
+   * "休息中" fallback. */
+  if (strcmp(state->active_agent, "deepseek-harness") == 0) {
+    return false;
+  }
   return status_from_state(state) != PET_P4_VIEW_STATUS_IDLE;
 }
 

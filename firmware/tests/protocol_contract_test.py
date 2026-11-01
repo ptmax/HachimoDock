@@ -2460,6 +2460,16 @@ def test_windows_tooling_forces_utf8_and_ascii_paths():
     assert '$env:USERPROFILE\\.platformio' not in root_readme
     assert '.tooling/' in gitignore
 
+def test_p4_dsh_state_is_not_replaced_by_session_card_fallback():
+    """DSH 没有 P4 会话队列快照；state/deepseek-harness 到达后不能被
+    should_wait_for_session_card 改写成“休息中”。"""
+    view = read_required("main/pet_p4_view.c")
+    assert 'strcmp(state->active_agent, "deepseek-harness") == 0' in view
+    assert 'return false;' in view
+    runner = read_required("tests/protocol_contract_test.py")
+    assert "test_p4_dsh_state_is_not_replaced_by_session_card_fallback" in runner
+
+
 def test_p4_dsh_approval_modal_is_single_shot_and_bounded():
     """R5 DSH 审批上屏：PC 下发 approval/request，设备只显示模态卡片并通过
     配置的确认/取消键回传一次 approval/decision；过期 fail-closed，重复 requestId 去重。"""
@@ -2681,6 +2691,7 @@ if __name__ == "__main__":
         test_p4_hardware_inputs_are_debounced_persistent_and_configurable,
         test_p4_device_ptt_stream_is_validated_and_relayed_by_pc,
         test_p4_gt911_touch_and_local_lifecycle_are_product_integrated,
+        test_p4_dsh_state_is_not_replaced_by_session_card_fallback,
         test_p4_dsh_approval_modal_is_single_shot_and_bounded,
     ]
     for test in tests:
