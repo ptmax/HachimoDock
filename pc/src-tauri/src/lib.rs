@@ -2873,7 +2873,14 @@ const BRIDGE_LAUNCH_AGENT_LABEL: &str = "com.petmanager.status-bridge";
 const BRIDGE_WINDOWS_STARTUP_SCRIPT_NAME: &str = "Pet Manager Status Bridge.cmd";
 const USB_STATE_MAX_AGE_MS: u64 = 10 * 60 * 1000;
 const USB_BRIDGE_SCAN_MAX_FILES: usize = 64;
-const KNOWN_USB_STATE_SOURCES: [&str; 5] = ["claude-code", "codex", "openclaw", "mimocode", "workbuddy"];
+const KNOWN_USB_STATE_SOURCES: [&str; 6] = [
+    "claude-code",
+    "codex",
+    "openclaw",
+    "mimocode",
+    "deepseek-harness",
+    "workbuddy",
+];
 #[cfg(windows)]
 const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
 
@@ -8985,6 +8992,7 @@ fn normalize_agent_id(value: &str) -> Option<String> {
         "claude" | "claude-code" => Some("claude-code".to_string()),
         "openclaw" => Some("openclaw".to_string()),
         "mimo" | "mimo-code" | "mimocode" => Some("mimocode".to_string()),
+        "deepseek-harness" | "deepseek" | "dsh" => Some("deepseek-harness".to_string()),
         "workbuddy" | "work-buddy" => Some("workbuddy".to_string()),
         "copilot" | "copilot-cli" => Some("copilot-cli".to_string()),
         "gemini" | "gemini-cli" => Some("gemini-cli".to_string()),
@@ -9452,7 +9460,12 @@ fn score_usb_state(state: &str) -> i32 {
 
 fn score_usb_source(source: &str) -> i32 {
     match source {
+        // Codex keeps the long-standing top slot. DeepSeek Harness is a
+        // first-class local agent routed through the same session bus, so it
+        // sits just below Codex and above the other integrations; this only
+        // breaks exact state/ts ties between sources.
         "codex" => 30,
+        "deepseek-harness" => 25,
         "claude-code" => 20,
         "mimocode" => 15,
         "workbuddy" => 15,
@@ -9507,6 +9520,7 @@ fn usb_source_display_name(source: &str) -> String {
         "claude" | "claude-code" => "Claude".to_string(),
         "openclaw" => "OpenClaw".to_string(),
         "mimo" | "mimo-code" | "mimocode" => "MiMoCode".to_string(),
+        "deepseek-harness" | "deepseek" | "dsh" => "DeepSeek Harness".to_string(),
         "workbuddy" | "work-buddy" => "WorkBuddy".to_string(),
         other if !other.is_empty() => other.to_string(),
         _ => "桌宠".to_string(),
@@ -10812,6 +10826,7 @@ fn selected_agent_to_channel_id(value: &str) -> String {
         "codex" => "codex".to_string(),
         "openclaw" => "openclaw".to_string(),
         "mimocode" => "mimocode".to_string(),
+        "deepseek-harness" => "deepseek-harness".to_string(),
         "workbuddy" => "workbuddy".to_string(),
         _ => DEFAULT_PET_CHANNEL_ID.to_string(),
     }
@@ -10823,6 +10838,7 @@ fn normalize_pet_channel_id(value: String) -> String {
         "claude" => "claude".to_string(),
         "openclaw" => "openclaw".to_string(),
         "mimocode" => "mimocode".to_string(),
+        "deepseek-harness" | "deepseek" | "dsh" => "deepseek-harness".to_string(),
         "workbuddy" => "workbuddy".to_string(),
         "cursor" => "cursor".to_string(),
         _ => DEFAULT_PET_CHANNEL_ID.to_string(),
@@ -12493,6 +12509,60 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_harness_aliases_route_through_the_agent_bus_instead_of_a_composer() {
+        assert_eq!(
+            normalize_agent_id("DeepSeek-Harness").as_deref(),
+            Some("deepseek-harness")
+        );
+        assert_eq!(
+            normalize_agent_id("deepseek").as_deref(),
+            Some("deepseek-harness")
+        );
+        assert_eq!(normalize_agent_id("DSH").as_deref(), Some("deepseek-harness"));
+        assert_eq!(
+            selected_agent_to_channel_id("deepseek-harness"),
+            "deepseek-harness"
+        );
+        assert_eq!(
+            normalize_pet_channel_id("DSH".into()),
+            "deepseek-harness"
+        );
+        assert_eq!(
+            usb_source_display_name("deepseek-harness"),
+            "DeepSeek Harness"
+        );
+        assert_eq!(usb_source_display_name("dsh"), "DeepSeek Harness");
+        assert!(KNOWN_USB_STATE_SOURCES.contains(&"deepseek-harness"));
+        // DSH text injection goes through agent-session-bus, never through an
+        // Accessibility composer, so the visible-composer branches stay off.
+        assert!(!agent_uses_visible_composer("deepseek-harness"));
+        assert!(!agent_streams_voice_draft("deepseek-harness"));
+        assert!(!should_locate_desktop_session(true, "deepseek-harness"));
+        assert!(device_voice_platform_block_reason("deepseek-harness", false).is_none());
+        assert!(device_voice_platform_block_reason("deepseek-harness", true).is_none());
+    }
+
+    #[test]
+    fn deepseek_harness_usb_source_ranks_between_codex_and_claude() {
+        let dsh_score = score_usb_source("deepseek-harness");
+        assert!(dsh_score < score_usb_source("codex"));
+        assert!(dsh_score > score_usb_source("claude-code"));
+        assert!(dsh_score > score_usb_source("openclaw"));
+
+        let enabled = HashSet::from([
+            "deepseek-harness".to_string(),
+            "codex".to_string(),
+        ]);
+        let selected = Some("deepseek-harness".to_string());
+        assert!(usb_source_allowed_by_follow(
+            "deepseek-harness",
+            &selected,
+            &enabled
+        ));
+        assert!(!usb_source_allowed_by_follow("codex", &selected, &enabled));
+    }
+
+    #[test]
     fn default_audio_cues_refresh_without_overwriting_uploaded_cues() {
         let temp = tempfile::tempdir().unwrap();
         let appearance = temp.path().join("appearance");
@@ -13743,6 +13813,7 @@ mod tests {
             disabled,
             vec![
                 "codex".to_string(),
+                "deepseek-harness".to_string(),
                 "mimocode".to_string(),
                 "openclaw".to_string(),
                 "workbuddy".to_string()
