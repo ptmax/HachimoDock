@@ -227,6 +227,9 @@ static void restore_idle_session_view(
   const char *event
 ) {
   if (!state || state->session_queue_count != 0) return;
+  /* The bridge has no DSH session snapshot; an empty snapshot must not erase
+   * the working/tool/done state carried by state/deepseek-harness. */
+  if (strcmp(state->active_agent, "deepseek-harness") == 0) return;
   const char *next_event = event && event[0] ? event : "session_queue_empty";
   bool changed = !lifecycle_is(runtime_lifecycle(state), "idle")
     || strcmp(state->current_speech, "休息中") != 0

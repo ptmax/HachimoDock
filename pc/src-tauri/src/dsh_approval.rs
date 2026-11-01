@@ -51,15 +51,24 @@ fn device_request_payload(event: &Value) -> Option<Value> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("DeepSeek Harness");
+    let reason = event
+        .get("displayReason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            event
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("");
     let request = json!({
         "requestId": request_id,
         "agent": agent,
         "tool": event.get("tool").and_then(Value::as_str).unwrap_or(""),
-        "reason": event
-            .get("displayReason")
-            .or_else(|| event.get("reason"))
-            .and_then(Value::as_str)
-            .unwrap_or(""),
+        "reason": reason,
         "sessionId": event.get("sessionId").and_then(Value::as_str).unwrap_or(""),
         "expiresAtMs": event.get("expiresAtMs").and_then(Value::as_u64).unwrap_or(0),
     });
@@ -376,6 +385,18 @@ mod tests {
             "done"
         );
         assert!(device_state_payload("approval", &json!({})).is_none());
+    }
+
+    #[test]
+    fn device_payload_falls_back_to_reason_when_display_reason_is_empty() {
+        let event = json!({
+            "requestId": "req-1",
+            "tool": "bash",
+            "reason": "真实原因",
+            "displayReason": "",
+        });
+        let payload = device_request_payload(&event).expect("payload");
+        assert_eq!(payload["reason"], "真实原因");
     }
 
     #[test]
