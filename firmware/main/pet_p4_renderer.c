@@ -1074,7 +1074,7 @@ static int utf8_text_width_medium(const char *text) {
     const char *next_cursor = cursor;
     uint32_t codepoint = utf8_next(&next_cursor);
     int glyph_advance = medium_glyph_width(codepoint, utf8_peek(next_cursor));
-    if (glyph_advance > 0) width += glyph_advance + 1;
+    if (glyph_advance > 0) width += glyph_advance;
     cursor = next_cursor;
   }
   return width;
@@ -1147,7 +1147,7 @@ static const char *draw_text_line_medium(
       return cursor;
     }
     int glyph_advance = medium_glyph_width(codepoint, next_codepoint);
-    int advance = glyph_advance > 0 ? glyph_advance + 1 : 0;
+    int advance = glyph_advance > 0 ? glyph_advance : 0;
     if (used_px + advance + reserve_px > max_px) break;
     draw_lvgl_glyph_medium(codepoint, next_codepoint, pen_x, y, color);
     pen_x += advance;
@@ -1162,7 +1162,7 @@ static const char *draw_text_line_medium(
       uint32_t codepoint = utf8_next(&next_cursor);
       uint32_t next_codepoint = utf8_peek(next_cursor);
       draw_lvgl_glyph_medium(codepoint, next_codepoint, pen_x, y, color);
-      pen_x += medium_glyph_width(codepoint, next_codepoint) + 1;
+      pen_x += medium_glyph_width(codepoint, next_codepoint);
       dots = next_cursor;
     }
   }
