@@ -2250,6 +2250,7 @@ static bool handle_approval_request(
   );
   unsigned long long deadline_ms;
   bool expired = false;
+  const cJSON *never_expires = cJSON_GetObjectItemCaseSensitive(payload, "neverExpires");
   if (!request_id[0]) {
     send_protocol_ack(send_line, ctx, "approval/request", payload, false,
                       "invalid_approval_request", "requestId is required");
@@ -2262,7 +2263,9 @@ static bool handle_approval_request(
                       "approval_already_decided", "requestId was already decided");
     return true;
   }
-  deadline_ms = approval_deadline_ms(expires_ms, now_ms, &expired);
+  deadline_ms = cJSON_IsTrue(never_expires)
+    ? 0
+    : approval_deadline_ms(expires_ms, now_ms, &expired);
   if (expired) {
     /* Requests that expired before arrival are ignored, never shown. */
     (void) pet_p4_audio_play_event_cue("permission_expired");
