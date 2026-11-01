@@ -245,7 +245,20 @@ function summarizeSession(bridge, session) {
     cwd: typeof session.header?.cwd === 'string' ? session.header.cwd : null,
     lastModified: Number.isFinite(lastModified) ? lastModified : createdAt,
     status: agent?.status === 'running' ? 'running' : 'idle',
+    state: bridge.sessionStates.get(String(session.id))?.state
+      || (agent?.status === 'running' ? 'working' : 'idle'),
+    transitionRevision: bridge.sessionStates.get(String(session.id))?.revision || 0,
     agentId: AGENT_ID,
+  }
+}
+
+function rememberSessionState(bridge, sessionId, state) {
+  const previous = bridge.sessionStates.get(sessionId) || { state: 'idle', revision: 0 }
+  if (previous.state === state) return
+  bridge.sessionStates.set(sessionId, { state, revision: previous.revision + 1 })
+  if (bridge.sessionStates.size > CACHE_LIMIT) {
+    const oldest = bridge.sessionStates.keys().next()
+    if (!oldest.done) bridge.sessionStates.delete(oldest.value)
   }
 }
 
@@ -294,6 +307,7 @@ function forwardSessionEvent(bridge, session, event) {
       return
     }
     case 'turn/start':
+      rememberSessionState(bridge, sessionId, 'working')
       bridge.server.publish('turn', {
         sessionId,
         phase: 'start',
@@ -301,6 +315,7 @@ function forwardSessionEvent(bridge, session, event) {
       })
       return
     case 'turn/end':
+      rememberSessionState(bridge, sessionId, 'done')
       bridge.server.publish('turn', {
         sessionId,
         phase: 'end',
@@ -324,6 +339,7 @@ function forwardSessionEvent(bridge, session, event) {
       const key = `${sessionId}:${callId}`
       const name = bridge.toolNames.get(key) ?? 'tool'
       bridge.toolNames.delete(key)
+      rememberSessionState(bridge, sessionId, 'working')
       bridge.server.publish('tool', {
         sessionId,
         phase: 'end',
@@ -670,6 +686,7 @@ function createBridge(ctx, config = {}) {
     logger,
     titleMap: new Map(),
     lastModified: new Map(),
+    sessionStates: new Map(),
     toolNames: new Map(),
     askedApprovals: new Map(),
     approvalLinks: new Map(),
