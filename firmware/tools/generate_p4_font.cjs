@@ -38,6 +38,11 @@ async function main() {
     }
   }
   assert.equal(chars.size, 6763);
+  for (const char of "“”‘’「」『』〈〉《》【】〔〕—–…·•×÷±°％‰＃＆＠！？，。、；：（）［］｛｝＜＞／＼｜～") chars.add(char.codePointAt(0));
+  for (const char of "←↑→↓") chars.add(char.codePointAt(0));
+  for (const char of "≈≤≥≠∞∑√") chars.add(char.codePointAt(0));
+  for (const char of "≈≤≥≠∞∑√") chars.add(char.codePointAt(0));
+  for (const char of "←↑→↓") chars.add(char.codePointAt(0));
   for (const cp of oldIds.keys()) if (cp < 0x4e00 || cp > 0x9fff) chars.add(cp);
   for (const name of fs.readdirSync(path.dirname(target))) {
     if (!/\.[ch]$/.test(name) || ['pet_p4_font_cn.c', 'pet_p4_builtin_components_data.c'].includes(name)) continue;
@@ -93,6 +98,7 @@ async function main() {
 async function generateTitleFont(ft, LvGlyf, fontPath, baseTarget, oldIds, oldGlyphs) {
   const catalog = JSON.parse(fs.readFileSync(path.join(path.dirname(baseTarget), 'pet_p4_builtin_components.json'), 'utf8'));
   const chars = new Set(Array.from({ length: 95 }, (_, i) => i + 32));
+  for (const char of "“”‘’「」『』〈〉《》【】〔〕—–…·•×÷±°％‰＃＆＠！？，。、；：（）［］｛｝＜＞／＼｜～") chars.add(char.codePointAt(0));
   // Fixed 32 px bubble labels; body hints use the separate 24 px rendering path.
   for (const title of ['组件中心', '休息中', '你', '宠物', ...catalog.components.map(item => item.widget.dashboard.title)]) {
     assert.equal(typeof title, 'string');

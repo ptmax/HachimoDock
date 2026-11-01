@@ -20,6 +20,8 @@ export default function DashboardActionsMenu({
   onUnbind,
   onDeviceReturnHome,
   onForceSyncAppearance,
+  textRenderingSettings,
+  onToggleTextRendering,
   onUpdateFirmware,
   onDiagnostics,
 }) {
@@ -72,6 +74,33 @@ export default function DashboardActionsMenu({
             <Copy size={14} />
             复制桌面设备 ID
           </button>
+          {textRenderingSettings && (
+            <div className="dashboard-actions-menu__section">
+              <span className="dashboard-actions-menu__section-label">字体渲染</span>
+              <button
+                type="button"
+                className="dashboard-actions-menu__item dashboard-actions-menu__toggle"
+                role="menuitemcheckbox"
+                aria-checked={textRenderingSettings.usbApp}
+                onClick={() => onToggleTextRendering?.("usbApp")}
+                title="USB 连接时是否由 App 渲染气泡文字；关闭后改用客户端本地字体"
+              >
+                <span>USB 使用 App 端渲染</span>
+                <span className={`dashboard-actions-menu__switch${textRenderingSettings.usbApp ? " is-on" : ""}`} />
+              </button>
+              <button
+                type="button"
+                className="dashboard-actions-menu__item dashboard-actions-menu__toggle"
+                role="menuitemcheckbox"
+                aria-checked={textRenderingSettings.wifiApp}
+                onClick={() => onToggleTextRendering?.("wifiApp")}
+                title="Wi-Fi 连接时是否由 App 渲染；默认关闭，使用客户端本地渲染"
+              >
+                <span>Wi-Fi 使用 App 端渲染</span>
+                <span className={`dashboard-actions-menu__switch${textRenderingSettings.wifiApp ? " is-on" : ""}`} />
+              </button>
+            </div>
+          )}
           {onDeviceReturnHome && (
             <button
               type="button"
