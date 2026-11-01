@@ -293,9 +293,10 @@ fn run_event_stream(usb: UsbSerialManager, base_url: String) -> Result<(), Strin
                         let base_url = base_url.clone();
                         thread::spawn(move || wait_for_device_decision(usb, request, base_url));
                     }
-                } else {
-                    forward_state_event(&usb, &event, &payload);
                 }
+                // Session/status data is owned by the normal session/current
+                // pipeline. Do not emit a second generic state bubble here:
+                // README bubble rules are active-only + 60s terminal retention.
             }
             event.clear();
             data.clear();
