@@ -112,6 +112,7 @@ pet_p4_render_metrics_t pet_p4_renderer_metrics(void) {
 static const char *TAG = "pet-p4-renderer";
 
 extern const lv_font_t pet_p4_font_cn_16;
+extern const lv_font_t pet_p4_font_cn_24;
 extern const lv_font_t pet_p4_font_cn_32;
 
 static uint16_t *g_framebuffer;
@@ -980,6 +981,12 @@ static void draw_lvgl_glyph(uint32_t codepoint, uint32_t next_codepoint, int x, 
 }
 
 static int medium_glyph_width(uint32_t codepoint, uint32_t next_codepoint) {
+  lv_font_glyph_dsc_t glyph = {0};
+  if (lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
+    int width = (int) glyph.adv_w;
+    lv_font_glyph_release_draw_data(&glyph);
+    return width;
+  }
   int width = glyph_width(codepoint, next_codepoint);
   return width > 0 ? (width * 3 + 1) / 2 : 0;
 }
@@ -992,7 +999,7 @@ static bool medium_glyph_visual_bounds(
 ) {
   lv_font_glyph_dsc_t glyph = {0};
   if (codepoint == 0xFE0F || codepoint == 0x200D) return false;
-  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_16, &glyph, codepoint, next_codepoint)) {
+  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
     if (codepoint == 0x00B7) {
       *top = 8;
       *bottom = 12;
@@ -1008,24 +1015,21 @@ static bool medium_glyph_visual_bounds(
   if (glyph.box_h <= 0 || glyph.box_w <= 0) return false;
   glyph.req_raw_bitmap = 1;
   const uint8_t *bitmap = (const uint8_t *) glyph.resolved_font->get_glyph_bitmap(&glyph, NULL);
-  int scaled_height = (glyph.box_h * 3 + 1) / 2;
-  int first_ink_row = scaled_height;
+  int first_ink_row = glyph.box_h;
   int last_ink_row = -1;
   if (bitmap) {
-    for (int dy = 0; dy < scaled_height; dy += 1) {
-      int source_y = dy * 2 / 3;
-      if (source_y >= glyph.box_h) source_y = glyph.box_h - 1;
+    for (int y = 0; y < glyph.box_h; y += 1) {
       for (int x = 0; x < glyph.box_w; x += 1) {
-        if (!glyph_alpha_at(bitmap, &glyph, x, source_y)) continue;
-        if (dy < first_ink_row) first_ink_row = dy;
-        if (dy > last_ink_row) last_ink_row = dy;
+        if (!glyph_alpha_at(bitmap, &glyph, x, y)) continue;
+        if (y < first_ink_row) first_ink_row = y;
+        if (y > last_ink_row) last_ink_row = y;
       }
     }
   }
   lv_font_glyph_release_draw_data(&glyph);
   if (last_ink_row < first_ink_row) return false;
-  int baseline = ((pet_p4_font_cn_16.line_height - pet_p4_font_cn_16.base_line) * 3 + 1) / 2;
-  int glyph_top = baseline - scaled_height - glyph.ofs_y * 3 / 2;
+  int baseline = glyph.resolved_font->line_height - glyph.resolved_font->base_line;
+  int glyph_top = baseline - glyph.box_h - glyph.ofs_y;
   *top = glyph_top + first_ink_row;
   *bottom = glyph_top + last_ink_row;
   return true;
@@ -1053,7 +1057,7 @@ static void text_visual_bounds_medium(const char *text, int *top, int *bottom) {
   }
   if (!found) {
     *top = 0;
-    *bottom = (pet_p4_font_cn_16.line_height * 3 + 1) / 2 - 1;
+    *bottom = pet_p4_font_cn_24.line_height - 1;
   }
 }
 
@@ -1079,15 +1083,15 @@ static void draw_lvgl_glyph_medium(
 ) {
   lv_font_glyph_dsc_t glyph = {0};
   if (codepoint == 0xFE0F || codepoint == 0x200D) return;
-  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_16, &glyph, codepoint, next_codepoint)) {
+  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
     if (codepoint == 0x00B7) {
-      fill_ellipse(x + 6, y + 10, 2, 2, color);
+      fill_ellipse(x + 9, y + 13, 2, 2, color);
     } else if (codepoint >= 0x2300) {
-      draw_line(x + 10, y + 2, x + 10, y + 18, color);
-      draw_line(x + 2, y + 10, x + 18, y + 10, color);
-      fill_ellipse(x + 10, y + 10, 4, 4, color);
+      draw_line(x + 13, y + 2, x + 13, y + 22, color);
+      draw_line(x + 2, y + 12, x + 22, y + 12, color);
+      fill_ellipse(x + 13, y + 12, 4, 4, color);
     } else {
-      draw_glyph5x7(x, y + 3, '?', color, 2);
+      draw_glyph5x7(x, y + 4, '?', color, 3);
     }
     return;
   }
@@ -1097,22 +1101,16 @@ static void draw_lvgl_glyph_medium(
     lv_font_glyph_release_draw_data(&glyph);
     return;
   }
-  int baseline = y + ((pet_p4_font_cn_16.line_height - pet_p4_font_cn_16.base_line) * 3 + 1) / 2;
-  int gx0 = x + glyph.ofs_x * 3 / 2;
-  int gy0 = baseline - (glyph.box_h * 3 + 1) / 2 - glyph.ofs_y * 3 / 2;
-  int scaled_w = (glyph.box_w * 3 + 1) / 2;
-  int scaled_h = (glyph.box_h * 3 + 1) / 2;
+  int baseline = y + glyph.resolved_font->line_height - glyph.resolved_font->base_line;
+  int gx0 = x + glyph.ofs_x;
+  int gy0 = baseline - glyph.box_h - glyph.ofs_y;
   uint8_t r = (uint8_t) (((color >> 11) & 0x1F) * 255 / 31);
   uint8_t g = (uint8_t) (((color >> 5) & 0x3F) * 255 / 63);
   uint8_t b = (uint8_t) ((color & 0x1F) * 255 / 31);
-  for (int dy = 0; dy < scaled_h; dy += 1) {
-    int source_y = dy * 2 / 3;
-    if (source_y >= glyph.box_h) source_y = glyph.box_h - 1;
-    for (int dx = 0; dx < scaled_w; dx += 1) {
-      int source_x = dx * 2 / 3;
-      if (source_x >= glyph.box_w) source_x = glyph.box_w - 1;
-      uint8_t alpha = glyph_alpha_at(bitmap, &glyph, source_x, source_y);
-      if (alpha) blend_px(gx0 + dx, gy0 + dy, r, g, b, alpha);
+  for (int gy = 0; gy < glyph.box_h; gy += 1) {
+    for (int gx = 0; gx < glyph.box_w; gx += 1) {
+      uint8_t alpha = glyph_alpha_at(bitmap, &glyph, gx, gy);
+      if (alpha) blend_px(gx0 + gx, gy0 + gy, r, g, b, alpha);
     }
   }
   lv_font_glyph_release_draw_data(&glyph);
@@ -2394,6 +2392,33 @@ static bool render_asset_pet_frame(const pet_p4_runtime_state_t *state, const pe
   return true;
 }
 
+/* The 32 px face is intentionally a small fixed-label subset. Dynamic Chinese
+ * titles are not guaranteed to be present; in that case use the native 24 px
+ * face rather than scaling a 16 px glyph two times, which looks visibly muddy. */
+static bool font_covers_text(const lv_font_t *font, const char *text) {
+  if (!font || !text) return false;
+  const char *cursor = text;
+  while (*cursor) {
+    const char *next = cursor;
+    uint32_t cp = utf8_next(&next);
+    if (cp == 0xFE0F || cp == 0x200D) { cursor = next; continue; }
+    lv_font_glyph_dsc_t glyph = {0};
+    if (!lv_font_get_glyph_dsc(font, &glyph, cp, utf8_peek(next))) return false;
+    lv_font_glyph_release_draw_data(&glyph);
+    cursor = next;
+  }
+  return true;
+}
+
+static void draw_session_card_title(const char *title, int x, int y, int box_h,
+    int max_px, uint16_t color) {
+  if (font_covers_text(&pet_p4_font_cn_32, title)) {
+    draw_text_line_vcenter(title, x, y, box_h, max_px, color, 2, true);
+  } else {
+    draw_text_line_medium_vcenter(title, x, y, box_h, max_px, color, true);
+  }
+}
+
 static void draw_bubble(const pet_p4_runtime_state_t *state,
     const pet_p4_view_model_t *view, unsigned long long now_ms) {
   if (view && !view->show_bubble) return;
@@ -2431,7 +2456,7 @@ static void draw_bubble(const pet_p4_runtime_state_t *state,
     fill_round_rect(x + 10, y + 14, 7, h - 28, 2, selection);
     if (!(text.pixels && pet_bubble_pixels_draw(PET_BUBBLE_TITLE, title, 0, g_framebuffer,
         x + 30, y + 10, w - 82, ink)))
-      draw_text_line_vcenter(title, x + 30, y + 10, 38, w - 82, ink, 2, true);
+      draw_session_card_title(title, x + 30, y + 10, 38, w - 82, ink);
     if (body[0]) {
       if (realtime) {
         unsigned host_pages = text.pixels ? pet_bubble_pixels_pages(PET_BUBBLE_BODY, body) : 0;
@@ -2881,8 +2906,9 @@ static uint16_t session_status_color(const char *status) {
   if (status && strcmp(status, "error") == 0) return view_status_color(PET_P4_VIEW_STATUS_ERROR);
   if (status && strcmp(status, "stopped") == 0) return view_status_color(PET_P4_VIEW_STATUS_STOPPED);
   if (status && strcmp(status, "waiting_user") == 0) return view_status_color(PET_P4_VIEW_STATUS_WAITING);
-  if (status && strcmp(status, "speaking") == 0) return view_status_color(PET_P4_VIEW_STATUS_WORKING);
-  if (status && strcmp(status, "working") == 0) return view_status_color(PET_P4_VIEW_STATUS_WORKING);
+  if (status && (strcmp(status, "speaking") == 0 || strcmp(status, "working") == 0
+      || strcmp(status, "thinking") == 0 || strcmp(status, "tool_running") == 0
+      || strcmp(status, "active") == 0)) return view_status_color(PET_P4_VIEW_STATUS_WORKING);
   return view_status_color(PET_P4_VIEW_STATUS_IDLE);
 }
 
@@ -2891,8 +2917,9 @@ static pet_p4_view_status_t session_view_status(const char *status) {
   if (status && strcmp(status, "error") == 0) return PET_P4_VIEW_STATUS_ERROR;
   if (status && strcmp(status, "stopped") == 0) return PET_P4_VIEW_STATUS_STOPPED;
   if (status && strcmp(status, "waiting_user") == 0) return PET_P4_VIEW_STATUS_WAITING;
-  if (status && strcmp(status, "speaking") == 0) return PET_P4_VIEW_STATUS_WORKING;
-  if (status && strcmp(status, "working") == 0) return PET_P4_VIEW_STATUS_WORKING;
+  if (status && (strcmp(status, "speaking") == 0 || strcmp(status, "working") == 0
+      || strcmp(status, "thinking") == 0 || strcmp(status, "tool_running") == 0
+      || strcmp(status, "active") == 0)) return PET_P4_VIEW_STATUS_WORKING;
   return PET_P4_VIEW_STATUS_IDLE;
 }
 
@@ -2991,7 +3018,7 @@ static void draw_session_queue_uncached(
     }
     if (!(text.pixels && pet_bubble_pixels_draw(PET_BUBBLE_TITLE, text.title, 0, g_framebuffer,
         x + 30, y + 10, w - 82, ink)))
-      draw_text_line_vcenter(text.title, x + 30, y + 10, 38, w - 82, ink, 2, true);
+      draw_session_card_title(text.title, x + 30, y + 10, 38, w - 82, ink);
 
     if (is_selected && state->session_voice_active) {
       draw_voice_input_row(x, y + 62);
