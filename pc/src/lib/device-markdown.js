@@ -32,6 +32,10 @@ export function flattenMarkdownForDevice(value) {
     line = line.replace(/(\*\*|__)(.*?)\1/g, "$2");
     line = line.replace(/(\*|_)(.*?)\1/g, "$2");
     line = line.replace(/~~(.*?)~~/g, "$1");
+    line = line.replace(/<[^>]*>/g, "");
+    line = line.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, "");
+    // Plain-device mode intentionally drops residual Markdown punctuation.
+    line = line.replace(/[#*_`~|>]/g, "");
     line = line.replace(/^---+\s*$/, "");
     lines.push(line.replace(/\s+$/, ""));
   }

@@ -934,9 +934,14 @@ static int utf8_text_width(const char *text, int byte_limit, int scale) {
   return width;
 }
 
+static bool device_markdown_marker(uint32_t codepoint) {
+  return codepoint == '#' || codepoint == '*' || codepoint == '_'
+    || codepoint == '`' || codepoint == '~' || codepoint == '|' || codepoint == '>';
+}
+
 static void draw_lvgl_glyph(uint32_t codepoint, uint32_t next_codepoint, int x, int y, uint16_t color, int scale) {
   lv_font_glyph_dsc_t glyph = {0};
-  if (codepoint == 0xFE0F || codepoint == 0x200D) return;
+  if (codepoint == 0xFE0F || codepoint == 0x200D || device_markdown_marker(codepoint)) return;
   if (!scaled_glyph_dsc(codepoint, next_codepoint, &glyph, &scale)) {
     if (scale < 1) scale = 1;
     if (codepoint == 0x00B7) {
@@ -1082,7 +1087,7 @@ static void draw_lvgl_glyph_medium(
   uint16_t color
 ) {
   lv_font_glyph_dsc_t glyph = {0};
-  if (codepoint == 0xFE0F || codepoint == 0x200D) return;
+  if (codepoint == 0xFE0F || codepoint == 0x200D || device_markdown_marker(codepoint)) return;
   if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
     if (codepoint == 0x00B7) {
       fill_ellipse(x + 9, y + 13, 2, 2, color);

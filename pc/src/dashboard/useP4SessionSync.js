@@ -73,7 +73,7 @@ export function cycleVoiceSessionId(currentSessionId, sessions, direction) {
 }
 
 export function formatDeviceSessionTitle(session, fallbackSessionId = "") {
-  const title = p4SessionDisplayTitle(session);
+  const title = flattenMarkdownForDevice(p4SessionDisplayTitle(session));
   if (title) return title;
   const sessionId = normalizeText(session?.id) || normalizeText(fallbackSessionId);
   return sessionId && sessionId !== "auto" ? `会话 ${sessionId.slice(0, 8)}` : "";
