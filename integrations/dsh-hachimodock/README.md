@@ -272,6 +272,25 @@ plugin_manager({
 `plugin_manager` performs the profile `package.json` / `cordis.patch.yml` /
 bundle-selection edits itself. Do not hand-edit those files.
 
+### Critical: bundle order on Desktop/Web profiles
+
+The bridge's `approval/request` answerer must register **before** the Desktop/Web
+approval UI, otherwise the native UI answers first and the device never sees the
+prompt. `plugin_manager` appends a bundle at the end of
+`dsh.profile.bundles`, so after installing, ensure this order:
+
+```yaml
+bundles:
+  - "@deepseek-ai/dsh-base"
+  - "@hachimodock/dsh-bridge"
+  - "@deepseek-ai/dsh-web-app"
+  # remaining bundles
+```
+
+Ahead of `dsh-web-app`, the bridge answers first when a HachimoDock `/events`
+subscriber is attached; with no subscriber it uses `approvalFallback: delegate`
+and the normal DSH UI remains authoritative.
+
 ### Option B — `dsh plugin` CLI
 
 `dsh plugin` only performs package management; select the bundle after the
