@@ -161,6 +161,7 @@ static uint16_t *g_session_overlay_cache;
 static uint64_t g_session_overlay_signature;
 static bool g_session_overlay_cache_valid;
 static bool g_last_realtime_conversation;
+static unsigned int g_bubble_opacity_percent = 100;
 static bool g_last_approval_visible;
 static bool g_session_overlay_cache_allocation_failed;
 static uint8_t g_session_overlay_row_run_count[PET_P4_UI_HEIGHT];
@@ -1363,12 +1364,16 @@ static void blend_round_rect(int x, int y, int w, int h, int radius, uint8_t r, 
 }
 
 static void draw_home_white_panel(int x, int y, int w, int h, int radius, uint16_t outline) {
-  // The panel is opaque, so a preblended solid shadow gives the same visible
-  // edge without read/modify/write alpha blending tens of thousands of PSRAM
-  // pixels every frame.
-  fill_round_rect(x + 2, y + 4, w, h, radius, rgb565(55, 58, 57));
-  fill_round_rect(x, y, w, h, radius, outline);
-  fill_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, rgb565(255, 255, 255));
+  if (g_bubble_opacity_percent >= 100) {
+    fill_round_rect(x + 2, y + 4, w, h, radius, rgb565(55, 58, 57));
+    fill_round_rect(x, y, w, h, radius, outline);
+    fill_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, rgb565(255, 255, 255));
+    return;
+  }
+  const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
+  blend_round_rect(x + 2, y + 4, w, h, radius, 55, 58, 57, alpha);
+  blend_round_rect(x, y, w, h, radius, 216, 221, 218, alpha);
+  blend_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, 255, 255, 255, alpha);
 }
 
 static void draw_session_card_panel(
@@ -1387,10 +1392,18 @@ static void draw_session_card_panel(
 
   uint16_t selection = rgb565(25, 151, 99);
   uint16_t selected_surface = rgb565(237, 249, 242);
-  fill_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, rgb565(173, 220, 193));
-  fill_round_rect(x + 2, y + 5, w, h, radius, rgb565(46, 50, 48));
-  fill_round_rect(x, y, w, h, radius, selection);
-  fill_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, selected_surface);
+  if (g_bubble_opacity_percent >= 100) {
+    fill_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, rgb565(173, 220, 193));
+    fill_round_rect(x + 2, y + 5, w, h, radius, rgb565(46, 50, 48));
+    fill_round_rect(x, y, w, h, radius, selection);
+    fill_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, selected_surface);
+    return;
+  }
+  const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
+  blend_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, 173, 220, 193, alpha);
+  blend_round_rect(x + 2, y + 5, w, h, radius, 46, 50, 48, alpha);
+  blend_round_rect(x, y, w, h, radius, 25, 151, 99, alpha);
+  blend_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, 237, 249, 242, alpha);
 }
 
 static void draw_card_body_lines(
@@ -3169,6 +3182,8 @@ static void draw_session_queue(
   const pet_p4_runtime_state_t *state,
   unsigned long long now_ms
 ) {
+  g_bubble_opacity_percent = state && state->bubble_opacity
+    ? state->bubble_opacity : 100;
   if (!state || state->session_queue_count == 0) {
     g_session_overlay_cache_valid = false;
     return;

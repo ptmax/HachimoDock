@@ -2836,6 +2836,16 @@ bool pet_p4_handle_line(
     pet_p4_conversation_playback_begin(state, "");
     pet_p4_audio_stream_flush();
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
+  } else if (strcmp(topic, "ui/bubble_opacity") == 0) {
+    const cJSON *opacity = cJSON_GetObjectItemCaseSensitive(payload, "opacity");
+    if (cJSON_IsNumber(opacity)) {
+      int value = (int) opacity->valuedouble;
+      if (value < 55) value = 55;
+      if (value > 100) value = 100;
+      state->bubble_opacity = (unsigned int) value;
+      state->last_update_ms += 1;
+    }
+    send_protocol_ack_if_requested(send_line, ctx, topic, payload);
   } else if (strcmp(topic, "ui/conversation") == 0) {
     bool phase_changed = strcmp(state->conversation_state, json_string(payload, "state")) != 0;
     bool accepted = pet_p4_conversation_update(state, json_string(payload, "sessionId"),

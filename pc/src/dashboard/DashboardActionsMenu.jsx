@@ -22,6 +22,8 @@ export default function DashboardActionsMenu({
   onForceSyncAppearance,
   textRenderingSettings,
   onToggleTextRendering,
+  bubbleOpacity,
+  onUpdateBubbleOpacity,
   onUpdateFirmware,
   onDiagnostics,
 }) {
@@ -99,6 +101,21 @@ export default function DashboardActionsMenu({
                 <span>Wi-Fi 使用 App 端渲染</span>
                 <span className={`dashboard-actions-menu__switch${textRenderingSettings.wifiApp ? " is-on" : ""}`} />
               </button>
+            </div>
+          )}
+          {bubbleOpacity !== undefined && (
+            <div className="dashboard-actions-menu__section">
+              <span className="dashboard-actions-menu__section-label">气泡透明度</span>
+              <label className="dashboard-actions-menu__range">
+                <span>透明度 <output>{bubbleOpacity}%</output></span>
+                <input
+                  type="range"
+                  min="55"
+                  max="100"
+                  value={bubbleOpacity}
+                  onChange={(event) => onUpdateBubbleOpacity?.(Number(event.target.value))}
+                />
+              </label>
             </div>
           )}
           {onDeviceReturnHome && (
