@@ -1439,12 +1439,29 @@ fn stage_device_voice_final(
                 "VISIBLE_COMPOSER_UNAVAILABLE",
             );
         } else {
+            realtime_chat_log::record(
+                &context.utterance_id,
+                "device_voice_timing",
+                serde_json::json!({
+                    "stage": "dsh_branch",
+                    "agentId": context.target.agent_id,
+                    "sessionId": context.target.session_id,
+                    "composerMode": device_voice_composer_mode(&context),
+                }),
+            );
             context.draft_ready.store(true, Ordering::SeqCst);
             emit_device_voice_transcript(&context, "draft_ready", revision, &text, true, true, "");
             if context.target.agent_id == "deepseek-harness" {
-                if let Err(error) = insert_dsh_voice_draft(&text) {
-                    eprintln!("[dsh-voice] draft insertion failed: {error}");
-                }
+                let insert_result = insert_dsh_voice_draft(&text);
+                realtime_chat_log::record(
+                    &context.utterance_id,
+                    "device_voice_timing",
+                    serde_json::json!({
+                        "stage": "dsh_draft_insert",
+                        "ok": insert_result.is_ok(),
+                        "error": insert_result.as_ref().err().cloned().unwrap_or_default(),
+                    }),
+                );
             }
         }
         return;
@@ -1631,7 +1648,17 @@ fn confirm_pending_device_voice_draft(topic: &str, payload: &serde_json::Value) 
                 cancel_device_voice_context(&context, "DSH voice target changed before submit");
                 return true;
             }
-            if let Err(error) = submit_dsh_voice_composer(&device_voice_session_id(&context)) {
+            let submit_result = submit_dsh_voice_composer(&device_voice_session_id(&context));
+            realtime_chat_log::record(
+                &context.utterance_id,
+                "device_voice_timing",
+                serde_json::json!({
+                    "stage": "dsh_submit",
+                    "ok": submit_result.is_ok(),
+                    "error": submit_result.as_ref().err().cloned().unwrap_or_default(),
+                }),
+            );
+            if let Err(error) = submit_result {
                 report_device_voice_delivery_failure(
                     &context,
                     revision,
@@ -2205,7 +2232,12 @@ fn usb_session_binding_allows(
 
 fn resolve_usb_inject_target(board_device_id: &str) -> (String, String) {
     if let Some(binding) = p4_session_binding_for_board(board_device_id) {
-        return (binding.agent_id, binding.session_id);
+        // A board connection can publish a binding row before the agent sync
+        // fills agentId. An empty agent here used to produce an untargeted
+        // device-voice context, so fall back to the selected bridge agent.
+        if !binding.agent_id.trim().is_empty() {
+            return (binding.agent_id, binding.session_id);
+        }
     }
     (resolve_usb_inject_agent_id(), "auto".to_string())
 }
