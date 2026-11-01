@@ -56,6 +56,10 @@ import {
   loadDeviceControls,
   saveDeviceControls,
 } from "./lib/device-controls.js";
+import {
+  loadBubbleOpacity,
+  saveBubbleOpacity,
+} from "./lib/bubble-opacity.js";
 import ChannelMatrixCard from "./dashboard/ChannelMatrixCard.jsx";
 import BoardButtonPanel from "./dashboard/BoardButtonPanel.jsx";
 import VoiceAssistantPanel, { buildVoiceSummary, formatVoiceSessionOption } from "./dashboard/VoiceAssistantPanel.jsx";
@@ -802,12 +806,18 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   const updateDeviceControl = useCallback((key, value) => {
     setDeviceControls((current) => saveDeviceControls({ ...current, [key]: value }));
   }, []);
+  const [bubbleOpacity, setBubbleOpacity] = useState(loadBubbleOpacity);
+  const updateBubbleOpacity = useCallback((value) => {
+    setBubbleOpacity(saveBubbleOpacity(value));
+  }, []);
   useEffect(() => {
     if (!usb.connected) return undefined;
     invoke("usb_send_topic", { topic: "ui/device_controls", payload: deviceControls })
       .catch(() => undefined);
+    invoke("usb_send_topic", { topic: "ui/bubble_opacity", payload: { opacity: bubbleOpacity } })
+      .catch(() => undefined);
     return undefined;
-  }, [usb.connected, deviceControls]);
+  }, [usb.connected, deviceControls, bubbleOpacity]);
   const [voiceConfig, setVoiceConfig] = useState(loadVoiceConfigFromStorage);
   const voiceConfigRef = useRef(voiceConfig);
   // 实时对话键是否已绑到某个按键（提示文案用；真正的按键事件由 Rust 处理）
@@ -1544,6 +1554,8 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
           onToggleTextRendering={toggleTextRendering}
           deviceControls={deviceControls}
           onUpdateDeviceControl={updateDeviceControl}
+          bubbleOpacity={bubbleOpacity}
+          onUpdateBubbleOpacity={updateBubbleOpacity}
           onUpdateFirmware={usb.connected && usb.runtime === P4_RUNTIME_ID
             ? () => {
               setFirmwareTargetBoardDeviceId(usb.boardDeviceId || "");
