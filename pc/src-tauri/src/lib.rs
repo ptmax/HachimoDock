@@ -52,6 +52,7 @@
  * [Sync] If this file changes, update `pc/.folder.md`.
  */
 
+mod dsh_approval;
 mod clawpkg;
 mod widget_data;
 mod stock_quotes;
@@ -2530,6 +2531,10 @@ fn handle_incoming_usb_message(
     payload: serde_json::Value,
 ) {
     resolve_button_config_ack(&topic, &payload);
+    if topic == "approval/decision" {
+        dsh_approval::handle_device_decision(&payload);
+        return;
+    }
     if topic=="app/event"{component_app::device_event(&payload);return;}
     music_player::observe_capture(&topic,&payload);
     component_media::observe_capture(&topic,&payload);
@@ -10147,6 +10152,7 @@ pub fn run() {
     }
     start_usb_host_heartbeat(usb_manager.clone());
     start_usb_state_forwarder(usb_manager.clone());
+    dsh_approval::start(usb_manager.clone());
     }
 
     let usb_for_auto = usb_manager.clone();
