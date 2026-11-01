@@ -38,6 +38,13 @@ static bool should_compact_bubble(const pet_p4_runtime_state_t *state) {
   return false;
 }
 
+static bool is_dsh_state_event(const pet_p4_runtime_state_t *state) {
+  return state
+    && (strncmp(state->current_event, "tool/", 5) == 0
+        || strncmp(state->current_event, "turn/", 5) == 0
+        || strncmp(state->current_event, "session", 7) == 0);
+}
+
 static bool should_wait_for_session_card(const pet_p4_runtime_state_t *state) {
   if (!state
       || state->session_queue_count > 0
@@ -48,7 +55,7 @@ static bool should_wait_for_session_card(const pet_p4_runtime_state_t *state) {
   /* DSH has no P4 session-queue snapshot; its state/tool events are the
    * authoritative status source. Do not replace working/tool_running with the
    * "休息中" fallback. */
-  if (strcmp(state->active_agent, "deepseek-harness") == 0) {
+  if (strcmp(state->active_agent, "deepseek-harness") == 0 || is_dsh_state_event(state)) {
     return false;
   }
   return status_from_state(state) != PET_P4_VIEW_STATUS_IDLE;

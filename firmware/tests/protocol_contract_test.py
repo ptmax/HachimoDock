@@ -2470,6 +2470,7 @@ def test_p4_dsh_state_is_not_replaced_by_session_card_fallback():
     restore = protocol[protocol.index("static void restore_idle_session_view("):]
     restore = restore[:restore.index("static void mark_current_session_terminal(")]
     assert 'strcmp(state->active_agent, "deepseek-harness") == 0' in restore
+    assert 'strncmp(state->current_event, "tool/", 5) == 0' in restore
     runner = read_required("tests/protocol_contract_test.py")
     assert "test_p4_dsh_state_is_not_replaced_by_session_card_fallback" in runner
 
