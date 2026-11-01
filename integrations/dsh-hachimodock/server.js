@@ -539,6 +539,13 @@ class BridgeServer {
       if (method !== 'GET') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
       return this.handleEvents(req, res, url)
     }
+    if (path === '/prototype/insert') {
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+      const body = await readJsonBody(req).catch(() => ({}))
+      const text = typeof body?.text === 'string' ? body.text : 'HACHIMO COMPOSER PROTOTYPE'
+      this.publish('voice-insert', { text: text.slice(0, 2000) })
+      return sendJson(res, 200, { ok: true, published: 'voice-insert' })
+    }
     if (path === '/approval/decision') {
       if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
       return this.handleApprovalDecision(req, res)

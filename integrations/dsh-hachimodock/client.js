@@ -12,6 +12,48 @@ window.__ModuleLoader__.load({
   factory(require) {
     const EVENT_URL = 'http://127.0.0.1:17892/events?role=client'
 
+    function findComposer() {
+      const candidates = Array.from(document.querySelectorAll('[contenteditable="true"]'))
+        .filter((element) => element.offsetParent !== null)
+      return candidates.find((element) => element.getAttribute('role') === 'textbox')
+        || candidates[candidates.length - 1]
+        || null
+    }
+
+    function insertIntoComposer(text, attempt = 0) {
+      const composer = findComposer()
+      if (!composer) {
+        if (attempt < 20) setTimeout(() => insertIntoComposer(text, attempt + 1), 150)
+        return false
+      }
+      composer.focus()
+      const selection = window.getSelection()
+      if (!selection) return false
+      const range = document.createRange()
+      range.selectNodeContents(composer)
+      range.collapse(false)
+      selection.removeAllRanges()
+      selection.addRange(range)
+      let inserted = false
+      try {
+        inserted = document.execCommand('insertText', false, text)
+      } catch {
+        inserted = false
+      }
+      if (!inserted) {
+        // Fallback for editors that ignore execCommand; dispatch the same
+        // input event shape a paste would produce.
+        const event = new InputEvent('beforeinput', {
+          bubbles: true,
+          cancelable: true,
+          inputType: 'insertText',
+          data: text,
+        })
+        composer.dispatchEvent(event)
+      }
+      return true
+    }
+
     function clickApproval(outcome, attempt = 0) {
       const allow = outcome === 'allowed-once'
       const labels = allow
@@ -45,9 +87,21 @@ window.__ModuleLoader__.load({
             /* malformed events must not break the client */
           }
         }
+        const onVoiceInsert = (event) => {
+          try {
+            const payload = JSON.parse(event.data)
+            if (payload && typeof payload.text === 'string' && payload.text.trim()) {
+              insertIntoComposer(payload.text)
+            }
+          } catch {
+            /* malformed events must not break the client */
+          }
+        }
         source.addEventListener('approval-resolved', onResolved)
+        source.addEventListener('voice-insert', onVoiceInsert)
         ctx.effect(() => () => {
           source.removeEventListener('approval-resolved', onResolved)
+          source.removeEventListener('voice-insert', onVoiceInsert)
           source.close()
         }, 'hachimodock: device approval dismissal')
       },

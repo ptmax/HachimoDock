@@ -492,13 +492,9 @@ async function injectToSession(bridge, args) {
     // minutes; device PTT must be accepted into the queue immediately rather
     // than holding the bridge HTTP request until that turn ends.
     const wasRunning = agent.status === 'running' || agent.running === true
-    if (wasRunning && typeof agent.steer === 'function') {
-      // Running turn: put the voice text into the current turn's next step so
-      // it is visible immediately instead of waiting for the whole turn to end.
-      agent.steer(message)
-      forward({ type: 'done', sessionId: target.id, tokens: 0, queued: true, steered: true })
-      return
-    }
+    // Always use followup so every device voice turn becomes a visible DSH
+    // user message. steer() does not emit a user/message event, which made all
+    // voice inputs after the first one invisible in the transcript.
     agent.followup(message)
     if (wasRunning) {
       forward({ type: 'done', sessionId: target.id, tokens: 0, queued: true })
