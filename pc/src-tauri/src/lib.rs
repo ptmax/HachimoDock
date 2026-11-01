@@ -12617,6 +12617,9 @@ mod tests {
             assert!(detected);
             assert_eq!(status, "ready");
         }
+    }
+
+    #[test]
     fn deepseek_harness_aliases_route_through_the_agent_bus_instead_of_a_composer() {
         assert_eq!(
             normalize_agent_id("DeepSeek-Harness").as_deref(),

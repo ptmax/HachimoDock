@@ -9,7 +9,8 @@
  *          stable first-seen card ordering, selected-card lifecycle authority for
  *          appearance playback, and exact retained-card selection preservation
  *          after host refreshes; queue resets preserve physical voice-hold feedback;
- *          actual chip revision for safe firmware selection.
+ *          DSH R5 approval pending state with fail-closed expiry and one-decision
+ *          idempotency; actual chip revision for safe firmware selection.
  * [Pos] shared ESP32-P4 protocol dispatcher.
  * [Sync] If this file changes, update firmware/protocol.md and .folder.md.
  */
@@ -61,12 +62,19 @@
 #define PET_P4_JSON_SAFE_INTEGER_MAX 9007199254740991ULL
 #define PET_P4_ASSET_SLOT_MARKER PET_P4_SPIFFS_PREFIX "/p4slot.txt"
 #define PET_P4_SESSION_NOTICE_MS 2200ULL
+/* DSH approval deadlines: the plugin/PC bridge use Unix epoch milliseconds,
+ * while the device only has a boot-relative monotonic clock. 2020-01-01 is far
+ * beyond any plausible boot-relative value, so it cleanly separates the two. */
+#define PET_P4_WALL_CLOCK_EPOCH_MIN_MS 1577836800000ULL
+#define PET_P4_APPROVAL_MAX_HOLD_MS 300000ULL
 
 static const char *TAG = "pet-p4-protocol";
 static int g_asset_active_slot = -1;
 static int g_asset_transfer_slot = -1;
 static char g_asset_transfer_id[PET_P4_DEVICE_ID_MAX];
 static unsigned long long g_asset_transfer_last_activity_ms;
+static unsigned long long g_host_wall_clock_ms;
+static unsigned long long g_host_wall_clock_at_ms;
 static FILE *g_asset_chunk_file;
 static char g_asset_chunk_logical_path[PET_P4_LOGICAL_PATH_MAX];
 static char g_asset_chunk_error[128];
@@ -336,6 +344,49 @@ static unsigned long long json_bounded_u64(
     return fallback;
   }
   return (unsigned long long) item->valuedouble;
+}
+
+/* Best-effort host wall clock from the latest system/heartbeat tsMs. Returns 0
+ * until an anchor was received, so callers can fail closed instead of guessing. */
+static unsigned long long host_wall_clock_estimate_ms(unsigned long long now_ms) {
+  unsigned long long elapsed_ms;
+  if (!g_host_wall_clock_ms || !g_host_wall_clock_at_ms) return 0;
+  elapsed_ms = now_ms >= g_host_wall_clock_at_ms ? now_ms - g_host_wall_clock_at_ms : 0;
+  return g_host_wall_clock_ms + elapsed_ms;
+}
+
+/* Converts the optional approval expiresAtMs into a device monotonic deadline.
+ * Accepts Unix epoch ms (the plugin/bridge contract) and, defensively, values
+ * already expressed in the boot-relative monotonic base. */
+static unsigned long long approval_deadline_ms(
+  unsigned long long expires_ms,
+  unsigned long long now_ms,
+  bool *expired
+) {
+  unsigned long long wall_now_ms;
+  unsigned long long remaining_ms;
+  *expired = false;
+  if (expires_ms == 0) return now_ms + PET_P4_APPROVAL_TIMEOUT_MS;
+  if (expires_ms < PET_P4_WALL_CLOCK_EPOCH_MIN_MS) {
+    /* Already boot-relative milliseconds (debug/legacy bridge senders). */
+    if (expires_ms <= now_ms) *expired = true;
+    return expires_ms;
+  }
+  wall_now_ms = host_wall_clock_estimate_ms(now_ms);
+  if (!wall_now_ms) {
+    /* No heartbeat anchor yet: keep the bounded local default so a wall-clock
+     * value can never turn into an endless modal. */
+    return now_ms + PET_P4_APPROVAL_TIMEOUT_MS;
+  }
+  if (expires_ms <= wall_now_ms) {
+    *expired = true;
+    return 0;
+  }
+  remaining_ms = expires_ms - wall_now_ms;
+  if (remaining_ms > PET_P4_APPROVAL_MAX_HOLD_MS) {
+    remaining_ms = PET_P4_APPROVAL_MAX_HOLD_MS;
+  }
+  return now_ms + remaining_ms;
 }
 
 static void send_topic_payload(pet_p4_send_line_fn send_line, void *ctx, const char *topic, cJSON *payload) {
@@ -1441,8 +1492,76 @@ void pet_p4_state_init(pet_p4_runtime_state_t *state, const char *board_device_i
   pet_p4_asset_catalog_init(&state->asset_catalog);
 }
 
+void pet_p4_state_clear_approval(pet_p4_runtime_state_t *state) {
+  if (!state) return;
+  state->approval_active = false;
+  state->approval_request_id[0] = '\0';
+  state->approval_agent[0] = '\0';
+  state->approval_tool[0] = '\0';
+  state->approval_reason[0] = '\0';
+  state->approval_expires_ms = 0;
+}
+
+bool pet_p4_state_approval_pending(
+  const pet_p4_runtime_state_t *state,
+  unsigned long long now_ms
+) {
+  if (!state || !state->approval_active || !state->approval_request_id[0]) return false;
+  /* A zero deadline is treated as "no deadline" so an older/odd request cannot
+   * make the modal invisible; normal paths always set a bound deadline. */
+  return state->approval_expires_ms == 0 || now_ms < state->approval_expires_ms;
+}
+
+bool pet_p4_state_begin_approval(
+  pet_p4_runtime_state_t *state,
+  const char *request_id,
+  const char *agent,
+  const char *tool,
+  const char *reason,
+  unsigned long long expires_ms
+) {
+  if (!state || !request_id || !request_id[0]) return false;
+  /* A new request always replaces the pending one: the device only ever shows
+   * one modal, and the previous request can no longer be answered locally. */
+  copy_text(state->approval_request_id, sizeof(state->approval_request_id), request_id);
+  copy_text(state->approval_agent, sizeof(state->approval_agent), agent);
+  copy_text(state->approval_tool, sizeof(state->approval_tool), tool);
+  copy_text(state->approval_reason, sizeof(state->approval_reason), reason);
+  state->approval_expires_ms = expires_ms;
+  state->approval_active = true;
+  return true;
+}
+
+bool pet_p4_state_decide_approval(
+  pet_p4_runtime_state_t *state,
+  unsigned long long now_ms,
+  char *request_id_out,
+  size_t request_id_out_size
+) {
+  if (!state || !request_id_out || request_id_out_size == 0) return false;
+  if (!pet_p4_state_approval_pending(state, now_ms)) {
+    /* Never emit a late decision for an expired modal; drop it fail-closed. */
+    pet_p4_state_clear_approval(state);
+    return false;
+  }
+  copy_text(request_id_out, request_id_out_size, state->approval_request_id);
+  copy_text(
+    state->approval_last_decided_id,
+    sizeof(state->approval_last_decided_id),
+    state->approval_request_id
+  );
+  pet_p4_state_clear_approval(state);
+  return true;
+}
+
 void pet_p4_state_process(pet_p4_runtime_state_t *state, unsigned long long now_ms) {
   if (!state) return;
+  if (state->approval_active && state->approval_expires_ms > 0
+      && now_ms >= state->approval_expires_ms) {
+    /* Timeout is fail-closed: hide the modal but never send a decision. */
+    pet_p4_state_clear_approval(state);
+    state->last_update_ms += 1;
+  }
   if (state->conversation_error_until_ms && now_ms >= state->conversation_error_until_ms) {
     pet_p4_conversation_clear(state);
   }
@@ -2087,6 +2206,59 @@ static void handle_speech(pet_p4_runtime_state_t *state, const cJSON *payload) {
   note_remote_lifecycle(state, was_done);
 }
 
+/* R5 DSH approval: the PC bridge forwards one pending permission request. The
+ * device only shows a modal and answers with a single SW1/SW3 decision; policy
+ * (30s plugin timeout, fail-closed) stays on the host side. */
+static bool handle_approval_request(
+  pet_p4_runtime_state_t *state,
+  const cJSON *payload,
+  pet_p4_send_line_fn send_line,
+  void *ctx
+) {
+  const char *request_id = json_string(payload, "requestId");
+  const char *agent = json_string(payload, "agent");
+  const char *tool = json_string(payload, "tool");
+  const char *reason = json_string(payload, "reason");
+  unsigned long long now_ms = (unsigned long long) (esp_timer_get_time() / 1000ULL);
+  unsigned long long expires_ms = json_bounded_u64(
+    payload,
+    "expiresAtMs",
+    PET_P4_JSON_SAFE_INTEGER_MAX,
+    0
+  );
+  unsigned long long deadline_ms;
+  bool expired = false;
+  if (!request_id[0]) {
+    send_protocol_ack(send_line, ctx, "approval/request", payload, false,
+                      "invalid_approval_request", "requestId is required");
+    return false;
+  }
+  if (strcmp(request_id, state->approval_last_decided_id) == 0) {
+    /* The decision already crossed the wire. A replayed request must not
+     * re-open the modal or allow a second decision for the same requestId. */
+    send_protocol_ack(send_line, ctx, "approval/request", payload, false,
+                      "approval_already_decided", "requestId was already decided");
+    return true;
+  }
+  deadline_ms = approval_deadline_ms(expires_ms, now_ms, &expired);
+  if (expired) {
+    /* Requests that expired before arrival are ignored, never shown. */
+    send_protocol_ack(send_line, ctx, "approval/request", payload, false,
+                      "approval_expired", "request is already expired");
+    return true;
+  }
+  if (!pet_p4_state_begin_approval(state, request_id, agent, tool, reason, deadline_ms)) {
+    send_protocol_ack(send_line, ctx, "approval/request", payload, false,
+                      "invalid_approval_request", "requestId is required");
+    return false;
+  }
+  state->last_update_ms += 1;
+  send_protocol_ack(send_line, ctx, "approval/request", payload, true, "ok", NULL);
+  ESP_LOGI(TAG, "approval pending tool=%s expires_ms=%llu",
+           state->approval_tool, state->approval_expires_ms);
+  return true;
+}
+
 static void handle_stats_update(pet_p4_runtime_state_t *state, const cJSON *payload) {
   char *raw = cJSON_PrintUnformatted((cJSON *) payload);
   if (raw) {
@@ -2422,6 +2594,11 @@ bool pet_p4_handle_line(
   } else if (strcmp(topic, "session/current") == 0) {
     handle_session_current(state, payload);
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
+  } else if (strcmp(topic, "approval/request") == 0) {
+    if (!handle_approval_request(state, payload, send_line, ctx)) {
+      cJSON_Delete(root);
+      return false;
+    }
   } else if (strcmp(topic, "control/screen-page") == 0) {
     const char *page = json_string(payload, "page");
     if (strcmp(page, "main") != 0
@@ -2609,7 +2786,20 @@ bool pet_p4_handle_line(
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
   } else if (strcmp(topic, "system/heartbeat") == 0) {
     const cJSON *clock=cJSON_GetObjectItemCaseSensitive(payload,"clock");
-    if(clock)pet_p4_miniapp_clock_sync(clock,esp_timer_get_time()/1000ULL);
+    unsigned long long heartbeat_now_ms = (unsigned long long) (esp_timer_get_time() / 1000ULL);
+    /* The PC bridge sends Unix epoch tsMs every two seconds. Keep it as the
+     * wall-clock anchor used to translate approval expiresAtMs deadlines. */
+    unsigned long long host_ts_ms = json_bounded_u64(
+      payload,
+      "tsMs",
+      4102444800000ULL,
+      0
+    );
+    if(clock)pet_p4_miniapp_clock_sync(clock,heartbeat_now_ms);
+    if (host_ts_ms >= PET_P4_WALL_CLOCK_EPOCH_MIN_MS) {
+      g_host_wall_clock_ms = host_ts_ms;
+      g_host_wall_clock_at_ms = heartbeat_now_ms;
+    }
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
   } else if (pet_p4_diagnostics_handle_topic(topic, payload, state, send_line, ctx)) {
     state->last_update_ms += 1;
