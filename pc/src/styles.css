@@ -14886,3 +14886,22 @@ select:focus-visible {
 .dashboard-actions-menu__switch.is-on::after {
   transform: translateX(12px);
 }
+
+.dashboard-actions-menu__range {
+  display: grid;
+  gap: 5px;
+  padding: 7px 10px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.dashboard-actions-menu__range > span {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dashboard-actions-menu__range input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}

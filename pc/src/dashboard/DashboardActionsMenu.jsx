@@ -22,6 +22,8 @@ export default function DashboardActionsMenu({
   onForceSyncAppearance,
   textRenderingSettings,
   onToggleTextRendering,
+  deviceControls,
+  onUpdateDeviceControl,
   onUpdateFirmware,
   onDiagnostics,
 }) {
@@ -99,6 +101,31 @@ export default function DashboardActionsMenu({
                 <span>Wi-Fi 使用 App 端渲染</span>
                 <span className={`dashboard-actions-menu__switch${textRenderingSettings.wifiApp ? " is-on" : ""}`} />
               </button>
+            </div>
+          )}
+          {deviceControls && (
+            <div className="dashboard-actions-menu__section">
+              <span className="dashboard-actions-menu__section-label">设备控制</span>
+              <label className="dashboard-actions-menu__range">
+                <span>音量 <output>{deviceControls.volume}%</output></span>
+                <input
+                  type="range"
+                  min="0"
+                  max="90"
+                  value={deviceControls.volume}
+                  onChange={(event) => onUpdateDeviceControl?.("volume", Number(event.target.value))}
+                />
+              </label>
+              <label className="dashboard-actions-menu__range">
+                <span>亮度 <output>{deviceControls.brightness}%</output></span>
+                <input
+                  type="range"
+                  min="10"
+                  max="100"
+                  value={deviceControls.brightness}
+                  onChange={(event) => onUpdateDeviceControl?.("brightness", Number(event.target.value))}
+                />
+              </label>
             </div>
           )}
           {onDeviceReturnHome && (

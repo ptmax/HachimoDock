@@ -33,6 +33,7 @@ static esp_lcd_panel_handle_t g_panel_handle;
 static esp_lcd_panel_io_handle_t g_lcd_io;
 static SemaphoreHandle_t g_refresh_done_sem;
 static esp_err_t g_backlight_status = ESP_ERR_INVALID_STATE;
+static int g_brightness_percent = 80;
 static bool g_backlight_revealed;
 static bool g_forced_backlight_logged;
 static bool g_refresh_callback_logged;
@@ -86,6 +87,7 @@ esp_err_t pet_p4_lcd_init(void) {
 
   ESP_LOGI(TAG, "Initialize Waveshare ESP32-P4 LCD BSP");
   ESP_RETURN_ON_ERROR(bsp_display_new(NULL, &g_panel_handle, &g_lcd_io), TAG, "initialize display");
+  (void) bsp_display_brightness_set(g_brightness_percent);
   if (!g_refresh_done_sem) {
     g_refresh_done_sem = xSemaphoreCreateBinary();
     if (!g_refresh_done_sem) return ESP_ERR_NO_MEM;
@@ -140,6 +142,22 @@ esp_err_t pet_p4_lcd_reveal(void) {
 
 esp_err_t pet_p4_lcd_backlight_status(void) {
   return g_backlight_status;
+}
+
+esp_err_t pet_p4_lcd_set_brightness(int percent) {
+  if (percent < 10) percent = 10;
+  if (percent > 100) percent = 100;
+  g_brightness_percent = percent;
+  if (!g_panel_handle) return ESP_ERR_INVALID_STATE;
+  return bsp_display_brightness_set(percent);
+}
+
+int pet_p4_lcd_get_brightness(void) {
+  if (g_panel_handle) {
+    int value = bsp_display_brightness_get();
+    if (value >= 0) return value;
+  }
+  return g_brightness_percent;
 }
 
 esp_err_t pet_p4_lcd_keep_awake(void) {

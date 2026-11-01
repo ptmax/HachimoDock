@@ -52,6 +52,10 @@ import {
   loadTextRenderingSettings,
   toggleTextRenderingSetting,
 } from "./lib/text-rendering-settings.js";
+import {
+  loadDeviceControls,
+  saveDeviceControls,
+} from "./lib/device-controls.js";
 import ChannelMatrixCard from "./dashboard/ChannelMatrixCard.jsx";
 import BoardButtonPanel from "./dashboard/BoardButtonPanel.jsx";
 import VoiceAssistantPanel, { buildVoiceSummary, formatVoiceSessionOption } from "./dashboard/VoiceAssistantPanel.jsx";
@@ -794,6 +798,16 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   const toggleTextRendering = useCallback((key) => {
     setTextRenderingSettings((current) => toggleTextRenderingSetting(current, key));
   }, []);
+  const [deviceControls, setDeviceControls] = useState(loadDeviceControls);
+  const updateDeviceControl = useCallback((key, value) => {
+    setDeviceControls((current) => saveDeviceControls({ ...current, [key]: value }));
+  }, []);
+  useEffect(() => {
+    if (!usb.connected) return undefined;
+    invoke("usb_send_topic", { topic: "ui/device_controls", payload: deviceControls })
+      .catch(() => undefined);
+    return undefined;
+  }, [usb.connected, deviceControls]);
   const [voiceConfig, setVoiceConfig] = useState(loadVoiceConfigFromStorage);
   const voiceConfigRef = useRef(voiceConfig);
   // 实时对话键是否已绑到某个按键（提示文案用；真正的按键事件由 Rust 处理）
@@ -1528,6 +1542,8 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
           onForceSyncAppearance={onForceSyncAppearance}
           textRenderingSettings={textRenderingSettings}
           onToggleTextRendering={toggleTextRendering}
+          deviceControls={deviceControls}
+          onUpdateDeviceControl={updateDeviceControl}
           onUpdateFirmware={usb.connected && usb.runtime === P4_RUNTIME_ID
             ? () => {
               setFirmwareTargetBoardDeviceId(usb.boardDeviceId || "");

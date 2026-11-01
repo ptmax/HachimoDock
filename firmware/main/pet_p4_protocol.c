@@ -19,6 +19,7 @@
 #include "pet_p4_wifi.h"
 #include "pet_p4_conversation.h"
 #include "pet_p4_audio.h"
+#include "pet_p4_lcd.h"
 #include "pet_p4_transport_config.h"
 
 #include <errno.h>
@@ -2864,6 +2865,19 @@ bool pet_p4_handle_line(
   } else if (strcmp(topic, "audio/play_flush") == 0) {
     pet_p4_conversation_playback_begin(state, "");
     pet_p4_audio_stream_flush();
+    send_protocol_ack_if_requested(send_line, ctx, topic, payload);
+  } else if (strcmp(topic, "ui/device_controls") == 0) {
+    const cJSON *volume = cJSON_GetObjectItemCaseSensitive(payload, "volume");
+    const cJSON *brightness = cJSON_GetObjectItemCaseSensitive(payload, "brightness");
+    if (cJSON_IsNumber(volume)) {
+      int value = (int) volume->valuedouble;
+      if (value < 0) value = 0;
+      if (value > 90) value = 90;
+      (void) pet_p4_audio_set_output_volume((unsigned int) value);
+    }
+    if (cJSON_IsNumber(brightness)) {
+      (void) pet_p4_lcd_set_brightness((int) brightness->valuedouble);
+    }
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);
   } else if (strcmp(topic, "ui/conversation") == 0) {
     bool phase_changed = strcmp(state->conversation_state, json_string(payload, "state")) != 0;
