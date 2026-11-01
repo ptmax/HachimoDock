@@ -326,6 +326,8 @@ function forwardSessionEvent(bridge, session, event) {
       const callId = typeof data.callId === 'string' ? data.callId : ''
       const name = boundString(data.name, 120) ?? 'tool'
       remember(bridge.toolNames, `${sessionId}:${callId}`, name)
+      // Tool-running is an active device state, not just a transient event.
+      rememberSessionState(bridge, sessionId, 'tool_running')
       bridge.server.publish('tool', { sessionId, phase: 'start', name, callId: callId || undefined, ok: true })
       return
     }

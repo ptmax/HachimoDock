@@ -211,3 +211,29 @@ test('the replay buffer is bounded', async (t) => {
   const first = await sse.next()
   assert.equal(first.data.index, 600 - replay.length)
 })
+
+test('tool/call publishes tool_running and tool/result returns to working', async (t) => {
+  const session = createFakeSession('session-tool-state', { cwd: '/tmp/tool-state' })
+  const ctx = createFakeCtx({ sessions: [session] })
+  const { bridge, url } = await startTestBridge(t, ctx)
+  await waitFor(() => bridge.server.hasEventSubscriber() === false)
+
+  ctx.dispatchSync('session/event', session, { type: 'turn/start', time: 2000, data: { turn: 1 } })
+  ctx.dispatchSync('session/event', session, {
+    type: 'tool/call',
+    time: 2001,
+    data: { turn: 1, step: 1, callId: 'call-state', name: 'bash', arguments: '{"cmd":"sleep 1"}' },
+  })
+  let { body } = await requestJson(`${url}/sessions`)
+  assert.equal(body.sessions[0].state, 'tool_running')
+  const toolRevision = body.sessions[0].transitionRevision
+
+  ctx.dispatchSync('session/event', session, {
+    type: 'tool/result',
+    time: 2002,
+    data: { turn: 1, step: 1, message: { callId: 'call-state' } },
+  })
+  ;({ body } = await requestJson(`${url}/sessions`))
+  assert.equal(body.sessions[0].state, 'working')
+  assert.ok(body.sessions[0].transitionRevision > toolRevision)
+})
