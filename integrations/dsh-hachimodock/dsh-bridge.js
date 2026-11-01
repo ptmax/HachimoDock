@@ -86,7 +86,9 @@ function normalizeOptions(config = {}) {
     (Number.isSafeInteger(options.injectTimeoutMs) && options.injectTimeoutMs > 0
       ? options.injectTimeoutMs
       : DEFAULT_INJECT_TIMEOUT_MS)
-  return { port, approvalTimeoutMs, approvalFallback, injectTimeoutMs, maxInjectTokenChars: MAX_INJECT_TOKEN_CHARS }
+  const mirrorNative =
+    process.env.HACHIMODOCK_DSH_MIRROR_NATIVE !== '0'
+  return { port, approvalTimeoutMs, approvalFallback, mirrorNative, injectTimeoutMs, maxInjectTokenChars: MAX_INJECT_TOKEN_CHARS }
 }
 
 /**
@@ -613,7 +615,25 @@ async function handleApprovalRequest(bridge, request, next) {
         if (!oldest.done) bridge.approvalLinks.delete(oldest.value)
       }
     }
-    const outcome = await prompt.outcome
+    // Native Web/Desktop approval and the device are both live answerers.
+    // Never let the native answerer's immediate "unavailable" short-circuit
+    // the device; race only meaningful decisions, then let the device timeout
+    // remain the fail-closed terminal path.
+    const nativeOutcome = Promise.resolve()
+      .then(() => (bridge.options.mirrorNative ? delegate() : 'unavailable'))
+      .catch(() => 'unavailable')
+    const outcome = await new Promise((resolve) => {
+      let settled = false
+      const finish = (value) => {
+        if (settled) return
+        settled = true
+        resolve(value)
+      }
+      prompt.outcome.then((value) => finish(value))
+      nativeOutcome.then((value) => {
+        if (value === 'allowed-once' || value === 'rejected') finish(value)
+      })
+    })
     if (outcome === 'allowed-once' || outcome === 'rejected') return outcome
     return 'unavailable'
   } catch (error) {

@@ -2154,6 +2154,18 @@ static void handle_state_topic(pet_p4_runtime_state_t *state, const char *topic,
   copy_text(state->current_status, sizeof(state->current_status), json_string(payload, "status"));
   if (!state->current_status[0]) copy_text(state->current_status, sizeof(state->current_status), state->current_state);
   copy_text(state->current_status_text, sizeof(state->current_status_text), json_string(payload, "statusText"));
+  if (strcmp(agent, "deepseek-harness") == 0) {
+    /* DSH has no speech/title events on the USB protocol. Clear the previous
+     * idle "休息中" body (and any stale title) so a working/tool state does not
+     * keep rendering the old bubble text. */
+    state->current_speech[0] = '\0';
+    state->current_title[0] = '\0';
+    const char *dsh_title = json_string(payload, "title");
+    if (!dsh_title[0]) dsh_title = json_string(payload, "sessionTitle");
+    if (dsh_title[0]) {
+      copy_text(state->current_title, sizeof(state->current_title), dsh_title);
+    }
+  }
   pet_p4_stats_update(&state->stats, payload, agent);
   if (state->stats.session_title[0]) {
     copy_text(

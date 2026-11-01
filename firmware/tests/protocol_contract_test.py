@@ -2471,6 +2471,10 @@ def test_p4_dsh_state_is_not_replaced_by_session_card_fallback():
     restore = restore[:restore.index("static void mark_current_session_terminal(")]
     assert 'strcmp(state->active_agent, "deepseek-harness") == 0' in restore
     assert 'strncmp(state->current_event, "tool/", 5) == 0' in restore
+    state_topic = protocol[protocol.index("static void handle_state_topic("):]
+    state_topic = state_topic[:state_topic.index("static void handle_speech(")]
+    assert "state->current_speech[0]" in state_topic
+    assert "state->current_title[0]" in state_topic
     runner = read_required("tests/protocol_contract_test.py")
     assert "test_p4_dsh_state_is_not_replaced_by_session_card_fallback" in runner
 
