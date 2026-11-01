@@ -437,7 +437,10 @@ def test_p4_token_widget_uses_bounded_stats_instead_of_host_readers():
     ]:
         assert f'set_string_var(&g_runtime, "{variable}"' in miniapp
     assert protocol.count("pet_p4_miniapp_sync_stats(&state->stats)") >= 3
-    activation = input_runtime[input_runtime.index('strcmp(binding->action, "page_enter") == 0') :]
+    # Start from the local-action dispatcher; the approval helper also compares
+    # configured page_enter/page_back actions earlier in the file.
+    activation = input_runtime[input_runtime.index("static bool apply_local_action(") :]
+    activation = activation[activation.index('strcmp(binding->action, "page_enter") == 0') :]
     activation = activation[: activation.index('strcmp(binding->action, "page_back") == 0')]
     assert "pet_p4_miniapp_catalog_activate_selected()" in activation
     assert "pet_p4_miniapp_sync_stats(&state->stats)" in activation
@@ -2459,7 +2462,7 @@ def test_windows_tooling_forces_utf8_and_ascii_paths():
 
 def test_p4_dsh_approval_modal_is_single_shot_and_bounded():
     """R5 DSH 审批上屏：PC 下发 approval/request，设备只显示模态卡片并通过
-    SW1/SW3 回传一次 approval/decision；过期 fail-closed，重复 requestId 去重。"""
+    配置的确认/取消键回传一次 approval/decision；过期 fail-closed，重复 requestId 去重。"""
     header = read_required("main/pet_p4_protocol.h")
     protocol = read_required("main/pet_p4_protocol.c")
     renderer = read_required("main/pet_p4_renderer.c")
@@ -2561,7 +2564,7 @@ def test_p4_dsh_approval_modal_is_single_shot_and_bounded():
     assert 'state->approval_tool[0] ? state->approval_tool : "未知工具"' in renderer
     assert 'state->approval_reason[0] ? state->approval_reason : "无说明"' in renderer
     assert "draw_card_body_lines(" in renderer
-    assert '"SW1 允许"' in renderer and '"SW3 拒绝"' in renderer
+    assert '"允许"' in renderer and '"拒绝"' in renderer
     render_source = renderer[
         renderer.index("esp_err_t pet_p4_renderer_render("):
         renderer.index("esp_err_t pet_p4_renderer_render_transfer_status(")
@@ -2580,15 +2583,16 @@ def test_p4_dsh_approval_modal_is_single_shot_and_bounded():
     ]
     assert "if (handle_approval_input(state, send_line, ctx, &event)) continue;" in input_process
     approval_input = input_source[
-        input_source.index("static bool handle_approval_input("):
+        input_source.index("static bool approval_decision_for_event("):
         input_source.index("static bool apply_local_action(")
     ]
     assert "if (!state || !event || !state->approval_active) return false;" in approval_input
     assert "event->gesture != PET_P4_INPUT_GESTURE_SHORT_PRESS" in approval_input
     assert "PET_P4_INPUT_GESTURE_HOLD_END && state->session_voice_active" in approval_input
     assert "pet_p4_audio_capture_stop();" in approval_input
-    assert "event->control == PET_P4_INPUT_CONTROL_SW1" in approval_input
-    assert "event->control == PET_P4_INPUT_CONTROL_SW3" in approval_input
+    assert "approval_decision_for_event(event, &allow)" in approval_input
+    assert 'strcmp(binding->action, "page_enter") == 0' in approval_input
+    assert 'strcmp(binding->action, "page_back") == 0' in approval_input
     assert "pet_p4_state_decide_approval(" in approval_input
     assert 'cJSON_AddStringToObject(root, "topic", "approval/decision");' in input_source
     assert 'cJSON_AddStringToObject(payload, "decision", allow ? "allow" : "deny");' in input_source
@@ -2604,7 +2608,7 @@ def test_p4_dsh_approval_modal_is_single_shot_and_bounded():
     assert '"topic":"approval/request"' in doc
     assert '"topic":"approval/decision"' in doc
     assert "需要授权" in doc
-    assert "SW1 允许" in doc and "SW3 拒绝" in doc
+    assert "page_enter" in doc and "page_back" in doc
     assert "approval_expired" in doc
     assert "approval_already_decided" in doc
     assert "PET_P4_APPROVAL_TIMEOUT_MS" in doc

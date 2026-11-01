@@ -5290,11 +5290,11 @@ static void draw_approval_overlay(
     content_w - 32,
     reason_ink
   );
-  draw_approval_button(content_x, card_y + 290, button_w, button_h, "SW1 允许",
+  draw_approval_button(content_x, card_y + 290, button_w, button_h, "允许",
                        rgb565(18, 54, 38), rgb565(64, 196, 128),
                        rgb565(122, 236, 172));
   draw_approval_button(content_x + button_w + 16, card_y + 290, button_w, button_h,
-                       "SW3 拒绝", rgb565(54, 22, 22), rgb565(236, 96, 88),
+                       "拒绝", rgb565(54, 22, 22), rgb565(236, 96, 88),
                        rgb565(255, 150, 140));
 }
 

@@ -1075,10 +1075,41 @@ static void send_approval_decision(
   cJSON_Delete(root);
 }
 
-/* While the DSH approval modal is up, physical input is modal too: SW1 allows,
- * SW3 denies, and every other gesture is swallowed. Holds/long presses can
- * never decide. A short press clears the pending request before the next event
- * is dequeued, so a duplicated press cannot produce a second decision. */
+/* Resolve an approval decision from the configured button bindings rather than
+ * physical button IDs: the global confirm action ("page_enter") allows and the
+ * global cancel/back action ("page_back") denies. This follows the user's
+ * button configuration automatically. */
+static bool approval_decision_for_event(
+  const pet_p4_input_event_t *event,
+  bool *allow
+) {
+  char event_name[PET_P4_INPUT_EVENT_MAX];
+  const char *prefix;
+  const pet_p4_input_binding_t *binding;
+  if (!event || !allow || event->gesture != PET_P4_INPUT_GESTURE_SHORT_PRESS) {
+    return false;
+  }
+  prefix = button_event_prefix(event->control);
+  if (!prefix[0]) return false;
+  snprintf(event_name, sizeof(event_name), "%s.short_press", prefix);
+  binding = active_binding(event_name);
+  if (!binding) return false;
+  if (strcmp(binding->action, "page_enter") == 0) {
+    *allow = true;
+    return true;
+  }
+  if (strcmp(binding->action, "page_back") == 0) {
+    *allow = false;
+    return true;
+  }
+  return false;
+}
+
+/* While the DSH approval modal is up, physical input is modal too: the
+ * configured confirm/enter gesture allows, the configured cancel/back gesture
+ * denies, and every other gesture is swallowed. Holds/long presses can never
+ * decide. A short press clears the pending request before the next event is
+ * dequeued, so a duplicated press cannot produce a second decision. */
 static bool handle_approval_input(
   pet_p4_runtime_state_t *state,
   pet_p4_send_line_fn send_line,
@@ -1095,9 +1126,7 @@ static bool handle_approval_input(
     (void) pet_p4_audio_capture_stop();
   }
   if (event->gesture != PET_P4_INPUT_GESTURE_SHORT_PRESS) return true;
-  if (event->control == PET_P4_INPUT_CONTROL_SW1) allow = true;
-  else if (event->control == PET_P4_INPUT_CONTROL_SW3) allow = false;
-  else return true;
+  if (!approval_decision_for_event(event, &allow)) return true;
   if (!pet_p4_state_decide_approval(
         state,
         event->ts_ms,
