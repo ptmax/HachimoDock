@@ -10326,7 +10326,11 @@ fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
             "system/heartbeat",
             &serde_json::json!({ "tsMs": current_timestamp_ms() }),
         ) {
-            eprintln!("[usb-heartbeat] send failed: {}", error);
+            eprintln!("[usb-heartbeat] send failed, forcing reconnect: {}", error);
+            // A stale writer can keep status.connected=true after the board
+            // disappears. Dropping the connection lets start_usb_auto_connect
+            // probe and restore the port without a manual rescan.
+            usb_manager.disconnect();
         }
     });
 }
