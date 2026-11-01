@@ -220,13 +220,14 @@ void pet_bubble_pixels_select(const char *owner, unsigned style, const char *tit
     if (!view->waiting) view->pending_since = now_ms;
     view->waiting = true;
   }
+  bool use_pixels = expect_pixels && ready;
   if (ready || !expect_pixels || view->degraded || now_ms - view->pending_since >= WAIT_MS) {
     bool changed = strcmp(view->shown.title, title) || strcmp(view->shown.body, body)
-      || view->shown.pixels != ready;
+      || view->shown.pixels != use_pixels;
     if (changed) {
       snprintf(view->shown.title, sizeof(view->shown.title), "%s", title);
       snprintf(view->shown.body, sizeof(view->shown.body), "%s", body);
-      view->shown.pixels = ready; view->shown.since_ms = now_ms;
+      view->shown.pixels = use_pixels; view->shown.since_ms = now_ms;
       view->title_key = text_key(PET_BUBBLE_TITLE, title);
       view->body_key = text_key(style, body);
       atomic_fetch_add(&revision, 1);
