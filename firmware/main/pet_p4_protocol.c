@@ -2605,6 +2605,14 @@ bool pet_p4_handle_line(
   if (strcmp(topic, "ack") == 0 || strcmp(topic, "bind") == 0) {
     copy_text(state->desktop_device_id, sizeof(state->desktop_device_id), json_string(payload, "desktopDeviceId"));
     pet_p4_send_hello(state, send_line, ctx);
+  } else if (strcmp(topic, "approval/cancel") == 0) {
+    const char *request_id = json_string(payload, "requestId");
+    if (request_id[0]
+        && strcmp(request_id, state->approval_request_id) == 0) {
+      pet_p4_state_clear_approval(state);
+      state->last_update_ms += 1;
+    }
+    return true;
   } else if (strncmp(topic, "state/", 6) == 0) {
     handle_state_topic(state, topic, payload);
     send_protocol_ack_if_requested(send_line, ctx, topic, payload);

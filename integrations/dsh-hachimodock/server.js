@@ -434,6 +434,19 @@ class BridgeServer {
   }
 
   /**
+   * Withdraw a pending approval because the native DSH answerer won. This emits
+   * an approval-cancel event so the HachimoDock relay can clear the device modal.
+   * @param {string} requestId - pending approval id.
+   * @returns {boolean} whether a pending request was cancelled.
+   */
+  cancelApproval(requestId) {
+    if (!this.pending.has(requestId)) return false
+    this.settleApproval(requestId, 'unavailable', { expired: false })
+    this.publish('approval-cancel', { requestId })
+    return true
+  }
+
+  /**
    * Settle one pending approval, remember its terminal state, and clean up.
    * @param {string} requestId - pending id.
    * @param {string} outcome - closed approval outcome.

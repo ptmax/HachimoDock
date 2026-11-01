@@ -293,6 +293,13 @@ fn run_event_stream(usb: UsbSerialManager, base_url: String) -> Result<(), Strin
                         let base_url = base_url.clone();
                         thread::spawn(move || wait_for_device_decision(usb, request, base_url));
                     }
+                } else if event == "approval-cancel" {
+                    if let Some(request_id) = payload.get("requestId").and_then(Value::as_str) {
+                        let _ = usb.send(
+                            "approval/cancel",
+                            &json!({"requestId": request_id}),
+                        );
+                    }
                 }
                 // Session/status data is owned by the normal session/current
                 // pipeline. Do not emit a second generic state bubble here:

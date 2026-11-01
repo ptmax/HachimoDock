@@ -649,17 +649,21 @@ async function handleApprovalRequest(bridge, request, next) {
       .catch(() => 'unavailable')
     const outcome = await new Promise((resolve) => {
       let settled = false
-      const finish = (value) => {
+      const finish = (source, value) => {
         if (settled) return
         settled = true
-        resolve(value)
+        resolve({ source, value })
       }
-      prompt.outcome.then((value) => finish(value))
+      prompt.outcome.then((value) => finish('device', value))
       nativeOutcome.then((value) => {
-        if (value === 'allowed-once' || value === 'rejected') finish(value)
+        if (value === 'allowed-once' || value === 'rejected') finish('native', value)
       })
     })
-    if (outcome === 'allowed-once' || outcome === 'rejected') return outcome
+    if (outcome.source === 'native') {
+      bridge.server.cancelApproval(prompt.requestId)
+      return outcome.value
+    }
+    if (outcome.value === 'allowed-once' || outcome.value === 'rejected') return outcome.value
     return 'unavailable'
   } catch (error) {
     bridge.logger.warn(error)
