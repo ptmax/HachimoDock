@@ -5345,7 +5345,8 @@ static void draw_approval_overlay(
     content_x + 16,
     card_y + 206,
     content_w - 32,
-    reason_ink
+    reason_ink,
+    false
   );
   draw_approval_button(content_x, card_y + 290, button_w, button_h, "允许",
                        rgb565(18, 54, 38), rgb565(64, 196, 128),
