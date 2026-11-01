@@ -16,3 +16,6 @@
       config:
         port: 17892
         approvalTimeoutMs: 30000
+        # HachimoDock's USB relay attaches /events only while a P4 is connected.
+        # Without it, keep the normal DSH Desktop approval UI as the answerer.
+        approvalFallback: delegate
