@@ -6,6 +6,7 @@
  */
 
 import { useEffect, useReducer, useRef } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   fetchAgentSessionEvents,
   fetchAgentSessions,
@@ -16,6 +17,7 @@ import {
   mergeP4SessionEvent,
   mergeP4SessionSnapshot,
 } from "../lib/p4-session-service.js";
+import { isActiveDeviceSession } from "../lib/session-display.js";
 
 export const P4_SESSION_EVENT_POLL_MS = 750;
 export const P4_SESSION_SNAPSHOT_POLL_MS = 5000;
@@ -27,7 +29,6 @@ const TERMINAL_SESSION_STATES = new Set([
   "failed",
   "complete",
   "completed",
-  "stopped",
 ]);
 const EMPTY_SESSIONS = Object.freeze([]);
 
@@ -55,7 +56,7 @@ function nextSessionFeedState(state, action, routingSessions, authoritativeSnaps
     routingSessions,
     dismissedSessions,
   );
-  const sessions = displayEnabled
+  let sessions = displayEnabled
     ? buildP4ConversationQueue(
       visibleRoutingSessions,
       previousQueue,
@@ -63,6 +64,20 @@ function nextSessionFeedState(state, action, routingSessions, authoritativeSnaps
       { authoritativeSnapshot },
     )
     : [];
+  if (displayEnabled && sessions.length === 0) {
+    // Event/snapshot races can transiently empty the device queue while the
+    // routing feed still contains an active Agent session. Recover that active
+    // card instead of leaving the P4 blank until the next turn.
+    const activeRouting = visibleRoutingSessions.filter(isActiveDeviceSession);
+    if (activeRouting.length > 0) {
+      sessions = buildP4ConversationQueue(
+        activeRouting,
+        [],
+        action.nowMs,
+        { authoritativeSnapshot: true },
+      );
+    }
+  }
   const fingerprint = JSON.stringify([sessions, routingSessions]);
   if (sameAgent && fingerprint === state.fingerprint) return state;
   return {
@@ -97,13 +112,22 @@ export function agentSessionFeedReducer(state, action) {
     case "tick_terminal": {
       const agentId = action.agentId || "";
       if (!state.loaded || state.agentId !== agentId) return state;
-      const sessions = action.displayEnabled === false
+      const routing = filterDismissedP4Sessions(state.routingSessions, action.dismissedSessions);
+      let sessions = action.displayEnabled === false
         ? []
         : buildP4ConversationQueue(
-          filterDismissedP4Sessions(state.routingSessions, action.dismissedSessions),
+          routing,
           filterDismissedP4Sessions(state.sessions, action.dismissedSessions),
           action.nowMs,
         );
+      if (action.displayEnabled !== false && sessions.length === 0) {
+        const activeRouting = routing.filter(isActiveDeviceSession);
+        if (activeRouting.length > 0) {
+          sessions = buildP4ConversationQueue(activeRouting, [], action.nowMs, {
+            authoritativeSnapshot: true,
+          });
+        }
+      }
       const fingerprint = JSON.stringify([sessions, state.routingSessions]);
       if (fingerprint === state.fingerprint) return state;
       return { ...state, sessions, fingerprint };
@@ -147,6 +171,7 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
     let snapshotInFlight = false;
     let eventTimer = null;
     let snapshotTimer = null;
+    let unlistenHeartbeat = null;
     let drainTimer = null;
     let draining = false;
     const pendingEvents = [];
@@ -268,6 +293,13 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
       scheduleSnapshotRefresh();
     };
     bootstrap();
+    void listen("agent-session-heartbeat", () => {
+      void pollEvents();
+      void refreshSnapshot();
+    }).then((unlisten) => {
+      if (cancelled) unlisten();
+      else unlistenHeartbeat = unlisten;
+    }).catch(() => undefined);
 
     return () => {
       cancelled = true;
@@ -276,6 +308,7 @@ export function useAgentSessionFeed({ agentId, displayEnabled, dismissedSessions
       if (eventTimer) clearTimeout(eventTimer);
       if (snapshotTimer) clearTimeout(snapshotTimer);
       if (drainTimer) clearTimeout(drainTimer);
+      unlistenHeartbeat?.();
     };
   }, [agentId, dismissedSessions, displayEnabled]);
 
