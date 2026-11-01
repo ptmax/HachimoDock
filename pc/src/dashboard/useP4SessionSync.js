@@ -18,10 +18,27 @@ import {
   p4SessionDisplayTitle,
   p4SessionActivitySignature,
 } from "../lib/p4-session-service.js";
+import { flattenMarkdownForDevice } from "../lib/device-markdown.js";
 
 export const P4_MANUAL_SESSION_TIMEOUT_MS = 5 * 60_000;
 export const P4_SESSION_LEASE_REFRESH_MS = 4_000;
 const P4_DEVICE_SESSION_LIMIT = 8;
+const P4_SESSION_BINDING_TIMEOUT_MS = 4_000;
+
+/**
+ * Bound one USB binding command so a stuck serial write cannot poison every
+ * later session-card update behind the serialized binding queue.
+ * @param {Promise<unknown>} promise - invoke promise.
+ * @param {number} timeoutMs - maximum wait.
+ * @returns {Promise<unknown>} original result or timeout rejection.
+ */
+function withBindingTimeout(promise, timeoutMs = P4_SESSION_BINDING_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error("P4 session binding timed out")), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 export function createMissingSessionNoticeGate() {
   let lastContext = null;
@@ -72,7 +89,7 @@ export function cycleVoiceSessionId(currentSessionId, sessions, direction) {
 }
 
 export function formatDeviceSessionTitle(session, fallbackSessionId = "") {
-  const title = p4SessionDisplayTitle(session);
+  const title = flattenMarkdownForDevice(p4SessionDisplayTitle(session));
   if (title) return title;
   const sessionId = normalizeText(session?.id) || normalizeText(fallbackSessionId);
   return sessionId && sessionId !== "auto" ? `会话 ${sessionId.slice(0, 8)}` : "";
@@ -94,11 +111,12 @@ export function isDeviceSessionTargetUnique(selectedSession, sessions) {
 
 export function formatDeviceSessionContent(session, title = "") {
   if (normalizeText(session?.state).toLowerCase() === "stopped") return "已停止";
-  const liveContent = normalizeText(session?.displayContent);
+  const liveContent = flattenMarkdownForDevice(normalizeText(session?.displayContent));
   if (liveContent) return clampUtf8Text(liveContent, 383);
-  const summary = normalizeText(session?.summary);
-  if (!summary || summary.startsWith("<recommended_plugins>")) return "";
-  if (summary === normalizeText(title)) return "";
+  const rawSummary = normalizeText(session?.summary);
+  if (!rawSummary || rawSummary.startsWith("<recommended_plugins>")) return "";
+  const summary = flattenMarkdownForDevice(rawSummary);
+  if (!summary || summary === normalizeText(title)) return "";
   return clampUtf8Text(summary, 383);
 }
 
@@ -117,6 +135,13 @@ export function useP4SessionSync({
   push,
 }) {
   const [selection, setSelection] = useState({ sessionId: "auto", selectedAt: 0 });
+  const [bindingDebug, setBindingDebug] = useState({
+    error: "",
+    okAt: 0,
+    attempts: 0,
+    inFlight: false,
+    last: "",
+  });
   const [bindingSyncRevision, requestBindingSync] = useReducer(
     (revision) => revision + 1,
     0,
@@ -239,9 +264,15 @@ export function useP4SessionSync({
       ? normalizeText(selectedRoutingSession?.id)
       : sessionId;
     if (matchedNotice) pendingNoticeRef.current = null;
+    setBindingDebug((debug) => ({
+      ...debug,
+      attempts: debug.attempts + 1,
+      inFlight: true,
+      last: "invoking",
+    }));
     const bindingPromise = bindingQueueRef.current
       .catch(() => undefined)
-      .then(() => invoke("set_p4_session_binding", {
+      .then(() => withBindingTimeout(invoke("set_p4_session_binding", {
         input: {
           boardDeviceId,
           agentId,
@@ -259,10 +290,17 @@ export function useP4SessionSync({
           displayEnabled: cardsEnabled,
           notice,
         },
-      }));
+      })));
     bindingQueueRef.current = bindingPromise.catch(() => undefined);
     bindingPromise
       .then((result) => {
+        setBindingDebug((debug) => ({
+          ...debug,
+          error: "",
+          okAt: Date.now(),
+          inFlight: false,
+          last: result?.sessionId ? "ok" : "empty",
+        }));
         const resultSessionId = normalizeText(result?.sessionId) || "auto";
         if (resultSessionId !== requestedSessionId || !matchedNotice) return;
         const location = normalizeText(result?.desktopLocation).toLowerCase();
@@ -285,6 +323,13 @@ export function useP4SessionSync({
         });
       })
       .catch((error) => {
+        setBindingDebug((debug) => ({
+          ...debug,
+          error: String(error?.message || error),
+          okAt: 0,
+          inFlight: false,
+          last: "error",
+        }));
         console.warn("[p4] failed to update target session", error);
         if (matchedNotice) {
           push?.({ tone: "error", title: "会话切换失败", message: String(error) });
@@ -436,6 +481,9 @@ export function useP4SessionSync({
     sessionsLoaded,
     selectedRoutingSession,
     selectableSessions,
+    deviceSessions,
+    cardsEnabled,
+    bindingDebug,
     onSessionChange,
   };
 }

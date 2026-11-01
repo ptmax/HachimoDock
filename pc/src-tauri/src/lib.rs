@@ -111,6 +111,7 @@ mod reference_image;
 mod realtime_chat_log;
 mod usb_audio;
 mod usb_serial;
+mod wifi_transport;
 mod voice_chat_settings;
 mod volcengine_asr;
 
@@ -600,7 +601,7 @@ fn validate_p4_session_transition_metadata(
     }
     let terminal = matches!(
         state,
-        "done" | "error" | "failed" | "complete" | "completed"
+        "done" | "error" | "failed" | "complete" | "completed" | "stopped"
     );
     if terminal_remaining_ms > 0 && !terminal {
         return Err("非终态设备会话不能携带终态保留时间".to_string());
@@ -836,6 +837,19 @@ fn pc_audio_board_binding() -> &'static Mutex<PcAudioBoardBinding> {
 fn p4_session_binding() -> &'static Mutex<P4SessionBinding> {
     static BINDING: OnceLock<Mutex<P4SessionBinding>> = OnceLock::new();
     BINDING.get_or_init(|| Mutex::new(P4SessionBinding::default()))
+}
+
+/// Last time the foreground WebView successfully requested a P4 binding.
+/// The native feed takes over only after this goes stale, so foreground and
+/// background never race to own the same device card.
+static P4_FRONTEND_SESSION_SYNC_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn unix_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn active_device_voice_context() -> &'static Mutex<Option<Arc<DeviceVoiceContext>>> {
@@ -2629,6 +2643,15 @@ fn handle_incoming_usb_message(
     topic: String,
     payload: serde_json::Value,
 ) {
+    handle_incoming_device_message(emitter, topic, payload, "usb");
+}
+
+fn handle_incoming_device_message(
+    emitter: &tauri::AppHandle,
+    topic: String,
+    payload: serde_json::Value,
+    transport: &str,
+) {
     resolve_button_config_ack(&topic, &payload);
     if topic == "approval/decision" {
         dsh_approval::handle_device_decision(&payload);
@@ -2672,7 +2695,7 @@ fn handle_incoming_usb_message(
         if topic != "audio/chunk" {
             let _ = emitter.emit(
                 "usb-message",
-                serde_json::json!({"topic": topic, "payload": payload}),
+                serde_json::json!({"topic": topic, "payload": payload, "transport": transport}),
             );
         }
         if let Some(event) = relay_event {
@@ -2776,7 +2799,7 @@ fn handle_incoming_usb_message(
 
     let _ = emitter.emit(
         "usb-message",
-        serde_json::json!({"topic": topic, "payload": payload}),
+        serde_json::json!({"topic": topic, "payload": payload, "transport": transport}),
     );
 
     if confirm_pending_device_voice_draft(&topic, &payload) {
@@ -4105,6 +4128,10 @@ fn set_p4_session_binding_blocking(
     input: SetP4SessionBindingInput,
     usb_manager: usb_serial::UsbSerialManager,
 ) -> Result<P4SessionBinding, String> {
+    P4_FRONTEND_SESSION_SYNC_MS.store(
+        unix_epoch_ms(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let board_device_id = input.board_device_id.trim().to_string();
     let agent_id = normalize_agent_id(&input.agent_id)
         .ok_or_else(|| "请选择一个受支持的 Agent".to_string())?;
@@ -4203,15 +4230,9 @@ fn set_p4_session_binding_blocking(
     let mut binding = p4_session_binding()
         .lock()
         .map_err(|error| error.to_string())?;
-    if should_preserve_exact_auto_binding(
-        &binding,
-        &board_device_id,
-        &agent_id,
-        &session_id,
-        input.auto_follow,
-    ) {
-        return Ok(binding.clone());
-    }
+    // Do not return early here. Even when the auto-follow target is preserved,
+    // the P4 still needs the refreshed session queue; returning skipped the
+    // entire session/current USB packet and left the device bubble stale.
     let target_changed = binding.board_device_id != board_device_id
         || binding.agent_id != agent_id
         || binding.session_id != session_id
@@ -6190,6 +6211,41 @@ fn detect_codex() -> DetectedAgent {
     }
 }
 
+/// Decide the OpenClaw discovery state from a real CLI entry and the local
+/// status-bridge identity file.
+///
+/// `~/.status-bridge/openclaw-device.json` is created by the bundled status
+/// bridge on first launch (it is only a local MQTT device identity), so its
+/// presence must never be reported as an installed OpenClaw CLI/Gateway.
+fn openclaw_detection(
+    cli_path: Option<&str>,
+    has_status_bridge_identity: bool,
+) -> (bool, &'static str, String) {
+    match (cli_path, has_status_bridge_identity) {
+        (Some(path), true) => (
+            true,
+            "ready",
+            format!("已检测到 OpenClaw CLI 与本地状态桥身份: {}", path),
+        ),
+        (Some(path), false) => (
+            true,
+            "ready",
+            format!("已检测到 OpenClaw CLI（等待 Gateway 配置）: {}", path),
+        ),
+        (None, true) => (
+            false,
+            "not_found",
+            "仅检测到 HachimoDock 本地状态桥身份文件（客户端自动生成），未安装 OpenClaw CLI"
+                .to_string(),
+        ),
+        (None, false) => (
+            false,
+            "not_found",
+            "未检测到 OpenClaw CLI 或 Gateway".to_string(),
+        ),
+    }
+}
+
 fn detect_openclaw() -> DetectedAgent {
     let home = get_home_dir().ok();
     let cli_path = find_agent_executable(
@@ -6207,37 +6263,18 @@ fn detect_openclaw() -> DetectedAgent {
                 .to_string()
         })
         .unwrap_or_default();
-    let has_config = !config_path.is_empty() && Path::new(&config_path).exists();
+    let has_status_bridge_identity =
+        !config_path.is_empty() && Path::new(&config_path).exists();
 
-    let (detected, status, detail) = match (&cli_path, has_config) {
-        (Some(path), true) => (
-            true,
-            "ready".to_string(),
-            format!("已检测到 OpenClaw CLI 与 Gateway: {}", path),
-        ),
-        (Some(path), false) => (
-            true,
-            "ready".to_string(),
-            format!("已检测到 OpenClaw CLI（等待 Gateway 配置）: {}", path),
-        ),
-        (None, true) => (
-            true,
-            "ready".to_string(),
-            "OpenClaw Gateway 已配置（未发现 CLI 入口）".to_string(),
-        ),
-        (None, false) => (
-            false,
-            "not_found".to_string(),
-            "未检测到 OpenClaw CLI 或 Gateway".to_string(),
-        ),
-    };
+    let (detected, status, detail) =
+        openclaw_detection(cli_path.as_deref(), has_status_bridge_identity);
 
     DetectedAgent {
         id: "openclaw".to_string(),
         label: "OpenClaw".to_string(),
         detected,
         ready: status == "ready",
-        status,
+        status: status.to_string(),
         detail,
         command_path: cli_path.unwrap_or_default(),
         config_path,
@@ -6781,6 +6818,61 @@ async fn usb_send_state(
     usb_manager.send_state(&source, &payload)
 }
 
+/// Send an arbitrary JSON topic to the connected board. Used by the optional
+/// Wi-Fi provisioning/status panel; USB remains the provisioning path.
+#[tauri::command]
+async fn usb_send_topic(
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    topic: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    usb_manager.send(&topic, &payload)
+}
+
+/// Optional PC-side Wi-Fi TCP transport. The firmware sends a hello line on
+/// connect; this layer keeps the TCP socket alive and forwards JSONL messages
+/// through the same `usb-message` event shape used by the USB bridge.
+#[tauri::command]
+async fn wifi_tcp_connect(
+    app: tauri::AppHandle,
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+    ip: String,
+    port: Option<u16>,
+) -> Result<wifi_transport::WifiConnectionStatus, String> {
+    let emitter = app.clone();
+    let handler: wifi_transport::WifiMessageHandler =
+        std::sync::Arc::new(move |topic: &str, payload: &serde_json::Value| {
+            // Reuse the shared device pipeline so session/state listeners see
+            // Wi-Fi messages, tagged with their actual transport.
+            handle_incoming_device_message(&emitter, topic.to_string(), payload.clone(), "wifi");
+        });
+    transport.connect(&ip, port.unwrap_or(3232), handler)
+}
+
+#[tauri::command]
+async fn wifi_tcp_disconnect(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+) -> Result<(), String> {
+    transport.disconnect();
+    Ok(())
+}
+
+#[tauri::command]
+async fn wifi_tcp_status(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+) -> Result<wifi_transport::WifiConnectionStatus, String> {
+    Ok(transport.status())
+}
+
+#[tauri::command]
+async fn wifi_tcp_send(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+    topic: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    transport.send(&topic, &payload)
+}
+
 #[tauri::command]
 async fn usb_send_speech(
     usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
@@ -6822,6 +6914,22 @@ async fn usb_send_speech(
     });
 
     Ok(())
+}
+
+#[tauri::command]
+fn usb_bubble_pixels_ready(app: tauri::AppHandle,
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>, ready: bool) {
+    usb_manager.set_bubble_renderer(if ready { Some(Arc::new(move |event| {
+        let _ = app.emit("usb-bubble-render", event);
+    })) } else { None });
+}
+
+#[tauri::command]
+async fn usb_send_bubble_pixels(usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    frame: usb_serial::BubbleFrame) -> Result<(), String> {
+    let manager = usb_manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.send_bubble_pixels(frame))
+        .await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -10076,6 +10184,138 @@ fn forward_usb_speech_updates(
 }
 
 /// Keep the board's host lease alive independently from state and speech scans.
+fn start_native_session_feed(usb_manager: usb_serial::UsbSerialManager) {
+    thread::spawn(move || {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(1800))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("[p4-session] native feed client unavailable: {error}");
+                return;
+            }
+        };
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            let now = unix_epoch_ms();
+            let last_frontend = P4_FRONTEND_SESSION_SYNC_MS
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if now.saturating_sub(last_frontend) < 7_000 {
+                continue;
+            }
+            let binding = match p4_session_binding().lock() {
+                Ok(binding) => binding.clone(),
+                Err(_) => continue,
+            };
+            if binding.board_device_id.is_empty() || binding.agent_id.is_empty() {
+                continue;
+            }
+            let status = usb_manager.status();
+            if !status.connected || status.board_device_id != binding.board_device_id {
+                continue;
+            }
+            let response = match client
+                .get("http://127.0.0.1:8181/agent/sessions")
+                .query(&[("agentId", binding.agent_id.as_str())])
+                .send()
+                .and_then(|response| response.error_for_status())
+            {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            let body: serde_json::Value = match response.json() {
+                Ok(body) => body,
+                Err(_) => continue,
+            };
+            let rows = body
+                .get("sessions")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut sessions = Vec::new();
+            let mut active_ids = Vec::new();
+            for row in rows.iter().take(8) {
+                let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let state = row
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("idle")
+                    .to_ascii_lowercase();
+                let is_active = matches!(
+                    state.as_str(),
+                    "working" | "thinking" | "tool_running" | "active" | "speaking"
+                );
+                if id.is_empty() || !is_active {
+                    continue;
+                }
+                let title = row
+                    .get("name")
+                    .or_else(|| row.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let content = row
+                    .get("displayContent")
+                    .or_else(|| row.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if title.is_empty() && content.is_empty() {
+                    continue;
+                }
+                let revision = row
+                    .get("transitionRevision")
+                    .or_else(|| row.get("statusUpdatedAt"))
+                    .or_else(|| row.get("lastModified"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                active_ids.push(id.to_string());
+                sessions.push(serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "content": content,
+                    "state": state,
+                    "transitionRevision": revision,
+                    "terminalRemainingMs": 0,
+                }));
+            }
+            let selected = if !binding.session_id.is_empty()
+                && sessions.iter().any(|session| session["id"] == binding.session_id.as_str())
+            {
+                binding.session_id.clone()
+            } else {
+                sessions
+                    .first()
+                    .and_then(|session| session["id"].as_str())
+                    .unwrap_or("auto")
+                    .to_string()
+            };
+            let title = sessions
+                .iter()
+                .find(|session| session["id"] == selected.as_str())
+                .and_then(|session| session["title"].as_str())
+                .unwrap_or("");
+            let payload = serde_json::json!({
+                "sessionId": selected,
+                "title": title,
+                "index": 0,
+                "count": sessions.len(),
+                "sessions": sessions,
+                "agentId": binding.agent_id,
+                "activeSessionIds": active_ids,
+                "displayEnabled": true,
+                "notice": "",
+            });
+            let _ = usb_manager.send_to_board(
+                &binding.board_device_id,
+                "session/current",
+                &payload,
+            );
+        }
+    });
+}
+
 fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
@@ -10556,6 +10796,7 @@ pub fn run() {
         eprintln!("[usb-identity] desktop id unavailable: {}", error);
     }
     start_usb_host_heartbeat(usb_manager.clone());
+    start_native_session_feed(usb_manager.clone());
     start_usb_state_forwarder(usb_manager.clone());
     dsh_approval::start(usb_manager.clone());
     }
@@ -10574,6 +10815,19 @@ pub fn run() {
                 return Ok(());
             }
             desktop_window::fit(app.handle(),true);
+            // Keep the dashboard session feed alive when the macOS WebView is
+            // occluded and its JS timers are throttled. The frontend reacts to
+            // this heartbeat by refreshing the local Agent Bus snapshot.
+            let session_heartbeat_app = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if session_heartbeat_app
+                    .emit("agent-session-heartbeat", ())
+                    .is_err()
+                {
+                    break;
+                }
+            });
             let bundled=app.path().resource_dir()?.join("builtin-clawpkgs");
             #[cfg(debug_assertions)]
             let bundled=if bundled.is_dir(){bundled}else{PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../builtin-clawpkgs")};
@@ -10643,6 +10897,7 @@ pub fn run() {
             Ok(())
         })
         .manage(usb_manager)
+        .manage(wifi_transport::WifiTransport::new())
         .invoke_handler(tauri::generate_handler![
             reference_image::reference_image_mount,
             reference_image::reference_image_action,
@@ -10724,7 +10979,14 @@ pub fn run() {
             usb_connect,
             usb_disconnect,
             usb_send_state,
+            usb_send_topic,
+            wifi_tcp_connect,
+            wifi_tcp_disconnect,
+            wifi_tcp_status,
+            wifi_tcp_send,
             usb_send_speech,
+            usb_bubble_pixels_ready,
+            usb_send_bubble_pixels,
             usb_send_command,
             usb_audio_capture_control,
             usb_get_status,
@@ -12715,6 +12977,24 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_status_bridge_identity_alone_is_not_an_installed_cli() {
+        let (detected, status, detail) = openclaw_detection(None, true);
+        assert!(!detected);
+        assert_eq!(status, "not_found");
+        assert!(detail.contains("状态桥身份"));
+    }
+
+    #[test]
+    fn openclaw_cli_detection_stays_ready_with_or_without_bridge_identity() {
+        for has_status_bridge_identity in [true, false] {
+            let (detected, status, _) =
+                openclaw_detection(Some("/tmp/openclaw"), has_status_bridge_identity);
+            assert!(detected);
+            assert_eq!(status, "ready");
+        }
+    }
+
+    #[test]
     fn deepseek_harness_aliases_route_through_the_agent_bus_instead_of_a_composer() {
         assert_eq!(
             normalize_agent_id("DeepSeek-Harness").as_deref(),
@@ -14446,4 +14726,6 @@ mod tests {
         assert_eq!(read_live_managed_pid(&pid_path), None);
         assert!(!pid_path.exists());
     }
+
+
 }
