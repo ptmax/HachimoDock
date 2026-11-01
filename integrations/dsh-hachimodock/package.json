@@ -9,11 +9,12 @@
     "node": ">=20"
   },
   "files": [
-    "index.js",
-    "server.js",
-    "dsh-bridge.js",
+    "README.md",
+    "client.js",
     "cordis.patch.yml",
-    "README.md"
+    "dsh-bridge.js",
+    "index.js",
+    "server.js"
   ],
   "scripts": {
     "test": "node --test"
@@ -26,6 +27,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
     }
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
   }
 }

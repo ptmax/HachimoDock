@@ -96,6 +96,7 @@ function sendJson(res, status, body) {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(text),
     'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
   })
   res.end(text)
 }
@@ -111,6 +112,7 @@ function sendSseHeaders(res) {
     'cache-control': 'no-cache, no-transform',
     connection: 'keep-alive',
     'x-accel-buffering': 'no',
+    'access-control-allow-origin': '*',
   })
   res.flushHeaders()
 }
@@ -338,7 +340,10 @@ class BridgeServer {
    * @returns {boolean} whether at least one HachimoDock `/events` consumer is attached.
    */
   hasEventSubscriber() {
-    return this.subscribers.size > 0
+    for (const subscriber of this.subscribers) {
+      if (subscriber.role !== 'client') return true
+    }
+    return false
   }
 
   /**
@@ -727,7 +732,11 @@ class BridgeServer {
       after = parsed
     }
     sendSseHeaders(res)
-    const subscriber = { res, ended: false }
+    const subscriber = {
+      res,
+      ended: false,
+      role: url.searchParams.get('role') === 'client' ? 'client' : 'bridge',
+    }
     this.subscribers.add(subscriber)
     const keepAlive = setInterval(() => writeSseComment(res, 'keep-alive'), SSE_KEEPALIVE_MS)
     if (typeof keepAlive.unref === 'function') keepAlive.unref()
