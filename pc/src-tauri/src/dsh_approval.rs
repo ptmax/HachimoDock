@@ -66,11 +66,86 @@ fn device_request_payload(event: &Value) -> Option<Value> {
     Some(request)
 }
 
-fn parse_sse_block(event: &str, data: &str) -> Option<Value> {
-    if event.trim() != "approval" {
-        return None;
-    }
+fn parse_sse_block(_event: &str, data: &str) -> Option<Value> {
     serde_json::from_str::<Value>(data.trim()).ok()
+}
+
+/// Map compact DSH session events to the same `state/<agent>` topic the other
+/// agents publish, so the P4 can follow DSH status without a second channel.
+/// Approval events are handled separately and must not be sent as state.
+fn device_state_payload(event: &str, payload: &Value) -> Option<Value> {
+    let session_id = payload
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("session")
+                .and_then(|session| session.get("id"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let title = payload
+        .get("session")
+        .and_then(|session| session.get("title"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("title").and_then(Value::as_str))
+        .unwrap_or_default();
+    let (state, status_text, event_name) = match event {
+        "session" => {
+            let running = payload
+                .get("session")
+                .and_then(|session| session.get("status"))
+                .and_then(Value::as_str)
+                == Some("running");
+            (
+                if running { "working" } else { "idle" },
+                if running { "DeepSeek Harness 工作中" } else { "DeepSeek Harness 待机" },
+                "session",
+            )
+        }
+        "turn" => match payload.get("phase").and_then(Value::as_str) {
+            Some("start") => ("working", "DeepSeek Harness 工作中", "turn/start"),
+            Some("end") => ("done", "DeepSeek Harness 已完成", "turn/end"),
+            _ => return None,
+        },
+        "tool" => match payload.get("phase").and_then(Value::as_str) {
+            Some("start") => ("tool_running", "DeepSeek Harness 调用工具", "tool/start"),
+            Some("end") => ("working", "DeepSeek Harness 处理中", "tool/end"),
+            _ => return None,
+        },
+        "session-title" => ("idle", "DeepSeek Harness", "session/title"),
+        _ => return None,
+    };
+    let mut output = serde_json::Map::new();
+    output.insert("state".into(), Value::String(state.into()));
+    output.insert("status".into(), Value::String(state.into()));
+    output.insert("statusText".into(), Value::String(status_text.into()));
+    output.insert("event".into(), Value::String(event_name.into()));
+    output.insert("tsMs".into(), Value::Number(now_ms.into()));
+    if !session_id.is_empty() {
+        output.insert("sessionId".into(), Value::String(session_id.into()));
+    }
+    if !title.is_empty() {
+        output.insert("title".into(), Value::String(title.into()));
+        output.insert("sessionTitle".into(), Value::String(title.into()));
+    }
+    Some(Value::Object(output))
+}
+
+fn forward_state_event(usb: &UsbSerialManager, event: &str, payload: &Value) {
+    // Approval audit events are not device status; the answerer/relay owns them.
+    if event.starts_with("approval") {
+        return;
+    }
+    if let Some(state_payload) = device_state_payload(event, payload) {
+        if let Err(error) = usb.send_state("deepseek-harness", &state_payload) {
+            eprintln!("[dsh-approval] state forward failed: {error}");
+        }
+    }
 }
 
 /// Parse one SSE line into `(event, data)` state. Returns true when the blank
@@ -203,10 +278,14 @@ fn run_event_stream(usb: UsbSerialManager, base_url: String) -> Result<(), Strin
         let line = line.map_err(|error| format!("DSH SSE read failed: {error}"))?;
         if consume_sse_line(&line, &mut event, &mut data) {
             if let Some(payload) = parse_sse_block(&event, &data) {
-                if let Some(request) = device_request_payload(&payload) {
-                    let usb = usb.clone();
-                    let base_url = base_url.clone();
-                    thread::spawn(move || wait_for_device_decision(usb, request, base_url));
+                if event == "approval" {
+                    if let Some(request) = device_request_payload(&payload) {
+                        let usb = usb.clone();
+                        let base_url = base_url.clone();
+                        thread::spawn(move || wait_for_device_decision(usb, request, base_url));
+                    }
+                } else {
+                    forward_state_event(&usb, &event, &payload);
                 }
             }
             event.clear();
@@ -273,9 +352,36 @@ mod tests {
     }
 
     #[test]
+    fn session_and_tool_events_map_to_device_state() {
+        let session = json!({
+            "session": {
+                "id": "session-1",
+                "title": "DSH Session",
+                "status": "running"
+            }
+        });
+        let payload = device_state_payload("session", &session).expect("session state");
+        assert_eq!(payload["state"], "working");
+        assert_eq!(payload["sessionId"], "session-1");
+        assert_eq!(payload["sessionTitle"], "DSH Session");
+
+        let tool = json!({"sessionId":"session-1","phase":"start","name":"bash","ok":true});
+        let payload = device_state_payload("tool", &tool).expect("tool state");
+        assert_eq!(payload["state"], "tool_running");
+        assert_eq!(payload["event"], "tool/start");
+
+        let turn_end = json!({"sessionId":"session-1","phase":"end"});
+        assert_eq!(
+            device_state_payload("turn", &turn_end).expect("turn state")["state"],
+            "done"
+        );
+        assert!(device_state_payload("approval", &json!({})).is_none());
+    }
+
+    #[test]
     fn malformed_or_non_approval_events_are_ignored() {
         assert!(device_request_payload(&json!({"tool": "bash"})).is_none());
-        assert!(parse_sse_block("session", "{\"type\":\"session\"}").is_none());
+        assert!(parse_sse_block("session", "{\"type\":\"session\"}").is_some());
         assert!(parse_sse_block("approval", "not-json").is_none());
     }
 
