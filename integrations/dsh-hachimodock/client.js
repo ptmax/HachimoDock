@@ -10,7 +10,19 @@
 window.__ModuleLoader__.load({
   id: '@hachimodock/dsh-bridge',
   factory(require) {
+    const React = require('react')
     const EVENT_URL = 'http://127.0.0.1:17892/events?role=client'
+    let composerActions = null
+
+    function VoiceDock(props) {
+      React.useEffect(() => {
+        composerActions = props.inputActions ?? null
+        return () => {
+          if (composerActions === props.inputActions) composerActions = null
+        }
+      }, [props.inputActions])
+      return null
+    }
 
     function findComposer() {
       const candidates = Array.from(document.querySelectorAll('[contenteditable="true"]'))
@@ -21,6 +33,15 @@ window.__ModuleLoader__.load({
     }
 
     function insertIntoComposer(text, attempt = 0) {
+      if (composerActions && typeof composerActions.captureInsertion === 'function'
+          && typeof composerActions.insertText === 'function') {
+        try {
+          const span = composerActions.captureInsertion()
+          if (composerActions.insertText(text, span)) return true
+        } catch {
+          /* fall through to the DOM adapter */
+        }
+      }
       const composer = findComposer()
       if (!composer) {
         if (attempt < 20) setTimeout(() => insertIntoComposer(text, attempt + 1), 150)
@@ -54,6 +75,48 @@ window.__ModuleLoader__.load({
       return true
     }
 
+    function submitComposer() {
+      if (composerActions && typeof composerActions.submit === 'function') {
+        try {
+          composerActions.submit()
+          return true
+        } catch {
+          /* fall through to the DOM adapter */
+        }
+      }
+      const composer = findComposer()
+      if (!composer) return false
+      composer.focus()
+      const selection = window.getSelection()
+      if (selection) {
+        const range = document.createRange()
+        range.selectNodeContents(composer)
+        range.collapse(false)
+        selection.removeAllRanges()
+        selection.addRange(range)
+      }
+      const enter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+      })
+      composer.dispatchEvent(enter)
+      // Some composer versions route Enter through a form/button rather than
+      // the editor key handler; fall back to the visible send control.
+      setTimeout(() => {
+        const buttons = Array.from(document.querySelectorAll('button'))
+        const send = buttons.find((button) => {
+          const label = `${button.getAttribute('aria-label') || ''} ${button.title || ''} ${button.textContent || ''}`
+          return /发送|send|submit/i.test(label) && !button.disabled
+        })
+        if (send) send.click()
+      }, 250)
+      return true
+    }
+
     function clickApproval(outcome, attempt = 0) {
       const allow = outcome === 'allowed-once'
       const labels = allow
@@ -76,6 +139,13 @@ window.__ModuleLoader__.load({
     return {
       apply(ctx) {
         if (typeof EventSource !== 'function') return
+        if (ctx.slots && typeof ctx.slots.inject === 'function') {
+          ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+            name: 'conversation.composer.dock',
+            id: 'hachimodock-voice-dock',
+            order: 999,
+          }, VoiceDock))
+        }
         const source = new EventSource(EVENT_URL)
         const onResolved = (event) => {
           try {
@@ -98,10 +168,15 @@ window.__ModuleLoader__.load({
           }
         }
         source.addEventListener('approval-resolved', onResolved)
+        const onVoiceSubmit = () => {
+          try { submitComposer() } catch { /* editor fallback must not throw */ }
+        }
         source.addEventListener('voice-insert', onVoiceInsert)
+        source.addEventListener('voice-submit', onVoiceSubmit)
         ctx.effect(() => () => {
           source.removeEventListener('approval-resolved', onResolved)
           source.removeEventListener('voice-insert', onVoiceInsert)
+          source.removeEventListener('voice-submit', onVoiceSubmit)
           source.close()
         }, 'hachimodock: device approval dismissal')
       },

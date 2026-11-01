@@ -1186,6 +1186,30 @@ fn release_completed_voice_for_desktop_task(board: &str) -> Result<(), &'static 
     supersede_device_voice_context(&context).map_err(|_| "voice_release_failed")
 }
 
+const DSH_BRIDGE_URL: &str = "http://127.0.0.1:17892";
+
+fn dsh_voice_post(path: &str, body: &serde_json::Value) -> Result<(), String> {
+    let url = format!("{DSH_BRIDGE_URL}{path}");
+    let client = lan_http_client(Duration::from_secs(2))?;
+    let response = client
+        .post(&url)
+        .json(body)
+        .send()
+        .map_err(|error| format!("DSH voice request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("DSH voice request returned HTTP {}", response.status()));
+    }
+    Ok(())
+}
+
+fn insert_dsh_voice_draft(text: &str) -> Result<(), String> {
+    dsh_voice_post("/voice/draft", &serde_json::json!({ "text": text }))
+}
+
+fn submit_dsh_voice_composer(session_id: &str) -> Result<(), String> {
+    dsh_voice_post("/voice/submit", &serde_json::json!({ "sessionId": session_id }))
+}
+
 fn submit_device_voice_via_agent_bus(context: Arc<DeviceVoiceContext>, text: String) {
     if !device_voice_target_is_current(&context) {
         cancel_device_voice_context(&context, "voice target changed before final submission");
@@ -1417,6 +1441,11 @@ fn stage_device_voice_final(
         } else {
             context.draft_ready.store(true, Ordering::SeqCst);
             emit_device_voice_transcript(&context, "draft_ready", revision, &text, true, true, "");
+            if context.target.agent_id == "deepseek-harness" {
+                if let Err(error) = insert_dsh_voice_draft(&text) {
+                    eprintln!("[dsh-voice] draft insertion failed: {error}");
+                }
+            }
         }
         return;
     };
@@ -1597,6 +1626,41 @@ fn confirm_pending_device_voice_draft(topic: &str, payload: &serde_json::Value) 
     }
 
     if !agent_uses_visible_composer(&context.target.agent_id) {
+        if context.target.agent_id == "deepseek-harness" {
+            if !device_voice_target_is_current(&context) {
+                cancel_device_voice_context(&context, "DSH voice target changed before submit");
+                return true;
+            }
+            if let Err(error) = submit_dsh_voice_composer(&device_voice_session_id(&context)) {
+                report_device_voice_delivery_failure(
+                    &context,
+                    revision,
+                    &text,
+                    &error,
+                    "DSH 输入框提交失败，语音文字未发送",
+                    "DSH_COMPOSER_SUBMIT_FAILED",
+                );
+                return true;
+            }
+            emit_device_voice_transcript(&context, "submitted", revision, &text, true, true, "");
+            let _ = context.emitter.emit(
+                "usb-input-action-result",
+                serde_json::json!({
+                    "ok": true,
+                    "pending": false,
+                    "view": "voice_input",
+                    "utteranceId": context.utterance_id,
+                    "text": text,
+                    "agentId": context.target.agent_id,
+                    "sessionId": device_voice_session_id(&context),
+                    "message": "已提交 DSH 输入框中的语音草稿",
+                    "composerMode": "dsh-composer",
+                    "composerError": "",
+                }),
+            );
+            complete_device_voice_context(&context);
+            return true;
+        }
         submit_device_voice_via_agent_bus(context, text);
         return true;
     }
