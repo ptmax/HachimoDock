@@ -18,6 +18,7 @@ import {
   p4SessionDisplayTitle,
   p4SessionActivitySignature,
 } from "../lib/p4-session-service.js";
+import { flattenMarkdownForDevice } from "../lib/device-markdown.js";
 
 export const P4_MANUAL_SESSION_TIMEOUT_MS = 5 * 60_000;
 export const P4_SESSION_LEASE_REFRESH_MS = 4_000;

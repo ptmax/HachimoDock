@@ -15,9 +15,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { startBubblePixelService } from "./lib/bubble-pixels.js";
 
 if (isTauri() && getCurrentWindow().label === "main") {
-  void startBubblePixelService({ listen, invoke }).catch(() => {
-    console.warn("Device text images unavailable; retaining text rendering.");
-  });
+  // Local MiSans experiment: bubble text is flattened on the PC and rendered
+  // entirely by the P4; do not start the host text-image service.
+  void startBubblePixelService;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(
