@@ -6138,6 +6138,198 @@ fn detect_workbuddy() -> DetectedAgent {
     }
 }
 
+// ── DeepSeek Harness (DSH) ──
+
+#[cfg(target_os = "macos")]
+const DSH_APP_BUNDLE_NAME: &str = "DeepSeek Harness.app";
+#[cfg(target_os = "macos")]
+const DSH_BUNDLE_IDENTIFIER: &str = "com.deepseek.dsh";
+const DSH_BUNDLED_CLI_RELATIVE_PATH: &str = "Contents/Resources/runtime/cli/bin/dsh";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DshDetection {
+    detected: bool,
+    ready: bool,
+    status: String,
+    detail: String,
+}
+
+/// Location of the CLI shipped inside the macOS application bundle.
+fn dsh_bundled_cli_path(app_path: &Path) -> PathBuf {
+    DSH_BUNDLED_CLI_RELATIVE_PATH
+        .split('/')
+        .fold(app_path.to_path_buf(), |path, segment| path.join(segment))
+}
+
+/// Classify an already-probed DSH install. All detected locations are injected
+/// so present/absent cases stay unit-testable without touching the real host.
+fn classify_dsh_detection(
+    app_path: Option<&Path>,
+    cli_path: Option<&Path>,
+    profile_path: Option<&Path>,
+    version: Option<&str>,
+) -> DshDetection {
+    let detected = app_path.is_some() || cli_path.is_some() || profile_path.is_some();
+    if !detected {
+        return DshDetection {
+            detected: false,
+            ready: false,
+            status: "not_found".to_string(),
+            detail: "未检测到 DeepSeek Harness 应用、CLI 或桌面配置".to_string(),
+        };
+    }
+
+    let mut sources = Vec::new();
+    if let Some(path) = app_path {
+        sources.push(format!("应用 {}", path.display()));
+    }
+    if let Some(path) = cli_path {
+        sources.push(format!("CLI {}", path.display()));
+    }
+    if let Some(path) = profile_path {
+        sources.push(format!("配置 {}", path.display()));
+    }
+    let version = version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" v{value}"))
+        .unwrap_or_default();
+
+    DshDetection {
+        detected: true,
+        ready: true,
+        status: "ready".to_string(),
+        detail: format!(
+            "已检测到 DeepSeek Harness{version}（{}）",
+            sources.join("；")
+        ),
+    }
+}
+
+/// Cheap version lookup: read CFBundleShortVersionString out of the bundle's
+/// text Info.plist instead of spawning the Electron-backed CLI. Binary plists
+/// simply fail the UTF-8 read and fall back to no version.
+fn parse_dsh_plist_version(plist: &str) -> Option<String> {
+    let key_index = plist.find("CFBundleShortVersionString")?;
+    let after_key = &plist[key_index..];
+    let value_start = after_key.find("<string>")? + "<string>".len();
+    let value_end = after_key[value_start..].find("</string>")? + value_start;
+    let version = after_key[value_start..value_end].trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+fn read_dsh_bundle_version(app_path: Option<&Path>) -> Option<String> {
+    let plist_path = app_path?.join("Contents").join("Info.plist");
+    parse_dsh_plist_version(&fs::read_to_string(plist_path).ok()?)
+}
+
+fn find_dsh_app_bundle(home: Option<&Path>) -> Option<PathBuf> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
+
+    #[cfg(target_os = "macos")]
+    {
+        for candidate in macos_app_bundle_candidates(
+            home,
+            &[DSH_APP_BUNDLE_NAME],
+            &[DSH_BUNDLE_IDENTIFIER],
+        ) {
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut candidates = Vec::new();
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            push_unique_path(
+                &mut candidates,
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("DeepSeek Harness")
+                    .join("DeepSeek Harness.exe"),
+            );
+        }
+        if let Some(program_files) = env::var_os("ProgramFiles") {
+            push_unique_path(
+                &mut candidates,
+                PathBuf::from(program_files)
+                    .join("DeepSeek Harness")
+                    .join("DeepSeek Harness.exe"),
+            );
+        }
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn find_dsh_cli(home: Option<&Path>, app_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(app_path) = app_path {
+        let bundled = dsh_bundled_cli_path(app_path);
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    find_agent_executable(
+        "dsh",
+        home,
+        &[".dsh/bin/dsh", ".local/bin/dsh"],
+        "dsh.exe",
+    )
+    .map(PathBuf::from)
+}
+
+fn find_dsh_profile_dir(home: Option<&Path>) -> Option<PathBuf> {
+    let profile = home?.join(".dsh").join("profiles").join("desktop");
+    profile.is_dir().then_some(profile)
+}
+
+fn detect_dsh() -> DetectedAgent {
+    detect_dsh_with_home(get_home_dir().ok().as_deref())
+}
+
+fn detect_dsh_with_home(home: Option<&Path>) -> DetectedAgent {
+    let app_path = find_dsh_app_bundle(home);
+    let cli_path = find_dsh_cli(home, app_path.as_deref());
+    let profile_path = find_dsh_profile_dir(home);
+    let version = read_dsh_bundle_version(app_path.as_deref());
+    let detection = classify_dsh_detection(
+        app_path.as_deref(),
+        cli_path.as_deref(),
+        profile_path.as_deref(),
+        version.as_deref(),
+    );
+
+    DetectedAgent {
+        id: "deepseek-harness".to_string(),
+        label: "DeepSeek Harness".to_string(),
+        detected: detection.detected,
+        ready: detection.ready,
+        status: detection.status,
+        detail: detection.detail,
+        command_path: cli_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        config_path: profile_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        activity_path: app_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        can_sync_hook: false,
+    }
+}
+
 fn detect_local_agents_inner() -> Result<AgentDiscoveryResponse, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6149,6 +6341,7 @@ fn detect_local_agents_inner() -> Result<AgentDiscoveryResponse, String> {
         detect_codex(),
         detect_openclaw(),
         detect_mimocode(),
+        detect_dsh(),
         detect_workbuddy(),
     ];
 
@@ -12385,6 +12578,95 @@ mod tests {
             find_claude_desktop_install(Some(home.path())).as_deref(),
             app.to_str()
         );
+    }
+
+    #[test]
+    fn dsh_detection_classifies_present_install() {
+        let detection = classify_dsh_detection(
+            Some(Path::new("DeepSeek Harness.app")),
+            Some(Path::new("dsh-cli")),
+            Some(Path::new("profile")),
+            Some("0.2.1-rc.5"),
+        );
+        assert!(detection.detected);
+        assert!(detection.ready);
+        assert_eq!(detection.status, "ready");
+        assert!(detection.detail.contains("DeepSeek Harness"));
+        assert!(detection.detail.contains("v0.2.1-rc.5"));
+        assert!(detection.detail.contains("dsh-cli"));
+    }
+
+    #[test]
+    fn dsh_detection_classifies_absent_install() {
+        let detection = classify_dsh_detection(None, None, None, None);
+        assert!(!detection.detected);
+        assert!(!detection.ready);
+        assert_eq!(detection.status, "not_found");
+        assert!(detection.detail.contains("未检测到 DeepSeek Harness"));
+    }
+
+    #[test]
+    fn dsh_detection_accepts_cli_or_profile_only_hosts() {
+        let cli_only = classify_dsh_detection(None, Some(Path::new("dsh-cli")), None, None);
+        assert!(cli_only.detected);
+        assert!(cli_only.detail.contains("CLI"));
+        assert!(cli_only.detail.contains("dsh-cli"));
+
+        let profile_only = classify_dsh_detection(None, None, Some(Path::new("profile")), None);
+        assert!(profile_only.detected);
+        assert!(profile_only.detail.contains("配置"));
+    }
+
+    #[test]
+    fn dsh_bundle_version_is_read_from_text_info_plist() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+  <dict>
+    <key>CFBundleShortVersionString</key>
+    <string>0.2.1-rc.5</string>
+  </dict>
+</plist>"#;
+        assert_eq!(parse_dsh_plist_version(plist).as_deref(), Some("0.2.1-rc.5"));
+        assert_eq!(
+            parse_dsh_plist_version(r#"<plist version="1.0"><dict/></plist>"#),
+            None
+        );
+    }
+
+    #[test]
+    fn dsh_bundled_cli_lives_inside_app_bundle_resources() {
+        let cli = dsh_bundled_cli_path(Path::new("DeepSeek Harness.app"));
+        assert!(cli.ends_with(Path::new("Contents/Resources/runtime/cli/bin/dsh")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dsh_detection_uses_app_bundle_cli_and_desktop_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let app = home.path().join("Applications").join("DeepSeek Harness.app");
+        let bundled_cli = dsh_bundled_cli_path(&app);
+        fs::create_dir_all(bundled_cli.parent().unwrap()).unwrap();
+        fs::write(&bundled_cli, b"#!/bin/sh\n").unwrap();
+        fs::write(
+            app.join("Contents").join("Info.plist"),
+            br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>9.9.9</string></dict></plist>"#,
+        )
+        .unwrap();
+        let profile = home.path().join(".dsh").join("profiles").join("desktop");
+        fs::create_dir_all(&profile).unwrap();
+
+        let detected = detect_dsh_with_home(Some(home.path()));
+        assert_eq!(detected.id, "deepseek-harness");
+        assert_eq!(detected.label, "DeepSeek Harness");
+        assert!(detected.detected);
+        assert!(detected.ready);
+        assert_eq!(
+            detected.command_path,
+            bundled_cli.to_string_lossy().into_owned()
+        );
+        assert_eq!(detected.config_path, profile.to_string_lossy().into_owned());
+        assert_eq!(detected.activity_path, app.to_string_lossy().into_owned());
+        assert!(detected.detail.contains("9.9.9"));
     }
 
     #[test]
