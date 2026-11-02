@@ -124,6 +124,11 @@ static uint16_t *g_jpeg_output;
 static uint8_t *g_tjpgd_workbuf;
 static jpeg_decoder_handle_t g_jpeg_decoder;
 static ppa_client_handle_t g_ppa_srm_client;
+static ppa_client_handle_t g_ppa_blend_client;
+static uint8_t *g_ppa_card_mask;
+static size_t g_ppa_card_mask_capacity;
+static int g_ppa_card_mask_w, g_ppa_card_mask_h, g_ppa_card_mask_radius;
+static uint8_t g_ppa_card_mask_alpha;
 static size_t g_jpeg_input_capacity;
 static size_t g_jpeg_output_capacity;
 static bool g_jpeg_input_dma_compatible;
@@ -1363,6 +1368,62 @@ static void blend_round_rect(int x, int y, int w, int h, int radius, uint8_t r, 
   }
 }
 
+static bool ppa_blend_card_surface(
+  int x, int y, int w, int h, int radius,
+  uint8_t r, uint8_t g, uint8_t b, uint8_t alpha
+) {
+  if (!g_ppa_blend_client || !g_framebuffer || !g_framebuffer_ppa_compatible
+      || x < 0 || y < 0 || w <= 0 || h <= 0
+      || x + w > PET_P4_UI_WIDTH || y + h > PET_P4_UI_HEIGHT) return false;
+  const size_t needed = (size_t) w * (size_t) h;
+  if (!g_ppa_card_mask || g_ppa_card_mask_capacity < needed) {
+    if (g_ppa_card_mask) heap_caps_free(g_ppa_card_mask);
+    g_ppa_card_mask = (uint8_t *) heap_caps_aligned_alloc(64, needed,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    g_ppa_card_mask_capacity = g_ppa_card_mask ? needed : 0;
+    if (!g_ppa_card_mask) return false;
+    g_ppa_card_mask_w = 0;
+  }
+  if (g_ppa_card_mask_w != w || g_ppa_card_mask_h != h
+      || g_ppa_card_mask_radius != radius || g_ppa_card_mask_alpha != alpha) {
+    memset(g_ppa_card_mask, 0, needed);
+    for (int yy = 0; yy < h; yy += 1) {
+      for (int xx = 0; xx < w; xx += 1) {
+        int cx = xx < radius ? radius : (xx >= w - radius ? w - radius - 1 : xx);
+        int cy = yy < radius ? radius : (yy >= h - radius ? h - radius - 1 : yy);
+        int dx = xx - cx, dy = yy - cy;
+        if (dx * dx + dy * dy <= radius * radius)
+          g_ppa_card_mask[(size_t) yy * w + xx] = alpha;
+      }
+    }
+    g_ppa_card_mask_w = w; g_ppa_card_mask_h = h;
+    g_ppa_card_mask_radius = radius; g_ppa_card_mask_alpha = alpha;
+  }
+  ppa_blend_oper_config_t cfg = {0};
+  cfg.in_bg.buffer = g_framebuffer;
+  cfg.in_bg.pic_w = PET_P4_UI_WIDTH;
+  cfg.in_bg.pic_h = PET_P4_UI_HEIGHT;
+  cfg.in_bg.block_w = w; cfg.in_bg.block_h = h;
+  cfg.in_bg.block_offset_x = x; cfg.in_bg.block_offset_y = y;
+  cfg.in_bg.blend_cm = PPA_SRM_COLOR_MODE_RGB565;
+  cfg.in_fg.buffer = g_ppa_card_mask;
+  cfg.in_fg.pic_w = w; cfg.in_fg.pic_h = h;
+  cfg.in_fg.block_w = w; cfg.in_fg.block_h = h;
+  cfg.in_fg.block_offset_x = 0; cfg.in_fg.block_offset_y = 0;
+  cfg.in_fg.blend_cm = PPA_BLEND_COLOR_MODE_A8;
+  cfg.out.buffer = g_framebuffer;
+  cfg.out.buffer_size = (uint32_t) PET_P4_UI_WIDTH * PET_P4_UI_HEIGHT * 2;
+  cfg.out.pic_w = PET_P4_UI_WIDTH;
+  cfg.out.pic_h = PET_P4_UI_HEIGHT;
+  cfg.out.block_offset_x = x; cfg.out.block_offset_y = y;
+  cfg.out.blend_cm = PPA_SRM_COLOR_MODE_RGB565;
+  cfg.bg_alpha_update_mode = PPA_ALPHA_NO_CHANGE;
+  cfg.fg_alpha_update_mode = PPA_ALPHA_NO_CHANGE;
+  cfg.fg_fix_rgb_val.r = r; cfg.fg_fix_rgb_val.g = g; cfg.fg_fix_rgb_val.b = b;
+  cfg.mode = PPA_TRANS_MODE_BLOCKING;
+  return ppa_do_blend(g_ppa_blend_client, &cfg) == ESP_OK;
+}
+
 static void draw_home_white_panel(int x, int y, int w, int h, int radius, uint16_t outline) {
   if (g_bubble_opacity_percent >= 100) {
     fill_round_rect(x + 2, y + 4, w, h, radius, rgb565(55, 58, 57));
@@ -1371,6 +1432,8 @@ static void draw_home_white_panel(int x, int y, int w, int h, int radius, uint16
     return;
   }
   const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
+  if (ppa_blend_card_surface(x + 2, y + 2, w - 4, h - 4, radius - 2, 255, 255, 255, alpha))
+    return;
   blend_round_rect(x + 2, y + 4, w, h, radius, 55, 58, 57, alpha);
   blend_round_rect(x, y, w, h, radius, 216, 221, 218, alpha);
   blend_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, 255, 255, 255, alpha);
@@ -1400,6 +1463,14 @@ static void draw_session_card_panel(
     return;
   }
   const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
+  if (ppa_blend_card_surface(x + 4, y + 4, w - 8, h - 8, radius - 4, 237, 249, 242, alpha)) {
+    /* Draw the selection outline as opaque strokes; the large surface is PPA. */
+    fill_round_rect(x - 2, y - 2, w + 4, 2, 1, selection);
+    fill_round_rect(x - 2, y + h, w + 4, 2, 1, selection);
+    fill_round_rect(x - 2, y - 2, 2, h + 4, 1, selection);
+    fill_round_rect(x + w, y - 2, 2, h + 4, 1, selection);
+    return;
+  }
   blend_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, 173, 220, 193, alpha);
   blend_round_rect(x + 2, y + 5, w, h, radius, 46, 50, 48, alpha);
   blend_round_rect(x, y, w, h, radius, 25, 151, 99, alpha);
@@ -5285,6 +5356,14 @@ esp_err_t pet_p4_renderer_init(void) {
         .data_burst_length = PPA_DATA_BURST_LENGTH_128,
       };
       esp_err_t ppa_err = ppa_register_client(&ppa_config, &g_ppa_srm_client);
+      ppa_client_config_t blend_config = {
+        .oper_type = PPA_OPERATION_BLEND,
+        .max_pending_trans_num = 1,
+        .data_burst_length = PPA_DATA_BURST_LENGTH_128,
+      };
+      if (ppa_err == ESP_OK && ppa_register_client(&blend_config, &g_ppa_blend_client) != ESP_OK) {
+        g_ppa_blend_client = NULL;
+      }
       if (ppa_err != ESP_OK) {
         g_ppa_srm_client = NULL;
         ESP_LOGW(

@@ -812,11 +812,15 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   }, []);
   useEffect(() => {
     if (!usb.connected) return undefined;
-    invoke("usb_send_topic", { topic: "ui/device_controls", payload: deviceControls })
-      .catch(() => undefined);
-    invoke("usb_send_topic", { topic: "ui/bubble_opacity", payload: { opacity: bubbleOpacity } })
-      .catch(() => undefined);
-    return undefined;
+    // Sliders fire continuously while dragging. Coalesce them so the USB
+    // writer is not flooded with one request per pixel.
+    const timer = setTimeout(() => {
+      invoke("usb_send_topic", { topic: "ui/device_controls", payload: deviceControls })
+        .catch(() => undefined);
+      invoke("usb_send_topic", { topic: "ui/bubble_opacity", payload: { opacity: bubbleOpacity } })
+        .catch(() => undefined);
+    }, 180);
+    return () => clearTimeout(timer);
   }, [usb.connected, deviceControls, bubbleOpacity]);
   const [voiceConfig, setVoiceConfig] = useState(loadVoiceConfigFromStorage);
   const voiceConfigRef = useRef(voiceConfig);

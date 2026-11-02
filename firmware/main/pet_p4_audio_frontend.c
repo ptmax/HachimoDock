@@ -326,9 +326,9 @@ static bool initialize(void) {
 #ifdef PET_P4_AEC_BENCH_FD
     .mode = AEC_MODE_FD_LOW_COST, .nlp_level = AEC_NLP_LEVEL_AGGR,
 #elif defined(CONFIG_ESP32P4_REV_MIN_FULL) && CONFIG_ESP32P4_REV_MIN_FULL >= 300
-    /* P4 v3 uses a different ESP-SR binary. Validate full-duplex performance
-     * on that silicon independently from the legacy VOIP path on v1. */
-    .mode = AEC_MODE_FD_HIGH_PERF, .nlp_level = AEC_NLP_LEVEL_VERYAGGR,
+    /* AEC3 HIGH_PERF panics in dl_esp32p4_sr_memcpy on this P4 build.
+     * LOW_COST remains full-duplex (unlike VOIP/half-duplex paths). */
+    .mode = AEC_MODE_FD_LOW_COST, .nlp_level = AEC_NLP_LEVEL_VERYAGGR,
 #else
     .mode = AEC_MODE_VOIP_LOW_COST, .nlp_level = AEC_NLP_LEVEL_VERYAGGR,
 #endif

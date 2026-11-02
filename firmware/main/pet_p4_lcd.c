@@ -132,6 +132,9 @@ esp_err_t pet_p4_lcd_reveal(void) {
   if (g_backlight_status == ESP_OK && force_err != ESP_OK) {
     g_backlight_status = force_err;
   }
+  gpio_reset_pin(BSP_LCD_BACKLIGHT);
+  (void) bsp_display_brightness_init();
+  (void) bsp_display_brightness_set(g_brightness_percent);
   if (g_backlight_status == ESP_OK) {
     g_backlight_revealed = true;
   } else {
@@ -149,6 +152,13 @@ esp_err_t pet_p4_lcd_set_brightness(int percent) {
   if (percent > 100) percent = 100;
   g_brightness_percent = percent;
   if (!g_panel_handle) return ESP_ERR_INVALID_STATE;
+  /* Reveal configures the backlight pin as a plain GPIO for fail-safe bring-up;
+   * restore the LEDC/PWM function before changing duty. */
+  /* The fail-safe reveal configures this pin as plain GPIO. Restore the
+   * LEDC peripheral route before changing the PWM duty. */
+  gpio_reset_pin(BSP_LCD_BACKLIGHT);
+  esp_err_t init = bsp_display_brightness_init();
+  if (init != ESP_OK) return init;
   return bsp_display_brightness_set(percent);
 }
 
