@@ -798,7 +798,7 @@ void app_main(void) {
     "pet_p4_uart_rx",
     PET_P4_TRANSPORT_RX_TASK_STACK_BYTES,
     NULL,
-    10,
+    20,
     NULL
   );
   BaseType_t usb_rx_created = xTaskCreate(
@@ -806,7 +806,7 @@ void app_main(void) {
     "pet_p4_usj_rx",
     PET_P4_TRANSPORT_RX_TASK_STACK_BYTES,
     NULL,
-    10,
+    20,
     NULL
   );
   if (usb_rx_created != pdPASS || uart_rx_created != pdPASS) {
