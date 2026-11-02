@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 const MAX_RECOVERY_RETRIES: usize = 3;
-const RECOVERY_DEADLINE: Duration = Duration::from_millis(350);
+const RECOVERY_DEADLINE: Duration = Duration::from_millis(1500);
 const RETRY_BACKOFF: Duration = Duration::from_millis(2);
 
 // Failed Windows overlapped completion can have unknown partial progress.
