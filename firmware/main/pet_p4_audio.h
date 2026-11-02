@@ -60,6 +60,8 @@ bool pet_p4_audio_music_paused(void);
 bool pet_p4_audio_music_ended(void);
 void pet_p4_audio_music_pause(bool paused);
 void pet_p4_audio_music_volume(unsigned int volume);
+esp_err_t pet_p4_audio_set_output_volume(unsigned int volume);
+int pet_p4_audio_output_volume(void);
 unsigned int pet_p4_audio_music_buffered_ms(void);
 bool pet_p4_audio_stream_playing(void);
 /* Metadata-only device diagnostic events: no PCM or spoken text. */
@@ -68,6 +70,9 @@ void pet_p4_audio_process(
   const pet_p4_runtime_state_t *state,
   unsigned long long now_ms
 );
+/* Play one embedded UI/system cue (permission request/approved/denied/expired).
+ * Unlike lifecycle cues this is event-driven and may repeat for another request. */
+esp_err_t pet_p4_audio_play_event_cue(const char *family);
 void pet_p4_audio_send_status(void);
 
 #ifdef __cplusplus

@@ -1,5 +1,9 @@
 # ESP-P4 USB Protocol
 
+可选气泡像素能力：`capabilities.bubblePixels=p4-text-alpha-v1`。PC 在现有文字消息之外下发原生字号的透明度图；设备按文字与样式的 FNV-1a-64 键匹配。渲染服务就绪时，PC 在文字消息中附带 `textPixels:true`：设备保留同一会话上一对文字，标题与正文图片都就绪后一起切换，首次显示可暂留空；等待超过 3 秒才回退字库，流式更新不重置首个等待期限。原有状态、动画和语音处理不等待图片，缺少该标记的旧客户端立即按原流程显示。样式 1 为标题（474×38，32px），2 为正文（496×54，24px、两行、最多 16 页），3 为紧凑气泡（348×38，32px），4 为两行截断的 Agent 正文（496×54，24px、超长加省略号）。图中每字节高四位为 alpha（0～15），低四位为重复像素数减一（1～16），每页连续行优先排列。
+
+`ui/text-pixels` 使用 `begin/chunk/end`：begin 包含 16 位小写十六进制 `id`、`style`、`pageSizes`、`totalBytes` 和压缩数据的 8 位 FNV-1a-32 `checksum`；chunk 包含 `id/offset/data`，data 是最多 1024 字节的 Base64 分块，offset 必须顺序匹配。end 携带 `id/requestId`，设备回复 `ui/text-pixels/status`（`requestId/ok/error`）。单张压缩图不超过 128 KiB，32 个内存缓存槽合计不超过 1 MiB，不写 Flash；完整校验后才提交并刷新气泡缓存。PC 合并流式更新，按设备连接代次发送，只有提交回执成功才记为已发送。能力未声明时不发送像素消息，原有文字、字幕时序和本机操作保持可用。
+
 0.7.103-p4：内置清单、启动器图片及完整出厂资源统一为 29 项。末尾追加 `decision-capsule`、`answer-book`、`hope-train`；通用 `widgetLocalTools=p4-local-tools-v1` 契约保持不变。OTA 仍保留轻量资源引导与现有用户存档，完整出厂镜像才携带全部图片。
 
 0.7.100-p4：新增 `widgetMediaQueueMax=128` 与 `widgetMediaLifecycle=p4-media-lifecycle-v1`。媒体队列超过 20 项时，key 至多 80 UTF-8 字节、标题至多 90 字节；上限 128，刷新按 key 保留选中项，不修改音频会话。`media/event` 新增 `operation=visibility`，包含 `source/boot/epoch/visible`；进入或离开递增 epoch，可见时每 2 秒发送心跳。宿主只有资源包声明自动播放、当前可见且新的进入事件时才准备播放，停止/离开取消未开始的播放；目录刷新不重新触发播放。能力与配置为通用媒体机制，不绑定特定组件 ID。
@@ -404,8 +408,52 @@ PC to board:
 {"topic":"ack","payload":{"desktopDeviceId":"desktop-..."}}
 ```
 
+## DSH 审批上屏（R5 设备侧 v0）
+
+DSH 审批卡片由 PC bridge 转发到设备；设备只负责显示并回传一次决定，
+不实现审批策略、不访问网络，也不改变审批未激活时的原有页面渲染与键位绑定。
+
+PC → P4：
+
+```json
+{"topic":"approval/request","payload":{"requestId":"req-1","agent":"DeepSeek Harness","tool":"bash","reason":"列出当前目录","sessionId":"session-...","expiresAtMs":1790000000000}}
+```
+
+- `requestId` 必填，最长 95 个 UTF-8 字节；缺失时回 `protocol/ack` 失败
+  `invalid_approval_request`。
+- `agent`（最长 64 字节）、`tool`（64）、`reason`（192）可选，超长按 UTF-8
+  边界截断；缺失时卡片分别显示 `未知 Agent`、`未知工具`、`无说明`。
+- `expiresAtMs` 可选，毫秒单位。DSH 插件/PC bridge 使用 Unix epoch 毫秒
+  （如 `1790000000000`），设备用最近一次 `system/heartbeat.tsMs` 锚点换算成
+  单调时钟；尚未收到心跳锚点或发送端直接给设备单调毫秒时，使用收到的值，
+  缺省为收到时刻 + 30 秒（`PET_P4_APPROVAL_TIMEOUT_MS`）。换算后的设备侧
+  pending 最长保留 5 分钟（`PET_P4_APPROVAL_MAX_HOLD_MS`，防御异常时钟）。
+  到达时已过期的请求直接忽略（fail closed，回 `approval_expired`），不会弹窗。
+- 同一时刻只保留一个 pending 请求：新请求覆盖旧请求；已回复过的同一
+  `requestId` 重发会被去重（回 `approval_already_decided`），不会再次弹窗。
+- 成功接收回 `protocol/ack`（`requestTopic:"approval/request"`、`ok:true`、
+  `requestId` 原样回传）。桥接端可据此确认设备在线，无需自行等待 UI。
+
+P4 → PC：
+
+```json
+{"topic":"approval/decision","payload":{"requestId":"req-1","decision":"allow","source":"esp32"}}
+```
+
+- 卡片显示期间 SW1 短按 = `allow`，SW3 短按 = `deny`；decision 入队后立即
+  清除 pending，因此同一请求只会产生一条 decision（幂等）。
+- 卡片显示期间其余按键、长按、HOLD、摇杆/旋钮事件全部被吞掉，不会落到原有
+  键位绑定，也不会误触允许/拒绝。
+- 换算后的设备侧 deadline 到期时设备自行清除 pending 且不发送任何 decision；
+  审批超时仍由 DSH 插件（默认 30 秒，fail closed）负责。
+- 界面为覆盖当前页面的深色模态卡片：标题 `需要授权`、来源/工具行、最多两行
+  省略理由、剩余秒数，底部 `确认键允许` / `取消键拒绝`。卡片只叠加在普通帧上；
+  固件/形象传输状态帧期间到达的请求会在传输界面结束后显示（其超时同样生效）。
+
 ## Supported Input Topics
 
+- `approval/request`: shows the modal DSH approval card (see above) and becomes
+  the only accepted input context until a decision or expiry clears it.
 - `state/<agent>`: updates current lifecycle state, event, and status marker.
 - `speech/text`: updates the speech bubble title, body, status, and status text.
   A terminal `done` lifecycle remains visible on the device for 60 seconds
@@ -580,7 +628,7 @@ PC to board:
   readable for compatibility; Linux `videos/*.mp4` or `videos/*.wav` assets
   are rejected explicitly.
 - `firmware/begin`, `firmware/chunk`, `firmware/commit`, `firmware/abort`:
-  writes a SHA-256-verified ESP-IDF image to the inactive 2.5MiB OTA slot. The
+  writes a SHA-256-verified ESP-IDF image to the inactive 3.5MiB OTA slot. The
   desktop uses 4092-byte padding-free decoded chunks when schema 5 and the
   advertised 4KiB receiver are both present, otherwise it starts at the legacy
   2046-byte size. A transient Base64 rejection retries the same sequence at the
@@ -1292,3 +1340,17 @@ begin/commit 遇到录音、对话或播放则拒绝；客户端每次连接仅�
 修复其他组件不切换当前页面。已存在完整图片资源时拒绝已知无图启动包覆盖。
 无有效备用包时设备明确提示需要恢复，完整美术仍来自 PC/出厂资源区，不占应用 OTA 两份空间。
 
+
+## Optional Wi-Fi transport
+
+Firmware may expose an optional Wi-Fi transport over TCP port `3232` when NVS contains
+credentials (`pet_wifi` namespace). The wire format is the same JSONL/raw-asset stream as
+USB/UART. New topics:
+
+- `wifi/config`: payload `{ "ssid": string, "password": string }`; persists credentials,
+  starts/reconnects STA; reply `wifi/config_result`.
+- `wifi/status`: reply `wifi/status_result` with `connected`, `clientConnected`, `ip`, `rssi`.
+
+The Wi-Fi transport is additive; USB/UART remain available for provisioning, OTA and
+fallback. Partition layout uses 3.5 MiB OTA slots and a 5 MiB storage partition; factory
+reset is required when moving from the legacy 2.5 MiB layout.

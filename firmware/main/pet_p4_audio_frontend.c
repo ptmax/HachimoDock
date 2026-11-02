@@ -14,7 +14,7 @@
 
 /* DeskBot V2's microphone/reference topology and cancel boundaries, adapted to
  * ESP-IDF P4 codecs. Standalone ESP-SR DSP avoids unused neural/offline models
- * that do not fit the existing 2.5 MiB OTA application slot. */
+ * that do not fit the existing 3.5 MiB OTA application slot. */
 #define FRAME 320
 #define NS_FRAME 160 /* The linked ESP-SR NS implementation requires 10 ms. */
 #define MAX_CHUNK 1024
@@ -178,39 +178,17 @@ bool pet_p4_afe_prepare(void) {
     if (!output) {
       /* Boot allocation failure already cleaned up all resources. */
       (void) initialize();
-    } else {
+    } else if (aec && ns && vad) {
+      /* Keep one HIGH_PERF AEC instance. LPRAM is excluded from the heap and
+       * post-UI HP-SRAM pressure must never force AEC3 to reallocate. */
       xQueueReset(output);
-      if (aec) aec_destroy(aec);
-      if (ns) ns_destroy(ns);
-      if (vad) vad_destroy(vad);
-      aec = NULL; ns = NULL; vad = NULL;
-      /* Re-entry must have the SAME internal-RAM protection as boot. ESP-SR
-       * uses small ordinary mallocs as well as config.caps; without the
-       * reserve a reset after loading UI/catalogs can starve USB/DMA. */
-      void *dma_reserve[2] = {NULL, NULL};
-      dma_reserve[0] = heap_caps_malloc(8 * 1024, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      if (dma_reserve[0])
-        dma_reserve[1] = heap_caps_malloc(8 * 1024, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-      if (dma_reserve[1]) {
-        aec = aec_create_from_config(&saved_config);
-        if (aec) ns = ns_create(10);
-        if (ns) vad = vad_create_with_param(VAD_MODE_2, 16000, 20, 120, 100);
-      }
-      heap_caps_free(dma_reserve[0]);
-      heap_caps_free(dma_reserve[1]);
-      if (!aec || !ns || !vad || aec_get_chunksize(aec) != chunk_samples) {
-        if (aec) aec_destroy(aec);
-        if (ns) ns_destroy(ns);
-        if (vad) vad_destroy(vad);
-        aec = NULL; ns = NULL; vad = NULL;
-        fail(AFE_RESET_FAILED, current);
-      } else {
-        memset(mic_chunk, 0, chunk_samples * sizeof(int16_t));
-        memset(ref_chunk, 0, chunk_samples * sizeof(int16_t));
-        memset(clean_chunk, 0, chunk_samples * sizeof(int16_t));
-        atomic_store(&failure, AFE_OK);
-        atomic_store(&ready, true);
-      }
+      memset(mic_chunk, 0, chunk_samples * sizeof(int16_t));
+      memset(ref_chunk, 0, chunk_samples * sizeof(int16_t));
+      memset(clean_chunk, 0, chunk_samples * sizeof(int16_t));
+      atomic_store(&failure, AFE_OK);
+      atomic_store(&ready, true);
+    } else {
+      fail(AFE_RESET_FAILED, current);
     }
     atomic_store(&feed_generation, current);
     ESP_LOGI(TAG, "new capture timeline: AEC/NS/VAD ready=%d", pet_p4_afe_ready());
@@ -326,8 +304,8 @@ static bool initialize(void) {
 #ifdef PET_P4_AEC_BENCH_FD
     .mode = AEC_MODE_FD_LOW_COST, .nlp_level = AEC_NLP_LEVEL_AGGR,
 #elif defined(CONFIG_ESP32P4_REV_MIN_FULL) && CONFIG_ESP32P4_REV_MIN_FULL >= 300
-    /* P4 v3 uses a different ESP-SR binary. Validate full-duplex performance
-     * on that silicon independently from the legacy VOIP path on v1. */
+    /* HIGH_PERF requires HP SRAM for AEC3 SIMD buffers. LPRAM is excluded
+     * from the general heap and the instance is kept alive across generations. */
     .mode = AEC_MODE_FD_HIGH_PERF, .nlp_level = AEC_NLP_LEVEL_VERYAGGR,
 #else
     .mode = AEC_MODE_VOIP_LOW_COST, .nlp_level = AEC_NLP_LEVEL_VERYAGGR,

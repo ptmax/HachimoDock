@@ -136,6 +136,7 @@ function ControlGlyph({ controlId, label, active = false }) {
 }
 
 export default function BoardButtonPanel({
+  selectedAgentId,
   voiceConfig,
   buttonActions = DEFAULT_BUTTON_ACTIONS,
   buttonValues = {},
@@ -232,7 +233,7 @@ export default function BoardButtonPanel({
       )}
 
       <div className="usage-help">
-        <p>为按键和摇杆选择功能，修改后点击「同步到设备」生效。同一个按键可以分别设置短按和长按。</p>
+        <p>为按键和摇杆选择功能，修改后会自动同步到设备；也可点击「同步到设备」立即应用。同一个按键可以分别设置短按和长按。</p>
         <details open>
           <summary>常用操作 · 按当前配置显示{voiceConfigDirty ? "（待同步）" : ""}</summary>
           <dl className="usage-help__operations">
@@ -375,10 +376,11 @@ export default function BoardButtonPanel({
                   {group.rows.map((row) => {
                     const currentActionId = buttonActions?.[row.id] || row.defaultAction;
                     const isShortPress = isP4Runtime && row.event.endsWith(".short_press");
-                    const allowedOptions = BUTTON_FUNCTION_OPTIONS.filter((option) =>
-                      row.actionOptions.includes(option.id)
-                        || (isShortPress && option.id === "voice_ptt"),
-                    );
+                    const allowedOptions = BUTTON_FUNCTION_OPTIONS.filter((option) => {
+                      if (option.id === "dsh_interrupt" && selectedAgentId !== "deepseek-harness") return false;
+                      return row.actionOptions.includes(option.id)
+                        || (isShortPress && option.id === "voice_ptt");
+                    });
                     const isVoicePttRow = currentActionId === "voice_ptt";
                     const rowHovered = hoveredButtonId === row.id || (row.controlId && hoveredButtonId === row.controlId);
                     const fieldId = `button-action-${row.id}`;

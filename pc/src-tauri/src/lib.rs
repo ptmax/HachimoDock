@@ -52,6 +52,7 @@
  * [Sync] If this file changes, update `pc/.folder.md`.
  */
 
+mod dsh_approval;
 mod clawpkg;
 mod widget_data;
 mod stock_quotes;
@@ -110,6 +111,7 @@ mod reference_image;
 mod realtime_chat_log;
 mod usb_audio;
 mod usb_serial;
+mod wifi_transport;
 mod voice_chat_settings;
 mod volcengine_asr;
 
@@ -599,7 +601,7 @@ fn validate_p4_session_transition_metadata(
     }
     let terminal = matches!(
         state,
-        "done" | "error" | "failed" | "complete" | "completed"
+        "done" | "error" | "failed" | "complete" | "completed" | "stopped"
     );
     if terminal_remaining_ms > 0 && !terminal {
         return Err("非终态设备会话不能携带终态保留时间".to_string());
@@ -835,6 +837,19 @@ fn pc_audio_board_binding() -> &'static Mutex<PcAudioBoardBinding> {
 fn p4_session_binding() -> &'static Mutex<P4SessionBinding> {
     static BINDING: OnceLock<Mutex<P4SessionBinding>> = OnceLock::new();
     BINDING.get_or_init(|| Mutex::new(P4SessionBinding::default()))
+}
+
+/// Last time the foreground WebView successfully requested a P4 binding.
+/// The native feed takes over only after this goes stale, so foreground and
+/// background never race to own the same device card.
+static P4_FRONTEND_SESSION_SYNC_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn unix_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn active_device_voice_context() -> &'static Mutex<Option<Arc<DeviceVoiceContext>>> {
@@ -1184,6 +1199,52 @@ fn release_completed_voice_for_desktop_task(board: &str) -> Result<(), &'static 
     supersede_device_voice_context(&context).map_err(|_| "voice_release_failed")
 }
 
+const DSH_BRIDGE_URL: &str = "http://127.0.0.1:17892";
+
+fn dsh_voice_post(path: &str, body: &serde_json::Value) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    const DSH_PORT: u16 = 17892;
+    let payload = body.to_string();
+    let address = ("127.0.0.1", DSH_PORT)
+        .to_socket_addrs()
+        .map_err(|error| format!("DSH voice address failed: {error}"))?
+        .next()
+        .ok_or_else(|| "DSH voice address unavailable".to_string())?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(800))
+        .map_err(|error| format!("DSH voice connect failed: {error}"))?;
+    stream.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    stream.set_write_timeout(Some(Duration::from_millis(800))).ok();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{DSH_PORT}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("DSH voice write failed: {error}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|error| format!("DSH voice read failed: {error}"))?;
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        return Err(format!("DSH voice HTTP failed: {}", response.lines().next().unwrap_or("empty")));
+    }
+    Ok(())
+}
+
+fn insert_dsh_voice_draft(text: &str) -> Result<(), String> {
+    dsh_voice_post("/voice/draft", &serde_json::json!({ "text": text }))
+}
+
+fn submit_dsh_voice_composer(session_id: &str) -> Result<(), String> {
+    dsh_voice_post("/voice/submit", &serde_json::json!({ "sessionId": session_id }))
+}
+
+fn interrupt_dsh_session(session_id: &str) -> Result<(), String> {
+    dsh_voice_post("/interrupt", &serde_json::json!({ "sessionId": session_id }))
+}
+
 fn submit_device_voice_via_agent_bus(context: Arc<DeviceVoiceContext>, text: String) {
     if !device_voice_target_is_current(&context) {
         cancel_device_voice_context(&context, "voice target changed before final submission");
@@ -1415,6 +1476,19 @@ fn stage_device_voice_final(
         } else {
             context.draft_ready.store(true, Ordering::SeqCst);
             emit_device_voice_transcript(&context, "draft_ready", revision, &text, true, true, "");
+            if context.target.agent_id == "deepseek-harness" {
+                if let Err(error) = insert_dsh_voice_draft(&text) {
+                    report_device_voice_delivery_failure(
+                        &context,
+                        revision,
+                        &text,
+                        &error,
+                        "DSH 输入框草稿插入失败",
+                        "DSH_COMPOSER_DRAFT_FAILED",
+                    );
+                    return;
+                }
+            }
         }
         return;
     };
@@ -1595,6 +1669,41 @@ fn confirm_pending_device_voice_draft(topic: &str, payload: &serde_json::Value) 
     }
 
     if !agent_uses_visible_composer(&context.target.agent_id) {
+        if context.target.agent_id == "deepseek-harness" {
+            if !device_voice_target_is_current(&context) {
+                cancel_device_voice_context(&context, "DSH voice target changed before submit");
+                return true;
+            }
+            if let Err(error) = submit_dsh_voice_composer(&device_voice_session_id(&context)) {
+                report_device_voice_delivery_failure(
+                    &context,
+                    revision,
+                    &text,
+                    &error,
+                    "DSH 输入框提交失败，语音文字未发送",
+                    "DSH_COMPOSER_SUBMIT_FAILED",
+                );
+                return true;
+            }
+            emit_device_voice_transcript(&context, "submitted", revision, &text, true, true, "");
+            let _ = context.emitter.emit(
+                "usb-input-action-result",
+                serde_json::json!({
+                    "ok": true,
+                    "pending": false,
+                    "view": "voice_input",
+                    "utteranceId": context.utterance_id,
+                    "text": text,
+                    "agentId": context.target.agent_id,
+                    "sessionId": device_voice_session_id(&context),
+                    "message": "已提交 DSH 输入框中的语音草稿",
+                    "composerMode": "dsh-composer",
+                    "composerError": "",
+                }),
+            );
+            complete_device_voice_context(&context);
+            return true;
+        }
         submit_device_voice_via_agent_bus(context, text);
         return true;
     }
@@ -2139,7 +2248,12 @@ fn usb_session_binding_allows(
 
 fn resolve_usb_inject_target(board_device_id: &str) -> (String, String) {
     if let Some(binding) = p4_session_binding_for_board(board_device_id) {
-        return (binding.agent_id, binding.session_id);
+        // A board connection can publish a binding row before the agent sync
+        // fills agentId. An empty agent here used to produce an untargeted
+        // device-voice context, so fall back to the selected bridge agent.
+        if !binding.agent_id.trim().is_empty() {
+            return (binding.agent_id, binding.session_id);
+        }
     }
     (resolve_usb_inject_agent_id(), "auto".to_string())
 }
@@ -2529,7 +2643,20 @@ fn handle_incoming_usb_message(
     topic: String,
     payload: serde_json::Value,
 ) {
+    handle_incoming_device_message(emitter, topic, payload, "usb");
+}
+
+fn handle_incoming_device_message(
+    emitter: &tauri::AppHandle,
+    topic: String,
+    payload: serde_json::Value,
+    transport: &str,
+) {
     resolve_button_config_ack(&topic, &payload);
+    if topic == "approval/decision" {
+        dsh_approval::handle_device_decision(&payload);
+        return;
+    }
     if topic=="app/event"{component_app::device_event(&payload);return;}
     music_player::observe_capture(&topic,&payload);
     component_media::observe_capture(&topic,&payload);
@@ -2568,7 +2695,7 @@ fn handle_incoming_usb_message(
         if topic != "audio/chunk" {
             let _ = emitter.emit(
                 "usb-message",
-                serde_json::json!({"topic": topic, "payload": payload}),
+                serde_json::json!({"topic": topic, "payload": payload, "transport": transport}),
             );
         }
         if let Some(event) = relay_event {
@@ -2672,7 +2799,7 @@ fn handle_incoming_usb_message(
 
     let _ = emitter.emit(
         "usb-message",
-        serde_json::json!({"topic": topic, "payload": payload}),
+        serde_json::json!({"topic": topic, "payload": payload, "transport": transport}),
     );
 
     if confirm_pending_device_voice_draft(&topic, &payload) {
@@ -2709,6 +2836,66 @@ fn handle_incoming_usb_message(
 
     if topic == "input/action" || topic == "input/event" {
         if realtime_chat::handle_input_event(emitter, &payload) {
+            return;
+        }
+        if payload.get("action").and_then(|value| value.as_str()) == Some("dsh_interrupt")
+            && payload
+                .get("handledLocally")
+                .and_then(|value| value.as_bool())
+                != Some(true)
+        {
+            let board_device_id = payload
+                .get("boardDeviceId")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let (agent_id, session_id) = resolve_usb_inject_target(&board_device_id);
+            if agent_id != "deepseek-harness" {
+                let _ = emitter.emit(
+                    "usb-input-action-result",
+                    serde_json::json!({
+                        "ok": false,
+                        "pending": false,
+                        "actionType": "dsh_interrupt",
+                        "agentId": agent_id,
+                        "sessionId": session_id,
+                        "message": "打断 DSH 任务仅在跟随 DeepSeek Harness 时可用",
+                    }),
+                );
+                return;
+            }
+            let emitter = emitter.clone();
+            thread::spawn(move || {
+                match interrupt_dsh_session(&session_id) {
+                    Ok(()) => {
+                        let _ = emitter.emit(
+                            "usb-input-action-result",
+                            serde_json::json!({
+                                "ok": true,
+                                "pending": false,
+                                "actionType": "dsh_interrupt",
+                                "agentId": "deepseek-harness",
+                                "sessionId": session_id,
+                                "message": "已发送打断请求",
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = emitter.emit(
+                            "usb-input-action-result",
+                            serde_json::json!({
+                                "ok": false,
+                                "pending": false,
+                                "actionType": "dsh_interrupt",
+                                "agentId": "deepseek-harness",
+                                "sessionId": session_id,
+                                "message": "打断 DSH 任务失败",
+                                "error": error,
+                            }),
+                        );
+                    }
+                }
+            });
             return;
         }
         let Some(agent_input) = extract_usb_agent_input(&topic, &payload) else {
@@ -2873,7 +3060,14 @@ const BRIDGE_LAUNCH_AGENT_LABEL: &str = "com.petmanager.status-bridge";
 const BRIDGE_WINDOWS_STARTUP_SCRIPT_NAME: &str = "Pet Manager Status Bridge.cmd";
 const USB_STATE_MAX_AGE_MS: u64 = 10 * 60 * 1000;
 const USB_BRIDGE_SCAN_MAX_FILES: usize = 64;
-const KNOWN_USB_STATE_SOURCES: [&str; 5] = ["claude-code", "codex", "openclaw", "mimocode", "workbuddy"];
+const KNOWN_USB_STATE_SOURCES: [&str; 6] = [
+    "claude-code",
+    "codex",
+    "openclaw",
+    "mimocode",
+    "deepseek-harness",
+    "workbuddy",
+];
 #[cfg(windows)]
 const CREATE_NO_WINDOW_FLAG: u32 = 0x08000000;
 
@@ -2960,6 +3154,7 @@ struct BridgeProfileFile {
     pet_channel_id: String,
     enabled_agents: Vec<String>,
     selected_agent_id: String,
+    dsh_approval_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -3605,6 +3800,7 @@ fn save_device_binding(binding: DeviceBinding) -> Result<Vec<DeviceBinding>, Str
             pet_channel_id: DEFAULT_PET_CHANNEL_ID.to_string(),
             enabled_agents: Vec::new(),
             selected_agent_id: String::new(),
+            dsh_approval_timeout_ms: None,
         };
         let profile_payload = serde_json::to_vec_pretty(&profile).map_err(|e| e.to_string())?;
         write_private_file(&config_path, &profile_payload)?;
@@ -3903,6 +4099,7 @@ fn is_allowed_button_config_action(action: &str) -> bool {
             | "session_next"
             | "session_previous"
             | "session_clear"
+            | "dsh_interrupt"
             | "miniapp_screen_tap"
             | "miniapp_screen_long_press"
             | "component_center"
@@ -3931,6 +4128,10 @@ fn set_p4_session_binding_blocking(
     input: SetP4SessionBindingInput,
     usb_manager: usb_serial::UsbSerialManager,
 ) -> Result<P4SessionBinding, String> {
+    P4_FRONTEND_SESSION_SYNC_MS.store(
+        unix_epoch_ms(),
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let board_device_id = input.board_device_id.trim().to_string();
     let agent_id = normalize_agent_id(&input.agent_id)
         .ok_or_else(|| "请选择一个受支持的 Agent".to_string())?;
@@ -4029,15 +4230,9 @@ fn set_p4_session_binding_blocking(
     let mut binding = p4_session_binding()
         .lock()
         .map_err(|error| error.to_string())?;
-    if should_preserve_exact_auto_binding(
-        &binding,
-        &board_device_id,
-        &agent_id,
-        &session_id,
-        input.auto_follow,
-    ) {
-        return Ok(binding.clone());
-    }
+    // Do not return early here. Even when the auto-follow target is preserved,
+    // the P4 still needs the refreshed session queue; returning skipped the
+    // entire session/current USB packet and left the device bubble stale.
     let target_changed = binding.board_device_id != board_device_id
         || binding.agent_id != agent_id
         || binding.session_id != session_id
@@ -4691,6 +4886,7 @@ fn merge_bridge_profile_input(
         selected_agent_id: input
             .selected_agent_id
             .unwrap_or(existing.selected_agent_id),
+        dsh_approval_timeout_ms: existing.dsh_approval_timeout_ms,
     })
 }
 
@@ -4716,6 +4912,40 @@ fn save_bridge_profile(input: BridgeProfileInput) -> Result<BridgeProfileRespons
     write_private_file(&config_path, &payload)?;
 
     Ok(build_bridge_profile_response(&config_path, profile))
+}
+
+const DEFAULT_DSH_APPROVAL_TIMEOUT_MS: u64 = 30_000;
+const MAX_DSH_APPROVAL_TIMEOUT_MS: u64 = 3_600_000;
+const DSH_APPROVAL_NEVER_TIMEOUT_MS: u64 = 99_999;
+
+#[tauri::command]
+fn load_dsh_approval_timeout() -> Result<u64, String> {
+    let config_path = get_bridge_profile_path()?;
+    let profile = read_bridge_profile(&config_path)?.unwrap_or_default();
+    Ok(match profile.dsh_approval_timeout_ms {
+        Some(value) if value > 0 => value,
+        _ => DEFAULT_DSH_APPROVAL_TIMEOUT_MS,
+    })
+}
+
+#[tauri::command]
+fn save_dsh_approval_timeout(timeout_ms: u64) -> Result<u64, String> {
+    if timeout_ms != DSH_APPROVAL_NEVER_TIMEOUT_MS
+        && (!(5_000..=MAX_DSH_APPROVAL_TIMEOUT_MS).contains(&timeout_ms))
+    {
+        return Err("审批超时必须在 5 秒到 1 小时之间，或选择永不超时。".to_string());
+    }
+    let config_path = get_bridge_profile_path()?;
+    let mut profile = read_bridge_profile(&config_path)?.unwrap_or_default();
+    profile.version = 1;
+    profile.updated_at = current_timestamp_ms();
+    profile.dsh_approval_timeout_ms = Some(timeout_ms);
+    if let Some(parent_dir) = config_path.parent() {
+        ensure_private_directory(parent_dir)?;
+    }
+    let payload = serde_json::to_vec_pretty(&profile).map_err(|error| error.to_string())?;
+    write_private_file(&config_path, &payload)?;
+    Ok(timeout_ms)
 }
 
 #[tauri::command]
@@ -4834,6 +5064,7 @@ fn ensure_bridge_runtime_blocking(
                 pet_channel_id: DEFAULT_PET_CHANNEL_ID.to_string(),
                 enabled_agents: Vec::new(),
                 selected_agent_id: String::new(),
+                dsh_approval_timeout_ms: None,
             }));
             let payload = serde_json::to_vec_pretty(&profile).map_err(|e| e.to_string())?;
             let _ = write_private_file(&config_path, &payload);
@@ -5980,6 +6211,41 @@ fn detect_codex() -> DetectedAgent {
     }
 }
 
+/// Decide the OpenClaw discovery state from a real CLI entry and the local
+/// status-bridge identity file.
+///
+/// `~/.status-bridge/openclaw-device.json` is created by the bundled status
+/// bridge on first launch (it is only a local MQTT device identity), so its
+/// presence must never be reported as an installed OpenClaw CLI/Gateway.
+fn openclaw_detection(
+    cli_path: Option<&str>,
+    has_status_bridge_identity: bool,
+) -> (bool, &'static str, String) {
+    match (cli_path, has_status_bridge_identity) {
+        (Some(path), true) => (
+            true,
+            "ready",
+            format!("已检测到 OpenClaw CLI 与本地状态桥身份: {}", path),
+        ),
+        (Some(path), false) => (
+            true,
+            "ready",
+            format!("已检测到 OpenClaw CLI（等待 Gateway 配置）: {}", path),
+        ),
+        (None, true) => (
+            false,
+            "not_found",
+            "仅检测到 HachimoDock 本地状态桥身份文件（客户端自动生成），未安装 OpenClaw CLI"
+                .to_string(),
+        ),
+        (None, false) => (
+            false,
+            "not_found",
+            "未检测到 OpenClaw CLI 或 Gateway".to_string(),
+        ),
+    }
+}
+
 fn detect_openclaw() -> DetectedAgent {
     let home = get_home_dir().ok();
     let cli_path = find_agent_executable(
@@ -5997,37 +6263,18 @@ fn detect_openclaw() -> DetectedAgent {
                 .to_string()
         })
         .unwrap_or_default();
-    let has_config = !config_path.is_empty() && Path::new(&config_path).exists();
+    let has_status_bridge_identity =
+        !config_path.is_empty() && Path::new(&config_path).exists();
 
-    let (detected, status, detail) = match (&cli_path, has_config) {
-        (Some(path), true) => (
-            true,
-            "ready".to_string(),
-            format!("已检测到 OpenClaw CLI 与 Gateway: {}", path),
-        ),
-        (Some(path), false) => (
-            true,
-            "ready".to_string(),
-            format!("已检测到 OpenClaw CLI（等待 Gateway 配置）: {}", path),
-        ),
-        (None, true) => (
-            true,
-            "ready".to_string(),
-            "OpenClaw Gateway 已配置（未发现 CLI 入口）".to_string(),
-        ),
-        (None, false) => (
-            false,
-            "not_found".to_string(),
-            "未检测到 OpenClaw CLI 或 Gateway".to_string(),
-        ),
-    };
+    let (detected, status, detail) =
+        openclaw_detection(cli_path.as_deref(), has_status_bridge_identity);
 
     DetectedAgent {
         id: "openclaw".to_string(),
         label: "OpenClaw".to_string(),
         detected,
         ready: status == "ready",
-        status,
+        status: status.to_string(),
         detail,
         command_path: cli_path.unwrap_or_default(),
         config_path,
@@ -6138,6 +6385,198 @@ fn detect_workbuddy() -> DetectedAgent {
     }
 }
 
+// ── DeepSeek Harness (DSH) ──
+
+#[cfg(target_os = "macos")]
+const DSH_APP_BUNDLE_NAME: &str = "DeepSeek Harness.app";
+#[cfg(target_os = "macos")]
+const DSH_BUNDLE_IDENTIFIER: &str = "com.deepseek.dsh";
+const DSH_BUNDLED_CLI_RELATIVE_PATH: &str = "Contents/Resources/runtime/cli/bin/dsh";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DshDetection {
+    detected: bool,
+    ready: bool,
+    status: String,
+    detail: String,
+}
+
+/// Location of the CLI shipped inside the macOS application bundle.
+fn dsh_bundled_cli_path(app_path: &Path) -> PathBuf {
+    DSH_BUNDLED_CLI_RELATIVE_PATH
+        .split('/')
+        .fold(app_path.to_path_buf(), |path, segment| path.join(segment))
+}
+
+/// Classify an already-probed DSH install. All detected locations are injected
+/// so present/absent cases stay unit-testable without touching the real host.
+fn classify_dsh_detection(
+    app_path: Option<&Path>,
+    cli_path: Option<&Path>,
+    profile_path: Option<&Path>,
+    version: Option<&str>,
+) -> DshDetection {
+    let detected = app_path.is_some() || cli_path.is_some() || profile_path.is_some();
+    if !detected {
+        return DshDetection {
+            detected: false,
+            ready: false,
+            status: "not_found".to_string(),
+            detail: "未检测到 DeepSeek Harness 应用、CLI 或桌面配置".to_string(),
+        };
+    }
+
+    let mut sources = Vec::new();
+    if let Some(path) = app_path {
+        sources.push(format!("应用 {}", path.display()));
+    }
+    if let Some(path) = cli_path {
+        sources.push(format!("CLI {}", path.display()));
+    }
+    if let Some(path) = profile_path {
+        sources.push(format!("配置 {}", path.display()));
+    }
+    let version = version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" v{value}"))
+        .unwrap_or_default();
+
+    DshDetection {
+        detected: true,
+        ready: true,
+        status: "ready".to_string(),
+        detail: format!(
+            "已检测到 DeepSeek Harness{version}（{}）",
+            sources.join("；")
+        ),
+    }
+}
+
+/// Cheap version lookup: read CFBundleShortVersionString out of the bundle's
+/// text Info.plist instead of spawning the Electron-backed CLI. Binary plists
+/// simply fail the UTF-8 read and fall back to no version.
+fn parse_dsh_plist_version(plist: &str) -> Option<String> {
+    let key_index = plist.find("CFBundleShortVersionString")?;
+    let after_key = &plist[key_index..];
+    let value_start = after_key.find("<string>")? + "<string>".len();
+    let value_end = after_key[value_start..].find("</string>")? + value_start;
+    let version = after_key[value_start..value_end].trim();
+    (!version.is_empty()).then(|| version.to_string())
+}
+
+fn read_dsh_bundle_version(app_path: Option<&Path>) -> Option<String> {
+    let plist_path = app_path?.join("Contents").join("Info.plist");
+    parse_dsh_plist_version(&fs::read_to_string(plist_path).ok()?)
+}
+
+fn find_dsh_app_bundle(home: Option<&Path>) -> Option<PathBuf> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
+
+    #[cfg(target_os = "macos")]
+    {
+        for candidate in macos_app_bundle_candidates(
+            home,
+            &[DSH_APP_BUNDLE_NAME],
+            &[DSH_BUNDLE_IDENTIFIER],
+        ) {
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut candidates = Vec::new();
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            push_unique_path(
+                &mut candidates,
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("DeepSeek Harness")
+                    .join("DeepSeek Harness.exe"),
+            );
+        }
+        if let Some(program_files) = env::var_os("ProgramFiles") {
+            push_unique_path(
+                &mut candidates,
+                PathBuf::from(program_files)
+                    .join("DeepSeek Harness")
+                    .join("DeepSeek Harness.exe"),
+            );
+        }
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn find_dsh_cli(home: Option<&Path>, app_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(app_path) = app_path {
+        let bundled = dsh_bundled_cli_path(app_path);
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    find_agent_executable(
+        "dsh",
+        home,
+        &[".dsh/bin/dsh", ".local/bin/dsh"],
+        "dsh.exe",
+    )
+    .map(PathBuf::from)
+}
+
+fn find_dsh_profile_dir(home: Option<&Path>) -> Option<PathBuf> {
+    let profile = home?.join(".dsh").join("profiles").join("desktop");
+    profile.is_dir().then_some(profile)
+}
+
+fn detect_dsh() -> DetectedAgent {
+    detect_dsh_with_home(get_home_dir().ok().as_deref())
+}
+
+fn detect_dsh_with_home(home: Option<&Path>) -> DetectedAgent {
+    let app_path = find_dsh_app_bundle(home);
+    let cli_path = find_dsh_cli(home, app_path.as_deref());
+    let profile_path = find_dsh_profile_dir(home);
+    let version = read_dsh_bundle_version(app_path.as_deref());
+    let detection = classify_dsh_detection(
+        app_path.as_deref(),
+        cli_path.as_deref(),
+        profile_path.as_deref(),
+        version.as_deref(),
+    );
+
+    DetectedAgent {
+        id: "deepseek-harness".to_string(),
+        label: "DeepSeek Harness".to_string(),
+        detected: detection.detected,
+        ready: detection.ready,
+        status: detection.status,
+        detail: detection.detail,
+        command_path: cli_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        config_path: profile_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        activity_path: app_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        can_sync_hook: false,
+    }
+}
+
 fn detect_local_agents_inner() -> Result<AgentDiscoveryResponse, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6149,6 +6588,7 @@ fn detect_local_agents_inner() -> Result<AgentDiscoveryResponse, String> {
         detect_codex(),
         detect_openclaw(),
         detect_mimocode(),
+        detect_dsh(),
         detect_workbuddy(),
     ];
 
@@ -6378,6 +6818,61 @@ async fn usb_send_state(
     usb_manager.send_state(&source, &payload)
 }
 
+/// Send an arbitrary JSON topic to the connected board. Used by the optional
+/// Wi-Fi provisioning/status panel; USB remains the provisioning path.
+#[tauri::command]
+async fn usb_send_topic(
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    topic: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    usb_manager.send(&topic, &payload)
+}
+
+/// Optional PC-side Wi-Fi TCP transport. The firmware sends a hello line on
+/// connect; this layer keeps the TCP socket alive and forwards JSONL messages
+/// through the same `usb-message` event shape used by the USB bridge.
+#[tauri::command]
+async fn wifi_tcp_connect(
+    app: tauri::AppHandle,
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+    ip: String,
+    port: Option<u16>,
+) -> Result<wifi_transport::WifiConnectionStatus, String> {
+    let emitter = app.clone();
+    let handler: wifi_transport::WifiMessageHandler =
+        std::sync::Arc::new(move |topic: &str, payload: &serde_json::Value| {
+            // Reuse the shared device pipeline so session/state listeners see
+            // Wi-Fi messages, tagged with their actual transport.
+            handle_incoming_device_message(&emitter, topic.to_string(), payload.clone(), "wifi");
+        });
+    transport.connect(&ip, port.unwrap_or(3232), handler)
+}
+
+#[tauri::command]
+async fn wifi_tcp_disconnect(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+) -> Result<(), String> {
+    transport.disconnect();
+    Ok(())
+}
+
+#[tauri::command]
+async fn wifi_tcp_status(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+) -> Result<wifi_transport::WifiConnectionStatus, String> {
+    Ok(transport.status())
+}
+
+#[tauri::command]
+async fn wifi_tcp_send(
+    transport: tauri::State<'_, wifi_transport::WifiTransport>,
+    topic: String,
+    payload: serde_json::Value,
+) -> Result<(), String> {
+    transport.send(&topic, &payload)
+}
+
 #[tauri::command]
 async fn usb_send_speech(
     usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
@@ -6419,6 +6914,22 @@ async fn usb_send_speech(
     });
 
     Ok(())
+}
+
+#[tauri::command]
+fn usb_bubble_pixels_ready(app: tauri::AppHandle,
+    usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>, ready: bool) {
+    usb_manager.set_bubble_renderer(if ready { Some(Arc::new(move |event| {
+        let _ = app.emit("usb-bubble-render", event);
+    })) } else { None });
+}
+
+#[tauri::command]
+async fn usb_send_bubble_pixels(usb_manager: tauri::State<'_, usb_serial::UsbSerialManager>,
+    frame: usb_serial::BubbleFrame) -> Result<(), String> {
+    let manager = usb_manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || manager.send_bubble_pixels(frame))
+        .await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -8792,6 +9303,7 @@ fn normalize_agent_id(value: &str) -> Option<String> {
         "claude" | "claude-code" => Some("claude-code".to_string()),
         "openclaw" => Some("openclaw".to_string()),
         "mimo" | "mimo-code" | "mimocode" => Some("mimocode".to_string()),
+        "deepseek-harness" | "deepseek" | "dsh" => Some("deepseek-harness".to_string()),
         "workbuddy" | "work-buddy" => Some("workbuddy".to_string()),
         "copilot" | "copilot-cli" => Some("copilot-cli".to_string()),
         "gemini" | "gemini-cli" => Some("gemini-cli".to_string()),
@@ -9259,7 +9771,12 @@ fn score_usb_state(state: &str) -> i32 {
 
 fn score_usb_source(source: &str) -> i32 {
     match source {
+        // Codex keeps the long-standing top slot. DeepSeek Harness is a
+        // first-class local agent routed through the same session bus, so it
+        // sits just below Codex and above the other integrations; this only
+        // breaks exact state/ts ties between sources.
         "codex" => 30,
+        "deepseek-harness" => 25,
         "claude-code" => 20,
         "mimocode" => 15,
         "workbuddy" => 15,
@@ -9314,6 +9831,7 @@ fn usb_source_display_name(source: &str) -> String {
         "claude" | "claude-code" => "Claude".to_string(),
         "openclaw" => "OpenClaw".to_string(),
         "mimo" | "mimo-code" | "mimocode" => "MiMoCode".to_string(),
+        "deepseek-harness" | "deepseek" | "dsh" => "DeepSeek Harness".to_string(),
         "workbuddy" | "work-buddy" => "WorkBuddy".to_string(),
         other if !other.is_empty() => other.to_string(),
         _ => "桌宠".to_string(),
@@ -9666,6 +10184,138 @@ fn forward_usb_speech_updates(
 }
 
 /// Keep the board's host lease alive independently from state and speech scans.
+fn start_native_session_feed(usb_manager: usb_serial::UsbSerialManager) {
+    thread::spawn(move || {
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(1800))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("[p4-session] native feed client unavailable: {error}");
+                return;
+            }
+        };
+        loop {
+            thread::sleep(Duration::from_secs(2));
+            let now = unix_epoch_ms();
+            let last_frontend = P4_FRONTEND_SESSION_SYNC_MS
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if now.saturating_sub(last_frontend) < 7_000 {
+                continue;
+            }
+            let binding = match p4_session_binding().lock() {
+                Ok(binding) => binding.clone(),
+                Err(_) => continue,
+            };
+            if binding.board_device_id.is_empty() || binding.agent_id.is_empty() {
+                continue;
+            }
+            let status = usb_manager.status();
+            if !status.connected || status.board_device_id != binding.board_device_id {
+                continue;
+            }
+            let response = match client
+                .get("http://127.0.0.1:8181/agent/sessions")
+                .query(&[("agentId", binding.agent_id.as_str())])
+                .send()
+                .and_then(|response| response.error_for_status())
+            {
+                Ok(response) => response,
+                Err(_) => continue,
+            };
+            let body: serde_json::Value = match response.json() {
+                Ok(body) => body,
+                Err(_) => continue,
+            };
+            let rows = body
+                .get("sessions")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut sessions = Vec::new();
+            let mut active_ids = Vec::new();
+            for row in rows.iter().take(8) {
+                let id = row.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let state = row
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("idle")
+                    .to_ascii_lowercase();
+                let is_active = matches!(
+                    state.as_str(),
+                    "working" | "thinking" | "tool_running" | "active" | "speaking"
+                );
+                if id.is_empty() || !is_active {
+                    continue;
+                }
+                let title = row
+                    .get("name")
+                    .or_else(|| row.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let content = row
+                    .get("displayContent")
+                    .or_else(|| row.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if title.is_empty() && content.is_empty() {
+                    continue;
+                }
+                let revision = row
+                    .get("transitionRevision")
+                    .or_else(|| row.get("statusUpdatedAt"))
+                    .or_else(|| row.get("lastModified"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                active_ids.push(id.to_string());
+                sessions.push(serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "content": content,
+                    "state": state,
+                    "transitionRevision": revision,
+                    "terminalRemainingMs": 0,
+                }));
+            }
+            let selected = if !binding.session_id.is_empty()
+                && sessions.iter().any(|session| session["id"] == binding.session_id.as_str())
+            {
+                binding.session_id.clone()
+            } else {
+                sessions
+                    .first()
+                    .and_then(|session| session["id"].as_str())
+                    .unwrap_or("auto")
+                    .to_string()
+            };
+            let title = sessions
+                .iter()
+                .find(|session| session["id"] == selected.as_str())
+                .and_then(|session| session["title"].as_str())
+                .unwrap_or("");
+            let payload = serde_json::json!({
+                "sessionId": selected,
+                "title": title,
+                "index": 0,
+                "count": sessions.len(),
+                "sessions": sessions,
+                "agentId": binding.agent_id,
+                "activeSessionIds": active_ids,
+                "displayEnabled": true,
+                "notice": "",
+            });
+            let _ = usb_manager.send_to_board(
+                &binding.board_device_id,
+                "session/current",
+                &payload,
+            );
+        }
+    });
+}
+
 fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
@@ -9676,7 +10326,11 @@ fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
             "system/heartbeat",
             &serde_json::json!({ "tsMs": current_timestamp_ms() }),
         ) {
-            eprintln!("[usb-heartbeat] send failed: {}", error);
+            eprintln!("[usb-heartbeat] send failed, forcing reconnect: {}", error);
+            // A stale writer can keep status.connected=true after the board
+            // disappears. Dropping the connection lets start_usb_auto_connect
+            // probe and restore the port without a manual rescan.
+            usb_manager.disconnect();
         }
     });
 }
@@ -10139,14 +10793,35 @@ fn start_usb_auto_connect(usb_manager: usb_serial::UsbSerialManager, app_handle:
     });
 }
 
+#[cfg(target_os = "macos")]
+fn prevent_app_nap() {
+    // macOS App Nap can throttle the USB audio writer when the window is
+    // occluded. Keep a user-activity/idle assertion for this process only.
+    let pid = std::process::id().to_string();
+    match std::process::Command::new("/usr/bin/caffeinate")
+        .args(["-imsu", "-w", &pid])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => eprintln!("[app-nap] caffeinate assertion started for pid {pid}"),
+        Err(error) => eprintln!("[app-nap] failed to start caffeinate: {error}"),
+    }
+}
+
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    prevent_app_nap();
     let usb_manager = usb_serial::UsbSerialManager::new();
     if !cfg!(feature = "composer-diagnostic") {
     if let Err(error) = sync_usb_desktop_device_id(&usb_manager) {
         eprintln!("[usb-identity] desktop id unavailable: {}", error);
     }
     start_usb_host_heartbeat(usb_manager.clone());
+    start_native_session_feed(usb_manager.clone());
     start_usb_state_forwarder(usb_manager.clone());
+    dsh_approval::start(usb_manager.clone());
     }
 
     let usb_for_auto = usb_manager.clone();
@@ -10163,6 +10838,19 @@ pub fn run() {
                 return Ok(());
             }
             desktop_window::fit(app.handle(),true);
+            // Keep the dashboard session feed alive when the macOS WebView is
+            // occluded and its JS timers are throttled. The frontend reacts to
+            // this heartbeat by refreshing the local Agent Bus snapshot.
+            let session_heartbeat_app = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if session_heartbeat_app
+                    .emit("agent-session-heartbeat", ())
+                    .is_err()
+                {
+                    break;
+                }
+            });
             let bundled=app.path().resource_dir()?.join("builtin-clawpkgs");
             #[cfg(debug_assertions)]
             let bundled=if bundled.is_dir(){bundled}else{PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../builtin-clawpkgs")};
@@ -10201,6 +10889,41 @@ pub fn run() {
                 let _ = get_npm_global_bin();
                 let _ = get_full_shell_path();
             });
+            let auto_flash_arg = std::env::args()
+                .skip_while(|arg| arg != "--flash")
+                .nth(1);
+            let auto_flash_path = std::env::var("HACHIMO_AUTO_FLASH").ok().or(auto_flash_arg);
+            if let Some(firmware_path) = auto_flash_path {
+                let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("queued {}\n", firmware_path));
+                let flash_manager = usb_for_auto.clone();
+                let flash_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let status = flash_manager.status();
+                        if status.connected && status.runtime.eq_ignore_ascii_case("esp-p4") {
+                            eprintln!("[auto-flash] flashing {} to {}", firmware_path, status.board_device_id);
+                            let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("flashing {} to {}\n", firmware_path, status.board_device_id));
+                            match run_usb_firmware_update(
+                                flash_handle.clone(),
+                                flash_manager.clone(),
+                                PathBuf::from(&firmware_path),
+                                status.board_device_id.clone(),
+                            ).await {
+                                Ok(result) => {
+                                    eprintln!("[auto-flash] complete: {:?}", result);
+                                    let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("complete: {:?}\n", result));
+                                }
+                                Err(error) => {
+                                    eprintln!("[auto-flash] failed: {error}");
+                                    let _ = std::fs::write("/tmp/hachimo-autoflash-status.log", format!("failed: {error}\n"));
+                                }
+                            }
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                });
+            }
             let handle = app.handle().clone();
             start_usb_auto_connect(usb_for_auto, handle.clone());
             start_p4_ready_migration(handle.clone());
@@ -10232,6 +10955,7 @@ pub fn run() {
             Ok(())
         })
         .manage(usb_manager)
+        .manage(wifi_transport::WifiTransport::new())
         .invoke_handler(tauri::generate_handler![
             reference_image::reference_image_mount,
             reference_image::reference_image_action,
@@ -10288,6 +11012,8 @@ pub fn run() {
             dispatch_remote_cli_binding,
             load_bridge_profile,
             save_bridge_profile,
+            load_dsh_approval_timeout,
+            save_dsh_approval_timeout,
             clear_bridge_profile,
             load_agent_selection,
             save_agent_selection,
@@ -10311,7 +11037,14 @@ pub fn run() {
             usb_connect,
             usb_disconnect,
             usb_send_state,
+            usb_send_topic,
+            wifi_tcp_connect,
+            wifi_tcp_disconnect,
+            wifi_tcp_status,
+            wifi_tcp_send,
             usb_send_speech,
+            usb_bubble_pixels_ready,
+            usb_send_bubble_pixels,
             usb_send_command,
             usb_audio_capture_control,
             usb_get_status,
@@ -10619,6 +11352,7 @@ fn selected_agent_to_channel_id(value: &str) -> String {
         "codex" => "codex".to_string(),
         "openclaw" => "openclaw".to_string(),
         "mimocode" => "mimocode".to_string(),
+        "deepseek-harness" => "deepseek-harness".to_string(),
         "workbuddy" => "workbuddy".to_string(),
         _ => DEFAULT_PET_CHANNEL_ID.to_string(),
     }
@@ -10630,6 +11364,7 @@ fn normalize_pet_channel_id(value: String) -> String {
         "claude" => "claude".to_string(),
         "openclaw" => "openclaw".to_string(),
         "mimocode" => "mimocode".to_string(),
+        "deepseek-harness" | "deepseek" | "dsh" => "deepseek-harness".to_string(),
         "workbuddy" => "workbuddy".to_string(),
         "cursor" => "cursor".to_string(),
         _ => DEFAULT_PET_CHANNEL_ID.to_string(),
@@ -12300,6 +13035,78 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_status_bridge_identity_alone_is_not_an_installed_cli() {
+        let (detected, status, detail) = openclaw_detection(None, true);
+        assert!(!detected);
+        assert_eq!(status, "not_found");
+        assert!(detail.contains("状态桥身份"));
+    }
+
+    #[test]
+    fn openclaw_cli_detection_stays_ready_with_or_without_bridge_identity() {
+        for has_status_bridge_identity in [true, false] {
+            let (detected, status, _) =
+                openclaw_detection(Some("/tmp/openclaw"), has_status_bridge_identity);
+            assert!(detected);
+            assert_eq!(status, "ready");
+        }
+    }
+
+    #[test]
+    fn deepseek_harness_aliases_route_through_the_agent_bus_instead_of_a_composer() {
+        assert_eq!(
+            normalize_agent_id("DeepSeek-Harness").as_deref(),
+            Some("deepseek-harness")
+        );
+        assert_eq!(
+            normalize_agent_id("deepseek").as_deref(),
+            Some("deepseek-harness")
+        );
+        assert_eq!(normalize_agent_id("DSH").as_deref(), Some("deepseek-harness"));
+        assert_eq!(
+            selected_agent_to_channel_id("deepseek-harness"),
+            "deepseek-harness"
+        );
+        assert_eq!(
+            normalize_pet_channel_id("DSH".into()),
+            "deepseek-harness"
+        );
+        assert_eq!(
+            usb_source_display_name("deepseek-harness"),
+            "DeepSeek Harness"
+        );
+        assert_eq!(usb_source_display_name("dsh"), "DeepSeek Harness");
+        assert!(KNOWN_USB_STATE_SOURCES.contains(&"deepseek-harness"));
+        // DSH text injection goes through agent-session-bus, never through an
+        // Accessibility composer, so the visible-composer branches stay off.
+        assert!(!agent_uses_visible_composer("deepseek-harness"));
+        assert!(!agent_streams_voice_draft("deepseek-harness"));
+        assert!(!should_locate_desktop_session(true, "deepseek-harness"));
+        assert!(device_voice_platform_block_reason("deepseek-harness", false).is_none());
+        assert!(device_voice_platform_block_reason("deepseek-harness", true).is_none());
+    }
+
+    #[test]
+    fn deepseek_harness_usb_source_ranks_between_codex_and_claude() {
+        let dsh_score = score_usb_source("deepseek-harness");
+        assert!(dsh_score < score_usb_source("codex"));
+        assert!(dsh_score > score_usb_source("claude-code"));
+        assert!(dsh_score > score_usb_source("openclaw"));
+
+        let enabled = HashSet::from([
+            "deepseek-harness".to_string(),
+            "codex".to_string(),
+        ]);
+        let selected = Some("deepseek-harness".to_string());
+        assert!(usb_source_allowed_by_follow(
+            "deepseek-harness",
+            &selected,
+            &enabled
+        ));
+        assert!(!usb_source_allowed_by_follow("codex", &selected, &enabled));
+    }
+
+    #[test]
     fn default_audio_cues_refresh_without_overwriting_uploaded_cues() {
         let temp = tempfile::tempdir().unwrap();
         let appearance = temp.path().join("appearance");
@@ -12385,6 +13192,95 @@ mod tests {
             find_claude_desktop_install(Some(home.path())).as_deref(),
             app.to_str()
         );
+    }
+
+    #[test]
+    fn dsh_detection_classifies_present_install() {
+        let detection = classify_dsh_detection(
+            Some(Path::new("DeepSeek Harness.app")),
+            Some(Path::new("dsh-cli")),
+            Some(Path::new("profile")),
+            Some("0.2.1-rc.5"),
+        );
+        assert!(detection.detected);
+        assert!(detection.ready);
+        assert_eq!(detection.status, "ready");
+        assert!(detection.detail.contains("DeepSeek Harness"));
+        assert!(detection.detail.contains("v0.2.1-rc.5"));
+        assert!(detection.detail.contains("dsh-cli"));
+    }
+
+    #[test]
+    fn dsh_detection_classifies_absent_install() {
+        let detection = classify_dsh_detection(None, None, None, None);
+        assert!(!detection.detected);
+        assert!(!detection.ready);
+        assert_eq!(detection.status, "not_found");
+        assert!(detection.detail.contains("未检测到 DeepSeek Harness"));
+    }
+
+    #[test]
+    fn dsh_detection_accepts_cli_or_profile_only_hosts() {
+        let cli_only = classify_dsh_detection(None, Some(Path::new("dsh-cli")), None, None);
+        assert!(cli_only.detected);
+        assert!(cli_only.detail.contains("CLI"));
+        assert!(cli_only.detail.contains("dsh-cli"));
+
+        let profile_only = classify_dsh_detection(None, None, Some(Path::new("profile")), None);
+        assert!(profile_only.detected);
+        assert!(profile_only.detail.contains("配置"));
+    }
+
+    #[test]
+    fn dsh_bundle_version_is_read_from_text_info_plist() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+  <dict>
+    <key>CFBundleShortVersionString</key>
+    <string>0.2.1-rc.5</string>
+  </dict>
+</plist>"#;
+        assert_eq!(parse_dsh_plist_version(plist).as_deref(), Some("0.2.1-rc.5"));
+        assert_eq!(
+            parse_dsh_plist_version(r#"<plist version="1.0"><dict/></plist>"#),
+            None
+        );
+    }
+
+    #[test]
+    fn dsh_bundled_cli_lives_inside_app_bundle_resources() {
+        let cli = dsh_bundled_cli_path(Path::new("DeepSeek Harness.app"));
+        assert!(cli.ends_with(Path::new("Contents/Resources/runtime/cli/bin/dsh")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dsh_detection_uses_app_bundle_cli_and_desktop_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let app = home.path().join("Applications").join("DeepSeek Harness.app");
+        let bundled_cli = dsh_bundled_cli_path(&app);
+        fs::create_dir_all(bundled_cli.parent().unwrap()).unwrap();
+        fs::write(&bundled_cli, b"#!/bin/sh\n").unwrap();
+        fs::write(
+            app.join("Contents").join("Info.plist"),
+            br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>9.9.9</string></dict></plist>"#,
+        )
+        .unwrap();
+        let profile = home.path().join(".dsh").join("profiles").join("desktop");
+        fs::create_dir_all(&profile).unwrap();
+
+        let detected = detect_dsh_with_home(Some(home.path()));
+        assert_eq!(detected.id, "deepseek-harness");
+        assert_eq!(detected.label, "DeepSeek Harness");
+        assert!(detected.detected);
+        assert!(detected.ready);
+        assert_eq!(
+            detected.command_path,
+            bundled_cli.to_string_lossy().into_owned()
+        );
+        assert_eq!(detected.config_path, profile.to_string_lossy().into_owned());
+        assert_eq!(detected.activity_path, app.to_string_lossy().into_owned());
+        assert!(detected.detail.contains("9.9.9"));
     }
 
     #[test]
@@ -13384,6 +14280,7 @@ mod tests {
         assert!(is_allowed_button_config_action("session_next"));
         assert!(is_allowed_button_config_action("session_previous"));
         assert!(is_allowed_button_config_action("session_clear"));
+        assert!(is_allowed_button_config_action("dsh_interrupt"));
         assert!(is_allowed_button_config_action("miniapp_screen_tap"));
         assert!(is_allowed_button_config_action("miniapp_screen_long_press"));
         assert!(is_allowed_button_config_action("component_center"));
@@ -13461,6 +14358,7 @@ mod tests {
             disabled,
             vec![
                 "codex".to_string(),
+                "deepseek-harness".to_string(),
                 "mimocode".to_string(),
                 "openclaw".to_string(),
                 "workbuddy".to_string()
@@ -13886,4 +14784,6 @@ mod tests {
         assert_eq!(read_live_managed_pid(&pid_path), None);
         assert!(!pid_path.exists());
     }
+
+
 }

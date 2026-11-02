@@ -16,6 +16,9 @@ idf_component_register(
     "pet_p4_conversation.c"
     "pet_p4_diagnostics.c"
     "pet_p4_font_cn.c"
+    "pet_p4_font_cn_24.c"
+    "pet_p4_font_cn_32.c"
+    "pet_p4_bubble_pixels.c"
     "pet_p4_game.c"
     "pet_p4_input.c"
     "pet_p4_input_core.c"
@@ -37,6 +40,7 @@ idf_component_register(
     "pet_p4_slice_core.c"
     "pet_p4_fruit_core.c"
     "pet_p4_usb_native.c"
+    "pet_p4_wifi.c"
     "pet_p4_usb_descriptors.c"
     "pet_p4_renderer.c"
     "pet_p4_view.c"
@@ -64,6 +68,12 @@ idf_component_register(
     nvs_flash
     spiffs
     tinyusb
+    esp_wifi
+    esp_netif
+    esp_event
+    lwip
+    espressif__esp_hosted
+    espressif__esp_wifi_remote
 )
 
 # Shared, OTA-updatable status cues live in the application, not appearance slots.
@@ -95,6 +105,26 @@ endif()
 foreach(cue done error)
   set(cue_input "${CMAKE_CURRENT_LIST_DIR}/../../pc/public/terrier-clips/${cue}.wav")
   target_add_binary_data(${COMPONENT_LIB} "${cue_input}" BINARY)
+endforeach()
+
+# Permission cues are generated ASM sources. Generate them at configure time
+# so a clean build always has the files before the ASM compile rules are added.
+idf_build_get_property(pet_idf_path IDF_PATH)
+foreach(cue permission_request permission_approved permission_denied permission_expired session_terminated)
+  set(cue_input "${CMAKE_CURRENT_LIST_DIR}/../../pc/public/terrier-clips/${cue}.wav")
+  set(cue_source "${CMAKE_BINARY_DIR}/${cue}.wav.S")
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}"
+      -D "DATA_FILE=${cue_input}"
+      -D "SOURCE_FILE=${cue_source}"
+      -D FILE_TYPE=BINARY
+      -P "${pet_idf_path}/tools/cmake/scripts/data_file_embed_asm.cmake"
+    RESULT_VARIABLE pet_permission_cue_status
+  )
+  if(NOT pet_permission_cue_status EQUAL 0)
+    message(FATAL_ERROR "Failed to generate ${cue}.wav.S")
+  endif()
+  target_sources(${COMPONENT_LIB} PRIVATE "${cue_source}")
 endforeach()
 
 execute_process(

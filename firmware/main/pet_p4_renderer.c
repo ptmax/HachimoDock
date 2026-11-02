@@ -7,6 +7,7 @@
  *          global-binding-neutral navigation hints, modern clean cards/HUDs, and
  *          Session-independent recording feedback on the idle main page,
  *          a lightweight transfer screen that never reads changing assets,
+ *          a modal DSH approval overlay above every page,
  *          and reusable bounded H.264 decode storage isolated from immutable asset caches.
  * [Pos] ESP32-P4 display renderer.
  * [Sync] If this file changes, update `firmware/.folder.md` and renderer tests.
@@ -14,6 +15,7 @@
 
 #include "pet_p4_renderer.h"
 #include "pet_p4_frame_gate.h"
+#include "pet_p4_bubble_pixels.h"
 
 #include <limits.h>
 #include <math.h>
@@ -87,6 +89,11 @@ pet_p4_render_metrics_t pet_p4_renderer_metrics(void) {
 #define PET_P4_SESSION_CARD_GAP 8
 #define PET_P4_SESSION_CARD_BOTTOM 460
 #define PET_P4_COMPACT_TEXT_OPTICAL_Y (-2)
+#define PET_P4_APPROVAL_CARD_WIDTH 520
+#define PET_P4_APPROVAL_CARD_HEIGHT 352
+#define PET_P4_APPROVAL_CARD_RADIUS 20
+#define PET_P4_APPROVAL_CARD_X ((PET_P4_UI_WIDTH - PET_P4_APPROVAL_CARD_WIDTH) / 2)
+#define PET_P4_APPROVAL_CARD_Y ((PET_P4_UI_HEIGHT - PET_P4_APPROVAL_CARD_HEIGHT) / 2)
 #define PET_P4_PAGE_INDICATOR_X 294
 #define PET_P4_PAGE_INDICATOR_Y 16
 #define PET_P4_PAGE_INDICATOR_WIDTH 52
@@ -105,6 +112,8 @@ pet_p4_render_metrics_t pet_p4_renderer_metrics(void) {
 static const char *TAG = "pet-p4-renderer";
 
 extern const lv_font_t pet_p4_font_cn_16;
+extern const lv_font_t pet_p4_font_cn_24;
+extern const lv_font_t pet_p4_font_cn_32;
 
 static uint16_t *g_framebuffer;
 static uint16_t *g_native_framebuffer;
@@ -115,6 +124,11 @@ static uint16_t *g_jpeg_output;
 static uint8_t *g_tjpgd_workbuf;
 static jpeg_decoder_handle_t g_jpeg_decoder;
 static ppa_client_handle_t g_ppa_srm_client;
+static ppa_client_handle_t g_ppa_blend_client;
+static uint8_t *g_ppa_card_mask;
+static size_t g_ppa_card_mask_capacity;
+static int g_ppa_card_mask_w, g_ppa_card_mask_h, g_ppa_card_mask_radius;
+static uint8_t g_ppa_card_mask_alpha;
 static size_t g_jpeg_input_capacity;
 static size_t g_jpeg_output_capacity;
 static bool g_jpeg_input_dma_compatible;
@@ -152,6 +166,8 @@ static uint16_t *g_session_overlay_cache;
 static uint64_t g_session_overlay_signature;
 static bool g_session_overlay_cache_valid;
 static bool g_last_realtime_conversation;
+static unsigned int g_bubble_opacity_percent = 100;
+static bool g_last_approval_visible;
 static bool g_session_overlay_cache_allocation_failed;
 static uint8_t g_session_overlay_row_run_count[PET_P4_UI_HEIGHT];
 static uint16_t g_session_overlay_row_run_start[PET_P4_UI_HEIGHT][PET_P4_SESSION_CACHE_MAX_RUNS];
@@ -825,6 +841,16 @@ static int glyph_width(uint32_t codepoint, uint32_t next_codepoint) {
   return glyph.adv_w > 0 ? glyph.adv_w : glyph.box_w;
 }
 
+/* Keep 16 px advances for layout; use native 32 px ink when available. */
+static bool scaled_glyph_dsc(uint32_t codepoint, uint32_t next_codepoint,
+                             lv_font_glyph_dsc_t *glyph, int *scale) {
+  if (*scale == 2 && lv_font_get_glyph_dsc(&pet_p4_font_cn_32, glyph, codepoint, next_codepoint)) {
+    *scale = 1;
+    return true;
+  }
+  return lv_font_get_glyph_dsc(&pet_p4_font_cn_16, glyph, codepoint, next_codepoint);
+}
+
 static bool glyph_visual_bounds(
   uint32_t codepoint,
   uint32_t next_codepoint,
@@ -835,7 +861,7 @@ static bool glyph_visual_bounds(
   lv_font_glyph_dsc_t glyph = {0};
   if (codepoint == 0xFE0F || codepoint == 0x200D) return false;
   if (scale < 1) scale = 1;
-  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_16, &glyph, codepoint, next_codepoint)) {
+  if (!scaled_glyph_dsc(codepoint, next_codepoint, &glyph, &scale)) {
     if (codepoint == 0x00B7) {
       *top = 6 * scale;
       *bottom = 8 * scale;
@@ -864,7 +890,7 @@ static bool glyph_visual_bounds(
   }
   lv_font_glyph_release_draw_data(&glyph);
   if (last_ink_row < first_ink_row) return false;
-  int baseline = (pet_p4_font_cn_16.line_height - pet_p4_font_cn_16.base_line) * scale;
+  int baseline = (glyph.resolved_font->line_height - glyph.resolved_font->base_line) * scale;
   int glyph_top = baseline - glyph.box_h * scale - glyph.ofs_y * scale;
   *top = glyph_top + first_ink_row * scale;
   *bottom = glyph_top + (last_ink_row + 1) * scale - 1;
@@ -914,10 +940,16 @@ static int utf8_text_width(const char *text, int byte_limit, int scale) {
   return width;
 }
 
+static bool device_markdown_marker(uint32_t codepoint) {
+  return codepoint == '#' || codepoint == '*'
+    || codepoint == '`' || codepoint == '~' || codepoint == '|' || codepoint == '>';
+}
+
 static void draw_lvgl_glyph(uint32_t codepoint, uint32_t next_codepoint, int x, int y, uint16_t color, int scale) {
   lv_font_glyph_dsc_t glyph = {0};
-  if (codepoint == 0xFE0F || codepoint == 0x200D) return;
-  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_16, &glyph, codepoint, next_codepoint)) {
+  if (codepoint == 0xFE0F || codepoint == 0x200D || device_markdown_marker(codepoint)) return;
+  if (codepoint < 0x20) return;
+  if (!scaled_glyph_dsc(codepoint, next_codepoint, &glyph, &scale)) {
     if (scale < 1) scale = 1;
     if (codepoint == 0x00B7) {
       fill_ellipse(x + 4 * scale, y + 7 * scale, scale, scale, color);
@@ -939,7 +971,7 @@ static void draw_lvgl_glyph(uint32_t codepoint, uint32_t next_codepoint, int x, 
     lv_font_glyph_release_draw_data(&glyph);
     return;
   }
-  int baseline = y + (pet_p4_font_cn_16.line_height - pet_p4_font_cn_16.base_line) * scale;
+  int baseline = y + (glyph.resolved_font->line_height - glyph.resolved_font->base_line) * scale;
   int gx0 = x + glyph.ofs_x * scale;
   int gy0 = baseline - glyph.box_h * scale - glyph.ofs_y * scale;
   uint8_t r = (uint8_t) (((color >> 11) & 0x1F) * 255 / 31);
@@ -961,6 +993,12 @@ static void draw_lvgl_glyph(uint32_t codepoint, uint32_t next_codepoint, int x, 
 }
 
 static int medium_glyph_width(uint32_t codepoint, uint32_t next_codepoint) {
+  lv_font_glyph_dsc_t glyph = {0};
+  if (lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
+    int width = (int) glyph.adv_w;
+    lv_font_glyph_release_draw_data(&glyph);
+    return width;
+  }
   int width = glyph_width(codepoint, next_codepoint);
   return width > 0 ? (width * 3 + 1) / 2 : 0;
 }
@@ -973,7 +1011,7 @@ static bool medium_glyph_visual_bounds(
 ) {
   lv_font_glyph_dsc_t glyph = {0};
   if (codepoint == 0xFE0F || codepoint == 0x200D) return false;
-  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_16, &glyph, codepoint, next_codepoint)) {
+  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
     if (codepoint == 0x00B7) {
       *top = 8;
       *bottom = 12;
@@ -989,24 +1027,21 @@ static bool medium_glyph_visual_bounds(
   if (glyph.box_h <= 0 || glyph.box_w <= 0) return false;
   glyph.req_raw_bitmap = 1;
   const uint8_t *bitmap = (const uint8_t *) glyph.resolved_font->get_glyph_bitmap(&glyph, NULL);
-  int scaled_height = (glyph.box_h * 3 + 1) / 2;
-  int first_ink_row = scaled_height;
+  int first_ink_row = glyph.box_h;
   int last_ink_row = -1;
   if (bitmap) {
-    for (int dy = 0; dy < scaled_height; dy += 1) {
-      int source_y = dy * 2 / 3;
-      if (source_y >= glyph.box_h) source_y = glyph.box_h - 1;
+    for (int y = 0; y < glyph.box_h; y += 1) {
       for (int x = 0; x < glyph.box_w; x += 1) {
-        if (!glyph_alpha_at(bitmap, &glyph, x, source_y)) continue;
-        if (dy < first_ink_row) first_ink_row = dy;
-        if (dy > last_ink_row) last_ink_row = dy;
+        if (!glyph_alpha_at(bitmap, &glyph, x, y)) continue;
+        if (y < first_ink_row) first_ink_row = y;
+        if (y > last_ink_row) last_ink_row = y;
       }
     }
   }
   lv_font_glyph_release_draw_data(&glyph);
   if (last_ink_row < first_ink_row) return false;
-  int baseline = ((pet_p4_font_cn_16.line_height - pet_p4_font_cn_16.base_line) * 3 + 1) / 2;
-  int glyph_top = baseline - scaled_height - glyph.ofs_y * 3 / 2;
+  int baseline = glyph.resolved_font->line_height - glyph.resolved_font->base_line;
+  int glyph_top = baseline - glyph.box_h - glyph.ofs_y;
   *top = glyph_top + first_ink_row;
   *bottom = glyph_top + last_ink_row;
   return true;
@@ -1034,7 +1069,7 @@ static void text_visual_bounds_medium(const char *text, int *top, int *bottom) {
   }
   if (!found) {
     *top = 0;
-    *bottom = (pet_p4_font_cn_16.line_height * 3 + 1) / 2 - 1;
+    *bottom = pet_p4_font_cn_24.line_height - 1;
   }
 }
 
@@ -1045,7 +1080,7 @@ static int utf8_text_width_medium(const char *text) {
     const char *next_cursor = cursor;
     uint32_t codepoint = utf8_next(&next_cursor);
     int glyph_advance = medium_glyph_width(codepoint, utf8_peek(next_cursor));
-    if (glyph_advance > 0) width += glyph_advance + 1;
+    if (glyph_advance > 0) width += glyph_advance;
     cursor = next_cursor;
   }
   return width;
@@ -1059,16 +1094,17 @@ static void draw_lvgl_glyph_medium(
   uint16_t color
 ) {
   lv_font_glyph_dsc_t glyph = {0};
-  if (codepoint == 0xFE0F || codepoint == 0x200D) return;
-  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_16, &glyph, codepoint, next_codepoint)) {
+  if (codepoint == 0xFE0F || codepoint == 0x200D || device_markdown_marker(codepoint)) return;
+  if (codepoint < 0x20) return;
+  if (!lv_font_get_glyph_dsc(&pet_p4_font_cn_24, &glyph, codepoint, next_codepoint)) {
     if (codepoint == 0x00B7) {
-      fill_ellipse(x + 6, y + 10, 2, 2, color);
+      fill_ellipse(x + 9, y + 13, 2, 2, color);
     } else if (codepoint >= 0x2300) {
-      draw_line(x + 10, y + 2, x + 10, y + 18, color);
-      draw_line(x + 2, y + 10, x + 18, y + 10, color);
-      fill_ellipse(x + 10, y + 10, 4, 4, color);
+      draw_line(x + 13, y + 2, x + 13, y + 22, color);
+      draw_line(x + 2, y + 12, x + 22, y + 12, color);
+      fill_ellipse(x + 13, y + 12, 4, 4, color);
     } else {
-      draw_glyph5x7(x, y + 3, '?', color, 2);
+      draw_glyph5x7(x, y + 4, '?', color, 3);
     }
     return;
   }
@@ -1078,22 +1114,16 @@ static void draw_lvgl_glyph_medium(
     lv_font_glyph_release_draw_data(&glyph);
     return;
   }
-  int baseline = y + ((pet_p4_font_cn_16.line_height - pet_p4_font_cn_16.base_line) * 3 + 1) / 2;
-  int gx0 = x + glyph.ofs_x * 3 / 2;
-  int gy0 = baseline - (glyph.box_h * 3 + 1) / 2 - glyph.ofs_y * 3 / 2;
-  int scaled_w = (glyph.box_w * 3 + 1) / 2;
-  int scaled_h = (glyph.box_h * 3 + 1) / 2;
+  int baseline = y + glyph.resolved_font->line_height - glyph.resolved_font->base_line;
+  int gx0 = x + glyph.ofs_x;
+  int gy0 = baseline - glyph.box_h - glyph.ofs_y;
   uint8_t r = (uint8_t) (((color >> 11) & 0x1F) * 255 / 31);
   uint8_t g = (uint8_t) (((color >> 5) & 0x3F) * 255 / 63);
   uint8_t b = (uint8_t) ((color & 0x1F) * 255 / 31);
-  for (int dy = 0; dy < scaled_h; dy += 1) {
-    int source_y = dy * 2 / 3;
-    if (source_y >= glyph.box_h) source_y = glyph.box_h - 1;
-    for (int dx = 0; dx < scaled_w; dx += 1) {
-      int source_x = dx * 2 / 3;
-      if (source_x >= glyph.box_w) source_x = glyph.box_w - 1;
-      uint8_t alpha = glyph_alpha_at(bitmap, &glyph, source_x, source_y);
-      if (alpha) blend_px(gx0 + dx, gy0 + dy, r, g, b, alpha);
+  for (int gy = 0; gy < glyph.box_h; gy += 1) {
+    for (int gx = 0; gx < glyph.box_w; gx += 1) {
+      uint8_t alpha = glyph_alpha_at(bitmap, &glyph, gx, gy);
+      if (alpha) blend_px(gx0 + gx, gy0 + gy, r, g, b, alpha);
     }
   }
   lv_font_glyph_release_draw_data(&glyph);
@@ -1117,8 +1147,13 @@ static const char *draw_text_line_medium(
     const char *next_cursor = cursor;
     uint32_t codepoint = utf8_next(&next_cursor);
     uint32_t next_codepoint = utf8_peek(next_cursor);
+    if (codepoint == '\n' || codepoint == '\r') {
+      cursor = next_cursor;
+      while (*cursor == '\n' || *cursor == '\r') cursor += 1;
+      return cursor;
+    }
     int glyph_advance = medium_glyph_width(codepoint, next_codepoint);
-    int advance = glyph_advance > 0 ? glyph_advance + 1 : 0;
+    int advance = glyph_advance > 0 ? glyph_advance : 0;
     if (used_px + advance + reserve_px > max_px) break;
     draw_lvgl_glyph_medium(codepoint, next_codepoint, pen_x, y, color);
     pen_x += advance;
@@ -1133,7 +1168,7 @@ static const char *draw_text_line_medium(
       uint32_t codepoint = utf8_next(&next_cursor);
       uint32_t next_codepoint = utf8_peek(next_cursor);
       draw_lvgl_glyph_medium(codepoint, next_codepoint, pen_x, y, color);
-      pen_x += medium_glyph_width(codepoint, next_codepoint) + 1;
+      pen_x += medium_glyph_width(codepoint, next_codepoint);
       dots = next_cursor;
     }
   }
@@ -1333,13 +1368,75 @@ static void blend_round_rect(int x, int y, int w, int h, int radius, uint8_t r, 
   }
 }
 
+static bool ppa_blend_card_surface(
+  int x, int y, int w, int h, int radius,
+  uint8_t r, uint8_t g, uint8_t b, uint8_t alpha
+) {
+  if (!g_ppa_blend_client || !g_framebuffer || !g_framebuffer_ppa_compatible
+      || x < 0 || y < 0 || w <= 0 || h <= 0
+      || x + w > PET_P4_UI_WIDTH || y + h > PET_P4_UI_HEIGHT) return false;
+  const size_t needed = (size_t) w * (size_t) h;
+  if (!g_ppa_card_mask || g_ppa_card_mask_capacity < needed) {
+    if (g_ppa_card_mask) heap_caps_free(g_ppa_card_mask);
+    g_ppa_card_mask = (uint8_t *) heap_caps_aligned_alloc(64, needed,
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    g_ppa_card_mask_capacity = g_ppa_card_mask ? needed : 0;
+    if (!g_ppa_card_mask) return false;
+    g_ppa_card_mask_w = 0;
+  }
+  if (g_ppa_card_mask_w != w || g_ppa_card_mask_h != h
+      || g_ppa_card_mask_radius != radius || g_ppa_card_mask_alpha != alpha) {
+    memset(g_ppa_card_mask, 0, needed);
+    for (int yy = 0; yy < h; yy += 1) {
+      for (int xx = 0; xx < w; xx += 1) {
+        int cx = xx < radius ? radius : (xx >= w - radius ? w - radius - 1 : xx);
+        int cy = yy < radius ? radius : (yy >= h - radius ? h - radius - 1 : yy);
+        int dx = xx - cx, dy = yy - cy;
+        if (dx * dx + dy * dy <= radius * radius)
+          g_ppa_card_mask[(size_t) yy * w + xx] = alpha;
+      }
+    }
+    g_ppa_card_mask_w = w; g_ppa_card_mask_h = h;
+    g_ppa_card_mask_radius = radius; g_ppa_card_mask_alpha = alpha;
+  }
+  ppa_blend_oper_config_t cfg = {0};
+  cfg.in_bg.buffer = g_framebuffer;
+  cfg.in_bg.pic_w = PET_P4_UI_WIDTH;
+  cfg.in_bg.pic_h = PET_P4_UI_HEIGHT;
+  cfg.in_bg.block_w = w; cfg.in_bg.block_h = h;
+  cfg.in_bg.block_offset_x = x; cfg.in_bg.block_offset_y = y;
+  cfg.in_bg.blend_cm = PPA_SRM_COLOR_MODE_RGB565;
+  cfg.in_fg.buffer = g_ppa_card_mask;
+  cfg.in_fg.pic_w = w; cfg.in_fg.pic_h = h;
+  cfg.in_fg.block_w = w; cfg.in_fg.block_h = h;
+  cfg.in_fg.block_offset_x = 0; cfg.in_fg.block_offset_y = 0;
+  cfg.in_fg.blend_cm = PPA_BLEND_COLOR_MODE_A8;
+  cfg.out.buffer = g_framebuffer;
+  cfg.out.buffer_size = (uint32_t) PET_P4_UI_WIDTH * PET_P4_UI_HEIGHT * 2;
+  cfg.out.pic_w = PET_P4_UI_WIDTH;
+  cfg.out.pic_h = PET_P4_UI_HEIGHT;
+  cfg.out.block_offset_x = x; cfg.out.block_offset_y = y;
+  cfg.out.blend_cm = PPA_SRM_COLOR_MODE_RGB565;
+  cfg.bg_alpha_update_mode = PPA_ALPHA_NO_CHANGE;
+  cfg.fg_alpha_update_mode = PPA_ALPHA_NO_CHANGE;
+  cfg.fg_fix_rgb_val.r = r; cfg.fg_fix_rgb_val.g = g; cfg.fg_fix_rgb_val.b = b;
+  cfg.mode = PPA_TRANS_MODE_BLOCKING;
+  return ppa_do_blend(g_ppa_blend_client, &cfg) == ESP_OK;
+}
+
 static void draw_home_white_panel(int x, int y, int w, int h, int radius, uint16_t outline) {
-  // The panel is opaque, so a preblended solid shadow gives the same visible
-  // edge without read/modify/write alpha blending tens of thousands of PSRAM
-  // pixels every frame.
-  fill_round_rect(x + 2, y + 4, w, h, radius, rgb565(55, 58, 57));
-  fill_round_rect(x, y, w, h, radius, outline);
-  fill_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, rgb565(255, 255, 255));
+  if (g_bubble_opacity_percent >= 100) {
+    fill_round_rect(x + 2, y + 4, w, h, radius, rgb565(55, 58, 57));
+    fill_round_rect(x, y, w, h, radius, outline);
+    fill_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, rgb565(255, 255, 255));
+    return;
+  }
+  const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
+  if (ppa_blend_card_surface(x + 2, y + 2, w - 4, h - 4, radius - 2, 255, 255, 255, alpha))
+    return;
+  blend_round_rect(x + 2, y + 4, w, h, radius, 55, 58, 57, alpha);
+  blend_round_rect(x, y, w, h, radius, 216, 221, 218, alpha);
+  blend_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, 255, 255, 255, alpha);
 }
 
 static void draw_session_card_panel(
@@ -1358,10 +1455,26 @@ static void draw_session_card_panel(
 
   uint16_t selection = rgb565(25, 151, 99);
   uint16_t selected_surface = rgb565(237, 249, 242);
-  fill_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, rgb565(173, 220, 193));
-  fill_round_rect(x + 2, y + 5, w, h, radius, rgb565(46, 50, 48));
-  fill_round_rect(x, y, w, h, radius, selection);
-  fill_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, selected_surface);
+  if (g_bubble_opacity_percent >= 100) {
+    fill_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, rgb565(173, 220, 193));
+    fill_round_rect(x + 2, y + 5, w, h, radius, rgb565(46, 50, 48));
+    fill_round_rect(x, y, w, h, radius, selection);
+    fill_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, selected_surface);
+    return;
+  }
+  const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
+  if (ppa_blend_card_surface(x + 4, y + 4, w - 8, h - 8, radius - 4, 237, 249, 242, alpha)) {
+    /* Draw the selection outline as opaque strokes; the large surface is PPA. */
+    fill_round_rect(x - 2, y - 2, w + 4, 2, 1, selection);
+    fill_round_rect(x - 2, y + h, w + 4, 2, 1, selection);
+    fill_round_rect(x - 2, y - 2, 2, h + 4, 1, selection);
+    fill_round_rect(x + w, y - 2, 2, h + 4, 1, selection);
+    return;
+  }
+  blend_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, 173, 220, 193, alpha);
+  blend_round_rect(x + 2, y + 5, w, h, radius, 46, 50, 48, alpha);
+  blend_round_rect(x, y, w, h, radius, 25, 151, 99, alpha);
+  blend_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, 237, 249, 242, alpha);
 }
 
 static void draw_card_body_lines(
@@ -1369,8 +1482,11 @@ static void draw_card_body_lines(
   int x,
   int first_line_y,
   int max_px,
-  uint16_t color
+  uint16_t color,
+  bool host_pixels
 ) {
+  if (host_pixels && pet_bubble_pixels_draw(PET_BUBBLE_BODY_CLIPPED, body, 0, g_framebuffer,
+      x, first_line_y, max_px, color)) return;
   const char *second_line = draw_text_line_medium_vcenter(
     body,
     x,
@@ -1420,6 +1536,11 @@ static void draw_status_marker(pet_p4_view_status_t status, unsigned long long n
     draw_line(cx + 6, cy - 6, cx - 6, cy + 6, white);
     return;
   }
+  if (status == PET_P4_VIEW_STATUS_STOPPED) {
+    fill_ellipse(cx, cy, 15, 15, gray);
+    fill_rect(cx - 5, cy - 5, 10, 10, white);
+    return;
+  }
   if (status == PET_P4_VIEW_STATUS_WAITING) {
     fill_ellipse(cx, cy, 15, 15, amber);
     fill_ellipse(cx - 6, cy, 2, 2, white);
@@ -1439,6 +1560,7 @@ static void draw_status_marker(pet_p4_view_status_t status, unsigned long long n
 static uint16_t view_status_color(pet_p4_view_status_t status) {
   if (status == PET_P4_VIEW_STATUS_DONE) return rgb565(85, 193, 133);
   if (status == PET_P4_VIEW_STATUS_ERROR) return rgb565(235, 89, 82);
+  if (status == PET_P4_VIEW_STATUS_STOPPED) return rgb565(120, 126, 132);
   if (status == PET_P4_VIEW_STATUS_WAITING) return rgb565(255, 163, 31);
   if (status == PET_P4_VIEW_STATUS_WORKING) return rgb565(96, 196, 255);
   return rgb565(170, 176, 173);
@@ -2366,18 +2488,56 @@ static bool render_asset_pet_frame(const pet_p4_runtime_state_t *state, const pe
   return true;
 }
 
-static void draw_bubble(const pet_p4_view_model_t *view, unsigned long long now_ms) {
+/* The 32 px face is intentionally a small fixed-label subset. Dynamic Chinese
+ * titles are not guaranteed to be present; in that case use the native 24 px
+ * face rather than scaling a 16 px glyph two times, which looks visibly muddy. */
+static bool font_covers_text(const lv_font_t *font, const char *text) {
+  if (!font || !text) return false;
+  const char *cursor = text;
+  while (*cursor) {
+    const char *next = cursor;
+    uint32_t cp = utf8_next(&next);
+    if (cp == 0xFE0F || cp == 0x200D) { cursor = next; continue; }
+    lv_font_glyph_dsc_t glyph = {0};
+    if (!lv_font_get_glyph_dsc(font, &glyph, cp, utf8_peek(next))) return false;
+    lv_font_glyph_release_draw_data(&glyph);
+    cursor = next;
+  }
+  return true;
+}
+
+static void draw_session_card_title(const char *title, int x, int y, int box_h,
+    int max_px, uint16_t color) {
+  if (font_covers_text(&pet_p4_font_cn_32, title)) {
+    draw_text_line_vcenter(title, x, y, box_h, max_px, color, 2, true);
+  } else {
+    draw_text_line_medium_vcenter(title, x, y, box_h, max_px, color, true);
+  }
+}
+
+static void draw_bubble(const pet_p4_runtime_state_t *state,
+    const pet_p4_view_model_t *view, unsigned long long now_ms) {
   if (view && !view->show_bubble) return;
   bool compact = view ? view->compact_bubble : true;
+  pet_bubble_text_view_t text = {0};
+  char owner[160];
+  snprintf(owner, sizeof(owner), "%s:%s", view && view->realtime_conversation ? "conversation" : "bubble",
+    state ? (view && view->realtime_conversation ? state->conversation_id : state->current_session_id) : "");
+  const char *requested_title = view && view->title ? view->title : "";
+  const char *requested_body = view && view->body ? view->body : "";
+  pet_bubble_pixels_select(owner, compact ? PET_BUBBLE_COMPACT
+      : view && view->realtime_conversation ? PET_BUBBLE_BODY : PET_BUBBLE_BODY_CLIPPED,
+    compact ? "" : requested_title, compact && !requested_body[0] ? requested_title : requested_body,
+    now_ms, &text);
   if (!compact) {
     int x = PET_P4_SESSION_CARD_X;
     int y = PET_P4_SESSION_CARD_BOTTOM - PET_P4_SESSION_CARD_HEIGHT;
     int w = PET_P4_SESSION_CARD_WIDTH;
     int h = PET_P4_SESSION_CARD_HEIGHT;
-    const char *title = view && view->title ? view->title : "";
-    const char *body = view && view->body ? view->body : "";
+    const char *title = text.title;
+    const char *body = text.body;
     uint16_t ink = rgb565(28, 31, 31);
-    uint16_t muted = rgb565(92, 98, 96);
+    uint16_t muted = rgb565(55, 61, 59);
     bool realtime = view && view->realtime_conversation;
     uint16_t selection = realtime ? rgb565(42, 119, 225) : rgb565(25, 151, 99);
     pet_p4_view_status_t status = view ? view->status : PET_P4_VIEW_STATUS_IDLE;
@@ -2390,34 +2550,43 @@ static void draw_bubble(const pet_p4_view_model_t *view, unsigned long long now_
       fill_round_rect(x + 4, y + 4, w - 8, h - 8, PET_P4_SESSION_CARD_RADIUS - 4, rgb565(237, 249, 242));
     }
     fill_round_rect(x + 10, y + 14, 7, h - 28, 2, selection);
-    draw_text_line_vcenter(title, x + 30, y + 10, 38, w - 82, ink, 2, true);
+    if (!(text.pixels && pet_bubble_pixels_draw(PET_BUBBLE_TITLE, title, 0, g_framebuffer,
+        x + 30, y + 10, w - 82, ink)))
+      draw_session_card_title(title, x + 30, y + 10, 38, w - 82, ink);
     if (body[0]) {
       if (realtime) {
-        // Roll through pairs of wrapped lines without allocating or cutting UTF-8.
-        const char *pages[32];
-        unsigned int count = 0;
-        const char *cursor = body;
-        while (*cursor && count < 32) {
-          pages[count++] = cursor;
-          for (int line = 0; line < 2 && *cursor; line++) {
-            int width = 0;
-            const char *start = cursor;
-            while (*cursor) {
-              const char *next = cursor;
-              uint32_t cp = utf8_next(&next);
-              int advance = medium_glyph_width(cp, utf8_peek(next));
-              advance = advance > 0 ? advance + 1 : 0;
-              if (width + advance > w - 60) break;
-              width += advance;
-              cursor = next;
+        unsigned host_pages = text.pixels ? pet_bubble_pixels_pages(PET_BUBBLE_BODY, body) : 0;
+        uint64_t caption_since = text.since_ms > view->caption_since_ms ? text.since_ms : view->caption_since_ms;
+        unsigned long long host_elapsed = now_ms >= caption_since ? now_ms - caption_since : 0;
+        bool host_drawn = host_pages && pet_bubble_pixels_draw(PET_BUBBLE_BODY, body,
+          (unsigned)((host_elapsed / 2800ULL) % host_pages), g_framebuffer, x + 30, y + 50, w - 60, muted);
+        if (!host_drawn) {
+          // Roll through pairs of wrapped lines without allocating or cutting UTF-8.
+          const char *pages[32];
+          unsigned int count = 0;
+          const char *cursor = body;
+          while (*cursor && count < 32) {
+            pages[count++] = cursor;
+            for (int line = 0; line < 2 && *cursor; line++) {
+              int width = 0;
+              const char *start = cursor;
+              while (*cursor) {
+                const char *next = cursor;
+                uint32_t cp = utf8_next(&next);
+                int advance = medium_glyph_width(cp, utf8_peek(next));
+                advance = advance > 0 ? advance + 1 : 0;
+                if (width + advance > w - 60) break;
+                width += advance;
+                cursor = next;
+              }
+              if (cursor == start) { utf8_next(&cursor); }
             }
-            if (cursor == start) { utf8_next(&cursor); }
           }
+          unsigned long long elapsed = now_ms >= view->caption_since_ms ? now_ms - view->caption_since_ms : 0;
+          unsigned int page = count > 0 ? (unsigned int) ((elapsed / 2800ULL) % count) : 0;
+          draw_card_body_lines(count ? pages[page] : body, x + 30, y + 50, w - 60, muted, false);
         }
-        unsigned long long elapsed = now_ms >= view->caption_since_ms ? now_ms - view->caption_since_ms : 0;
-        unsigned int page = count > 0 ? (unsigned int) ((elapsed / 2800ULL) % count) : 0;
-        draw_card_body_lines(count ? pages[page] : body, x + 30, y + 50, w - 60, muted);
-      } else draw_card_body_lines(body, x + 30, y + 50, w - 60, muted);
+      } else draw_card_body_lines(body, x + 30, y + 50, w - 60, muted, text.pixels);
     }
     if (realtime) draw_text_line_vcenter(view->conversation_history ? "回看" : "对话", x + w - 78, y + 14, 30, 64, selection, 1, true);
     else draw_status_marker(status, now_ms, x + w - 26, y + 26);
@@ -2432,14 +2601,15 @@ static void draw_bubble(const pet_p4_view_model_t *view, unsigned long long now_
   uint16_t ink = rgb565(28, 31, 31);
   uint16_t outline = rgb565(216, 221, 218);
   uint16_t accent = view_status_color(view ? view->status : PET_P4_VIEW_STATUS_IDLE);
-  const char *body = view && view->body && view->body[0] ? view->body : (view ? view->title : "");
+  const char *body = text.body;
   w = 72 + utf8_text_width(body, -1, 2);
   if (w < 160) w = 160;
   if (w > 420) w = 420;
   if (w & 1) w += 1;
   draw_home_white_panel(x, y, w, h, 16, outline);
   fill_round_rect(x + 10, y + 14, 4, h - 28, 2, accent);
-  draw_text_line(
+  if (!(text.pixels && pet_bubble_pixels_draw(PET_BUBBLE_COMPACT, body, 0, g_framebuffer,
+      text_x, y + (h - 38) / 2 + PET_P4_COMPACT_TEXT_OPTICAL_Y, w - 72, ink))) draw_text_line(
     body,
     text_x,
     text_y_in_box(body, 2, y, h) + PET_P4_COMPACT_TEXT_OPTICAL_Y,
@@ -2830,18 +3000,22 @@ static uint16_t miniapp_state_color(const char *state) {
 static uint16_t session_status_color(const char *status) {
   if (status && strcmp(status, "done") == 0) return view_status_color(PET_P4_VIEW_STATUS_DONE);
   if (status && strcmp(status, "error") == 0) return view_status_color(PET_P4_VIEW_STATUS_ERROR);
+  if (status && strcmp(status, "stopped") == 0) return view_status_color(PET_P4_VIEW_STATUS_STOPPED);
   if (status && strcmp(status, "waiting_user") == 0) return view_status_color(PET_P4_VIEW_STATUS_WAITING);
-  if (status && strcmp(status, "speaking") == 0) return view_status_color(PET_P4_VIEW_STATUS_WORKING);
-  if (status && strcmp(status, "working") == 0) return view_status_color(PET_P4_VIEW_STATUS_WORKING);
+  if (status && (strcmp(status, "speaking") == 0 || strcmp(status, "working") == 0
+      || strcmp(status, "thinking") == 0 || strcmp(status, "tool_running") == 0
+      || strcmp(status, "active") == 0)) return view_status_color(PET_P4_VIEW_STATUS_WORKING);
   return view_status_color(PET_P4_VIEW_STATUS_IDLE);
 }
 
 static pet_p4_view_status_t session_view_status(const char *status) {
   if (status && strcmp(status, "done") == 0) return PET_P4_VIEW_STATUS_DONE;
   if (status && strcmp(status, "error") == 0) return PET_P4_VIEW_STATUS_ERROR;
+  if (status && strcmp(status, "stopped") == 0) return PET_P4_VIEW_STATUS_STOPPED;
   if (status && strcmp(status, "waiting_user") == 0) return PET_P4_VIEW_STATUS_WAITING;
-  if (status && strcmp(status, "speaking") == 0) return PET_P4_VIEW_STATUS_WORKING;
-  if (status && strcmp(status, "working") == 0) return PET_P4_VIEW_STATUS_WORKING;
+  if (status && (strcmp(status, "speaking") == 0 || strcmp(status, "working") == 0
+      || strcmp(status, "thinking") == 0 || strcmp(status, "tool_running") == 0
+      || strcmp(status, "active") == 0)) return PET_P4_VIEW_STATUS_WORKING;
   return PET_P4_VIEW_STATUS_IDLE;
 }
 
@@ -2881,6 +3055,14 @@ static void draw_standalone_voice_overlay(void) {
   draw_voice_input_row(x, y + 18);
 }
 
+static void session_text(const pet_p4_session_queue_item_t *item, uint64_t now_ms,
+    pet_bubble_text_view_t *out) {
+  char owner[160];
+  snprintf(owner, sizeof(owner), "session:%s", item->id);
+  pet_bubble_pixels_select(owner, PET_BUBBLE_BODY_CLIPPED, item->title,
+    item->content[0] ? item->content : item->state, now_ms, out);
+}
+
 static void draw_session_queue_uncached(
   const pet_p4_runtime_state_t *state,
   unsigned long long now_ms,
@@ -2889,7 +3071,7 @@ static void draw_session_queue_uncached(
   if (!state || state->session_queue_count == 0) return;
 
   uint16_t ink = rgb565(28, 31, 31);
-  uint16_t muted = rgb565(92, 98, 96);
+  uint16_t muted = rgb565(55, 61, 59);
   uint16_t card_outline = rgb565(216, 221, 218);
   uint16_t selection = rgb565(25, 151, 99);
   unsigned int selected = state->current_session_index > 0
@@ -2908,6 +3090,8 @@ static void draw_session_queue_uncached(
   for (unsigned int row = 0; row < visible; row += 1) {
     unsigned int item_index = start + row;
     const pet_p4_session_queue_item_t *item = &state->session_queue[item_index];
+    pet_bubble_text_view_t text = {0};
+    session_text(item, now_ms, &text);
     bool is_selected = item_index == selected;
     int x = PET_P4_SESSION_CARD_X;
     int y = first_y + (int) row * (PET_P4_SESSION_CARD_HEIGHT + PET_P4_SESSION_CARD_GAP);
@@ -2928,13 +3112,14 @@ static void draw_session_queue_uncached(
     if (draw_working_markers || marker_status != PET_P4_VIEW_STATUS_WORKING) {
       draw_status_marker(marker_status, now_ms, x + w - 26, y + 26);
     }
-    draw_text_line_vcenter(item->title, x + 30, y + 10, 38, w - 82, ink, 2, true);
+    if (!(text.pixels && pet_bubble_pixels_draw(PET_BUBBLE_TITLE, text.title, 0, g_framebuffer,
+        x + 30, y + 10, w - 82, ink)))
+      draw_session_card_title(text.title, x + 30, y + 10, 38, w - 82, ink);
 
     if (is_selected && state->session_voice_active) {
       draw_voice_input_row(x, y + 62);
     } else {
-      const char *body = item->content[0] ? item->content : item->state;
-      draw_card_body_lines(body, x + 30, y + 50, w - 60, muted);
+      draw_card_body_lines(text.body, x + 30, y + 50, w - 60, muted, text.pixels);
     }
   }
 }
@@ -2955,6 +3140,8 @@ static uint64_t session_cache_hash_text(uint64_t hash, const char *text) {
 
 static uint64_t session_overlay_signature(const pet_p4_runtime_state_t *state) {
   uint64_t hash = 1469598103934665603ULL;
+  uint32_t text_revision = pet_bubble_pixels_revision();
+  hash = session_cache_hash_bytes(hash, &text_revision, sizeof(text_revision));
   hash = session_cache_hash_bytes(hash, &state->session_queue_count, sizeof(state->session_queue_count));
   hash = session_cache_hash_bytes(hash, &state->current_session_index, sizeof(state->current_session_index));
   hash = session_cache_hash_bytes(hash, &state->session_voice_active, sizeof(state->session_voice_active));
@@ -3074,18 +3261,16 @@ static void draw_session_queue(
   const pet_p4_runtime_state_t *state,
   unsigned long long now_ms
 ) {
+  g_bubble_opacity_percent = state && state->bubble_opacity
+    ? state->bubble_opacity : 100;
   if (!state || state->session_queue_count == 0) {
     g_session_overlay_cache_valid = false;
     return;
   }
-  uint64_t signature = session_overlay_signature(state);
-  if ((!g_session_overlay_cache_valid || signature != g_session_overlay_signature)
-      && !rebuild_session_overlay_cache(state, now_ms, signature)) {
-    draw_session_queue_uncached(state, now_ms, true);
-    return;
-  }
-  copy_session_overlay_cache();
-  draw_session_queue_working_markers(state, now_ms);
+  /* Direct-draw experiment: bypass the cached overlay while validating the
+   * zero-to-one session transition that intermittently fails to appear. */
+  g_session_overlay_cache_valid = false;
+  draw_session_queue_uncached(state, now_ms, true);
 }
 
 typedef struct {
@@ -5171,6 +5356,14 @@ esp_err_t pet_p4_renderer_init(void) {
         .data_burst_length = PPA_DATA_BURST_LENGTH_128,
       };
       esp_err_t ppa_err = ppa_register_client(&ppa_config, &g_ppa_srm_client);
+      ppa_client_config_t blend_config = {
+        .oper_type = PPA_OPERATION_BLEND,
+        .max_pending_trans_num = 1,
+        .data_burst_length = PPA_DATA_BURST_LENGTH_128,
+      };
+      if (ppa_err == ESP_OK && ppa_register_client(&blend_config, &g_ppa_blend_client) != ESP_OK) {
+        g_ppa_blend_client = NULL;
+      }
       if (ppa_err != ESP_OK) {
         g_ppa_srm_client = NULL;
         ESP_LOGW(
@@ -5206,6 +5399,98 @@ esp_err_t pet_p4_renderer_init(void) {
   return ESP_OK;
 }
 
+static void draw_approval_button(
+  int x,
+  int y,
+  int w,
+  int h,
+  const char *label,
+  uint16_t fill,
+  uint16_t outline,
+  uint16_t ink
+) {
+  fill_round_rect_outline(x, y, w, h, 12, fill, outline);
+  draw_text_center(label, x + w / 2, text_y_in_box(label, 2, y, h), w - 24, ink, 2);
+}
+
+/* R5 DSH approval: a modal dark card over the current page. It never mutates
+ * normal page rendering; it is the last paint before rotation so it covers the
+ * home page, component center and mini-app frames identically. */
+static void draw_approval_overlay(
+  const pet_p4_runtime_state_t *state,
+  unsigned long long now_ms
+) {
+  const uint16_t card = rgb565(18, 22, 26);
+  const uint16_t shadow = rgb565(2, 3, 4);
+  const uint16_t outline = rgb565(255, 176, 32);
+  const uint16_t divider = rgb565(58, 64, 70);
+  const uint16_t ivory = rgb565(250, 241, 204);
+  const uint16_t ink = rgb565(235, 238, 240);
+  const uint16_t muted = rgb565(132, 140, 146);
+  const uint16_t reason_panel = rgb565(11, 14, 17);
+  const uint16_t reason_ink = rgb565(200, 208, 214);
+  const int card_x = PET_P4_APPROVAL_CARD_X;
+  const int card_y = PET_P4_APPROVAL_CARD_Y;
+  const int content_x = card_x + 28;
+  const int content_w = PET_P4_APPROVAL_CARD_WIDTH - 56;
+  const int button_w = (content_w - 16) / 2;
+  const int button_h = 46;
+  char countdown[24];
+  unsigned long long remaining_ms;
+  unsigned int seconds;
+
+  if (!state || !pet_p4_state_approval_pending(state, now_ms)) return;
+  blend_rect(0, 0, PET_P4_UI_WIDTH, PET_P4_UI_HEIGHT, 0, 0, 0, 168);
+  fill_round_rect(card_x + 4, card_y + 6,
+                  PET_P4_APPROVAL_CARD_WIDTH, PET_P4_APPROVAL_CARD_HEIGHT,
+                  PET_P4_APPROVAL_CARD_RADIUS, shadow);
+  fill_round_rect_outline(card_x, card_y,
+                          PET_P4_APPROVAL_CARD_WIDTH, PET_P4_APPROVAL_CARD_HEIGHT,
+                          PET_P4_APPROVAL_CARD_RADIUS, card, outline);
+  draw_text_line("需要授权", content_x, card_y + 28, 220, ivory, 2, false);
+  if (state->approval_expires_ms == 0) {
+    /* A zero deadline is the explicit never-expire mode; do not render 0 s. */
+    draw_text_right("不超时", card_x + PET_P4_APPROVAL_CARD_WIDTH - 26,
+                    card_y + 30, 210, outline, 2);
+  } else {
+    remaining_ms = state->approval_expires_ms > now_ms
+      ? state->approval_expires_ms - now_ms
+      : 0;
+    if (remaining_ms > 999000ULL) remaining_ms = 999000ULL;
+    seconds = (unsigned int) ((remaining_ms + 999ULL) / 1000ULL);
+    snprintf(countdown, sizeof(countdown), "剩余 %u 秒", seconds);
+    draw_text_right(countdown, card_x + PET_P4_APPROVAL_CARD_WIDTH - 26,
+                    card_y + 30, 210, outline, 2);
+  }
+  fill_rect(content_x, card_y + 82, content_w, 1, divider);
+  draw_text_line_vcenter("来源", content_x, card_y + 92, 40, 64, muted, 1, false);
+  draw_text_line_vcenter(
+    state->approval_agent[0] ? state->approval_agent : "未知 Agent",
+    content_x + 72, card_y + 92, 40, content_w - 72, ink, 2, true
+  );
+  draw_text_line_vcenter("工具", content_x, card_y + 132, 40, 64, muted, 1, false);
+  draw_text_line_vcenter(
+    state->approval_tool[0] ? state->approval_tool : "未知工具",
+    content_x + 72, card_y + 132, 40, content_w - 72, ink, 2, true
+  );
+  fill_round_rect(content_x, card_y + 180, content_w, 94, 12, reason_panel);
+  draw_text_line("理由", content_x + 16, card_y + 188, 56, muted, 1, false);
+  draw_card_body_lines(
+    state->approval_reason[0] ? state->approval_reason : "无说明",
+    content_x + 16,
+    card_y + 206,
+    content_w - 32,
+    reason_ink,
+    false
+  );
+  draw_approval_button(content_x, card_y + 290, button_w, button_h, "允许",
+                       rgb565(18, 54, 38), rgb565(64, 196, 128),
+                       rgb565(122, 236, 172));
+  draw_approval_button(content_x + button_w + 16, card_y + 290, button_w, button_h,
+                       "拒绝", rgb565(54, 22, 22), rgb565(236, 96, 88),
+                       rgb565(255, 150, 140));
+}
+
 esp_err_t pet_p4_renderer_render(
   const pet_p4_runtime_state_t *state,
   const pet_p4_view_model_t *view,
@@ -5238,6 +5523,15 @@ esp_err_t pet_p4_renderer_render(
     g_session_overlay_cache_valid = false;
     g_last_realtime_conversation = realtime_mode;
   }
+  const bool approval_visible = state && pet_p4_state_approval_pending(state, now_ms);
+  if (approval_visible != g_last_approval_visible) {
+    // The modal dims arbitrary pixels; repaint the page beneath from black so
+    // entering/leaving it cannot leave a ghost card on pages (for example a
+    // missing appearance frame) that only repaint their own controls.
+    fill_rect(0, 0, PET_P4_UI_WIDTH, PET_P4_UI_HEIGHT, rgb565(0, 0, 0));
+    g_session_overlay_cache_valid = false;
+    g_last_approval_visible = approval_visible;
+  }
   if (strcmp(page, "components") == 0) {
     render_component_center_page();
   } else if (strcmp(page, "touch_test") == 0 && state) {
@@ -5261,7 +5555,7 @@ esp_err_t pet_p4_renderer_render(
       }
     }
     if (view && view->show_voice_overlay) draw_standalone_voice_overlay();
-    else if (!show_session_queue) draw_bubble(view, now_ms);
+    else if (!show_session_queue) draw_bubble(state, view, now_ms);
     if (!realtime) draw_session_queue(state, now_ms);
     else g_session_overlay_cache_valid = false;
   }
@@ -5277,6 +5571,7 @@ esp_err_t pet_p4_renderer_render(
   if (!dedicated_page) draw_connection_banner(state, now_ms);
   snprintf(g_last_render_page, sizeof(g_last_render_page), "%s", page);
   if (!dedicated_page) draw_boot_diagnostic(now_ms);
+  draw_approval_overlay(state, now_ms);
   int64_t rotate_started_us = esp_timer_get_time();
   uint32_t overlay_us = elapsed_us_clamped(overlay_started_us, rotate_started_us);
   ESP_RETURN_ON_ERROR(rotate_landscape_to_panel(), TAG, "rotate logical framebuffer");

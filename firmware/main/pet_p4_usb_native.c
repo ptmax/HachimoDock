@@ -666,14 +666,14 @@ esp_err_t pet_p4_native_usb_init(
         "pet_p4_usb_exec",
         8192,
         NULL,
-        9,
+        19,
         NULL
       ) != pdPASS) {
     vQueueDelete(g_rx_queue);
     g_rx_queue = NULL;
     return ESP_ERR_NO_MEM;
   }
-  if (xTaskCreate(tusb_device_task, "pet_p4_tusb", 4096, NULL, 8, NULL) != pdPASS) {
+  if (xTaskCreate(tusb_device_task, "pet_p4_tusb", 8192, NULL, 20, NULL) != pdPASS) {
     return ESP_ERR_NO_MEM;
   }
   g_started = true;
