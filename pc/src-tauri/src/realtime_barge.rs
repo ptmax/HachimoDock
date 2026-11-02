@@ -15,8 +15,8 @@ fn bigrams(text: &str) -> HashSet<(char, char)> {
 fn echo_like(text: &str, reply: &str) -> bool {
     let text = normalized(text);
     let reply = normalized(reply);
-    if text.chars().count() < 3 || reply.chars().count() < 3 { return false; }
     if reply.contains(&text) { return true; }
+    if text.chars().count() < 3 || reply.chars().count() < 3 { return false; }
     let a = bigrams(&text);
     let b = bigrams(&reply);
     if a.is_empty() || b.is_empty() { return false; }
@@ -26,7 +26,7 @@ fn echo_like(text: &str, reply: &str) -> bool {
 
 
 fn explicit_barge_command(text: &str) -> bool {
-    matches!(text, "停" | "停止" | "换歌" | "下一首" | "取消")
+    matches!(text, "停" | "停止" | "等一下" | "等等" | "先别" | "暂停" | "换歌" | "下一首" | "取消")
 }
 
 pub fn normalized(text: &str) -> String {
@@ -54,7 +54,7 @@ impl Confirmation {
             // Short ASR fragments during playback are frequently noise or echo.
             // Keep explicit transport commands immediate, but require a real
             // phrase before interrupting a spoken reply.
-            if !explicit_barge_command(&text) && text.chars().count() < 6 { return false; }
+            if !explicit_barge_command(&text) && text.chars().count() < 2 { return false; }
         }
         if self.previous.is_empty() || !text.starts_with(&self.previous) {
             self.first_ms = Some(ms); self.revisions = 1;
@@ -118,7 +118,9 @@ mod tests {
         assert!(c.accept("换歌",true,None,Duration::from_millis(900),12,"speaking","你好，现在正在检查双向实时对话",""));
         let mut c=Confirmation::default();
         assert!(!c.accept("检查双向实时",true,None,Duration::from_millis(1200),60,"speaking","现在正在检查双向实时对话",""));
-        assert!(!c.accept("测试一下",true,None,Duration::from_millis(1800),120,"speaking","现在正在检查双向实时对话",""));
+        assert!(!c.accept("测",true,None,Duration::from_millis(1800),120,"speaking","",""));
+        let mut c=Confirmation::default();
+        assert!(c.accept("等一下",true,None,Duration::from_millis(700),20,"speaking","现在正在检查双向实时对话",""));
         assert!(c.accept("请帮我换一首歌",true,None,Duration::from_millis(1800),20,"speaking","现在正在检查双向实时对话",""));
         assert!(c.accept("停",true,None,Duration::from_millis(200),8,"speaking","你可以说停来结束",""));
         assert!(c.accept("你好",true,None,Duration::from_millis(900),12,"thinking","你好",""));
