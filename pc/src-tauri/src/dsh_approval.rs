@@ -291,7 +291,7 @@ fn run_event_stream(usb: UsbSerialManager, base_url: String) -> Result<(), Strin
         .build()
         .map_err(|error| format!("DSH SSE client failed: {error}"))?;
     let response = client
-        .get(format!("{base_url}/events"))
+        .get(format!("{base_url}/events?role=device"))
         .send()
         .map_err(|error| format!("DSH SSE connect failed: {error}"))?;
     if !response.status().is_success() {
