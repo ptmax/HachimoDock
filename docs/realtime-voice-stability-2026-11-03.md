@@ -145,22 +145,40 @@ playback_flushed
 
 ---
 
-## 5. 审批卡片不显示（待办）
+## 5. 审批卡片不显示（已解决）
 
-### 现状
+### 根因
 
-- Host `pendingApprovals=0` 时 P4 不显示卡片是正常的；
-- 当前会话的 approval prompts 实际被自动放行/关闭，无法产生 pending；
-- 子代理不能升级权限，也不能触发交互审批；
-- 需要在新会话/真正询问模式下产生 pending，再抓：
-  - Host approval SSE；
-  - App `dsh_approval` `/events`；
-  - USB `approval/request`；
-  - P4 approval state/renderer。
+1. App 的 `dsh_approval` 连接 `/events` 时没有声明设备角色；
+2. 更关键的是插件 `ctx.on('approval/request', ...)` 注册在 DSH 原生审批 answerer 之后，
+   原生弹窗抢先处理，P4 根本收不到 `approval`。
 
-### 未完成
+### 修复
 
-- 尚未证明是 P4 renderer、App relay 还是 Host policy 的问题。
+- App `/events` 连接加 `role=device`；
+- 插件 approval listener 使用 prepend/true，注册到原生 UI 之前；
+- 保持 `mirrorNative`：P4 和 DSH 原生弹窗同时存在。
+
+### 验证
+
+重启 DSH 后：
+
+```text
+pendingApprovals: 1
+approval-asked
+approval                  ← 插件终于下发设备请求
+```
+
+实测：
+
+- P4 先允许 → 插件 `approval-resolved allowed-once`，DSH 原生关闭；
+- DSH 先拒绝 → 插件 `approval-cancel rejected`，P4 卡片清除；
+- P4 屏幕实际显示了权限卡片。
+
+### 教训
+
+- “客户端没弹窗”不一定是 P4 renderer；要同时看 Host audit、插件 answerer 顺序和 `/events`。
+- DSH 原生审批和 P4 审批可以双端共存，但 bridge 必须是第一个 answerer。
 
 ---
 
@@ -203,8 +221,9 @@ fix/dsh-full-duplex-aec     10b9579  LPRAM + AEC 单实例
 fix/p4-usb-scheduling       af6a4d0  CDC/native USB 任务优先级
 fix/macos-app-nap           c0cfd6d  App Nap 防护
 fix/realtime-tts-epoch      a7c34bc  TTS epoch
-fix/realtime-barge-echo     12669d5  barge 回声过滤（历史）
-integration/autonomous-test 9bebec0  最新语音稳定性修复
+fix/realtime-barge-echo      12669d5  barge 回声过滤（历史）
+fix/voice-realtime-stability a5bce85  最新语音稳定性快照
+integration/autonomous-test  7014ab8  approval role 修复之后的集成
 ```
 
 最终快照分支：`fix/voice-realtime-stability`。
@@ -221,3 +240,22 @@ integration/autonomous-test 9bebec0  最新语音稳定性修复
 8. **TTS 回调要绑定 epoch**，否则 Flush 后旧音频会混入新回复。
 9. **临时诊断钩子必须清理**，刷写 marker/raw log 会伪装成产品 bug。
 10. **每个修复都要区分“缓解”与“根因”**；当前 USB CDC 长回复仍有未闭环风险。
+
+
+## 10. 审批双端行为（最终）
+
+```text
+P4 允许/拒绝
+  → App dsh_approval
+  → 插件 approval/decision
+  → 插件返回结果并发布 approval-resolved
+  → DSH client plugin 点击原生按钮
+
+DSH 原生允许/拒绝
+  → 插件 cancelApproval
+  → approval-cancel
+  → App 转发 USB approval/cancel
+  → P4 清除卡片
+```
+
+此次实测已验证两条路径。
