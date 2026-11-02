@@ -706,6 +706,10 @@ struct Player {
     epoch: Arc<AtomicU64>,
 }
 impl Player {
+    fn epoch(&self) -> u64 { self.epoch.load(Ordering::SeqCst) }
+    fn send_at(&self, epoch: u64, cmd: PlayerCmd) -> Result<(), ()> {
+        self.tx.send((epoch, cmd)).map_err(|_| ())
+    }
     fn send(&self, cmd: PlayerCmd) -> Result<(), ()> {
         let epoch = if matches!(&cmd, PlayerCmd::Flush) {
             self.epoch.fetch_add(1, Ordering::SeqCst) + 1
@@ -1670,15 +1674,19 @@ async fn speak_one(tts: &mut DoubaoTtsClient, player: &Player, text: &str) -> Re
 
 async fn speak_one_logged(tts: &mut DoubaoTtsClient, player: &Player, text: &str, session_id: &str) -> Result<(), String> {
     let sender = player.clone();
+    // Bind every callback to the epoch at synthesis start. If a barge-in or a
+    // newer turn flushes the player, late TTS chunks must not inherit the new
+    // epoch and mix the old sentence into the next response.
+    let epoch = player.epoch();
     let started = Instant::now();
     let mut first_pcm = true;
     tts.synthesize(text, |pcm| {
         if first_pcm && !pcm.is_empty() {
-            let _ = sender.send(PlayerCmd::Subtitle(text.to_string()));
+            let _ = sender.send_at(epoch, PlayerCmd::Subtitle(text.to_string()));
             diagnostics::record(session_id, "tts_first_pcm", json!({"elapsedMs":started.elapsed().as_millis()}));
             first_pcm = false;
         }
-        let _ = sender.send(PlayerCmd::Pcm(pcm.to_vec()));
+        let _ = sender.send_at(epoch, PlayerCmd::Pcm(pcm.to_vec()));
     })
     .await
     .map(|_| ())
