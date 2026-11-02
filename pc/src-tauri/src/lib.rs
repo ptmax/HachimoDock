@@ -10793,7 +10793,26 @@ fn start_usb_auto_connect(usb_manager: usb_serial::UsbSerialManager, app_handle:
     });
 }
 
+#[cfg(target_os = "macos")]
+fn prevent_app_nap() {
+    // macOS App Nap can throttle the USB audio writer when the window is
+    // occluded. Keep a user-activity/idle assertion for this process only.
+    let pid = std::process::id().to_string();
+    match std::process::Command::new("/usr/bin/caffeinate")
+        .args(["-imsu", "-w", &pid])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => eprintln!("[app-nap] caffeinate assertion started for pid {pid}"),
+        Err(error) => eprintln!("[app-nap] failed to start caffeinate: {error}"),
+    }
+}
+
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    prevent_app_nap();
     let usb_manager = usb_serial::UsbSerialManager::new();
     if !cfg!(feature = "composer-diagnostic") {
     if let Err(error) = sync_usb_desktop_device_id(&usb_manager) {
