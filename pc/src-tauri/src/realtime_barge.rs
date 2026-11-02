@@ -52,9 +52,10 @@ impl Confirmation {
         if phase == "speaking" {
             if echo_like(&text, reply) { return false; }
             // Short ASR fragments during playback are frequently noise or echo.
-            // Keep explicit transport commands immediate, but require a real
-            // phrase before interrupting a spoken reply.
-            if !explicit_barge_command(&text) && text.chars().count() < 2 { return false; }
+            // Explicit transport commands should act without waiting for a
+            // terminal/stable transcript.
+            if explicit_barge_command(&text) { return voiced_frames >= 8; }
+            if text.chars().count() < 2 { return false; }
         }
         if self.previous.is_empty() || !text.starts_with(&self.previous) {
             self.first_ms = Some(ms); self.revisions = 1;
@@ -120,6 +121,7 @@ mod tests {
         assert!(!c.accept("检查双向实时",true,None,Duration::from_millis(1200),60,"speaking","现在正在检查双向实时对话",""));
         assert!(!c.accept("测",true,None,Duration::from_millis(1800),120,"speaking","",""));
         let mut c=Confirmation::default();
+        assert!(c.accept("等一下",false,None,Duration::from_millis(100),8,"speaking","现在正在检查双向实时对话",""));
         assert!(c.accept("等一下",true,None,Duration::from_millis(700),20,"speaking","现在正在检查双向实时对话",""));
         assert!(c.accept("请帮我换一首歌",true,None,Duration::from_millis(1800),20,"speaking","现在正在检查双向实时对话",""));
         assert!(c.accept("停",true,None,Duration::from_millis(200),8,"speaking","你可以说停来结束",""));

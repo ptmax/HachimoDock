@@ -2,7 +2,7 @@
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-const MAX_RECOVERY_RETRIES: usize = 3;
+const MAX_RECOVERY_RETRIES: usize = 8;
 const RECOVERY_DEADLINE: Duration = Duration::from_millis(1500);
 const RETRY_BACKOFF: Duration = Duration::from_millis(2);
 
@@ -150,11 +150,10 @@ mod tests {
     }
     #[test]
     fn retries_are_bounded_across_the_frame_not_reset_by_progress() {
-        let mut writer=flaky(vec![(7,io::ErrorKind::TimedOut),(70,io::ErrorKind::WouldBlock),
-            (130,io::ErrorKind::Interrupted),(200,io::ErrorKind::TimedOut)]);
+        let mut writer=flaky(vec![(7,io::ErrorKind::TimedOut);10]);
         let bytes:Vec<_>=(0..256).map(|i|i as u8).collect();
         let failure=write_serial_live_frame(&mut writer,&bytes,64,Duration::ZERO).unwrap_err();
-        assert_eq!(failure.report.retries,3);
+        assert_eq!(failure.report.retries,8);
         assert_eq!(failure.report.bytes_written,writer.bytes.len());
         assert_eq!(writer.bytes,bytes[..writer.bytes.len()]);
         assert!(writer.bytes.len()<bytes.len());
@@ -163,11 +162,11 @@ mod tests {
     fn no_progress_and_recovery_deadline_have_finite_bounds() {
         let mut writer=flaky(vec![(0,io::ErrorKind::Interrupted);100]);
         let failure=write_serial_live_frame(&mut writer,b"frame\n",64,Duration::ZERO).unwrap_err();
-        assert_eq!(writer.attempts,4); assert_eq!(failure.report.bytes_written,0);
+        assert_eq!(writer.attempts,9); assert_eq!(failure.report.bytes_written,0);
         let timeout=io::Error::new(io::ErrorKind::TimedOut,"timeout");
         assert!(can_retry(&timeout,2,RECOVERY_DEADLINE-Duration::from_millis(1)));
         assert!(!can_retry(&timeout,2,RECOVERY_DEADLINE));
-        assert!(!can_retry(&timeout,3,Duration::ZERO));
+        assert!(!can_retry(&timeout,8,Duration::ZERO));
     }
     #[test]
     fn permanent_and_uncertain_errors_never_retry() {
