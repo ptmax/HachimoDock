@@ -860,7 +860,10 @@ function createBridge(ctx, config = {}) {
   })
 
   // The answerer itself: terminal for HachimoDock, delegating by config.
-  ctx.on('approval/request', (request, next) => handleApprovalRequest(bridge, request, next))
+  // Prepend so HachimoDock becomes the first approval answerer. With
+  // mirrorNative still enabled, the native DSH/Web answerer is raced through
+  // next(); either side may decide, and the plugin cancels the other side.
+  ctx.on('approval/request', (request, next) => handleApprovalRequest(bridge, request, next), true)
 
   bridge.start = async () => bridge.server.listen()
   bridge.stop = async () => bridge.server.close()
