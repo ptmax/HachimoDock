@@ -52,3 +52,48 @@ test("DSH interrupt action is wired end to end and gated by selected agent", () 
   assert.match(dashboard, /dsh_interrupt/);
   assert.match(panel, /selectedAgentId !== "deepseek-harness"/);
 });
+
+test("realtime DSH task dispatch uses the plugin task API and never the visible composer", () => {
+  const desktop = read("../src-tauri/src/desktop_agent.rs");
+  const dshTask = read("../src-tauri/src/dsh_task.rs");
+  const realtime = read("../src-tauri/src/realtime_chat.rs");
+  const approval = read("../src-tauri/src/dsh_approval.rs");
+  const plugin = read("../../integrations/dsh-hachimodock/dsh-bridge.js");
+  const pluginServer = read("../../integrations/dsh-hachimodock/server.js");
+  const pluginTasks = read("../../integrations/dsh-hachimodock/tasks.js");
+
+  // The DSH adapter dispatches through `/task`, never the desktop composer.
+  assert.match(desktop, /Agent::Dsh/);
+  assert.match(desktop, /fn dsh_follow_block/);
+  assert.match(desktop, /fn run_dsh_dispatch/);
+  assert.match(desktop, /fn monitor_dsh/);
+  assert.match(desktop, /crate::dsh_task::dispatch/);
+  assert.match(desktop, /cancel_running/);
+  assert.doesNotMatch(desktop, /Agent::Dsh[\s\S]{0,400}?dispatch_task_from_draft/);
+
+  // Transport is loopback-only and keeps fixed codes out of the conversation.
+  assert.match(dshTask, /HACHIMODOCK_DSH_URL/);
+  assert.match(dshTask, /POST \/task|\/task/);
+  assert.match(dshTask, /DSH_BRIDGE_UNAVAILABLE/);
+  assert.match(dshTask, /no_proxy/);
+  assert.match(dshTask, /takeover_once/);
+  assert.match(dshTask, /DSH_TEXT_TOO_LARGE/);
+  assert.match(dshTask, /is_connect/);
+  assert.match(desktop, /outcome\.adopted/);
+  assert.match(desktop, /DispatchError::Uncertain/);
+  assert.match(desktop, /take_permission_notification/);
+  assert.match(realtime, /take_permission_notification/);
+
+  // Approval is a hard gate for realtime utterance dispatch.
+  assert.match(approval, /pub fn device_approval_pending/);
+  assert.match(realtime, /device_approval_pending/);
+  assert.match(realtime, /approval_gated/);
+  assert.match(realtime, /handle_dsh_interrupt_action/);
+
+  // Plugin contract and bounded task state machine.
+  assert.match(pluginServer, /path === '\/task'/);
+  assert.match(plugin, /agent\/inbox\/claimed/);
+  assert.match(plugin, /dispatchTask/);
+  assert.match(pluginTasks, /terminalStateForReason/);
+  assert.match(pluginTasks, /not found|ACTIVE_STATES/);
+});

@@ -1234,7 +1234,13 @@ def test_p4_protocol_replies_are_routed_back_to_the_command_origin():
     assert "uart_write_all(line" in transport
     assert "pet_p4_native_usb_send_json_line" in transport
     assert "PET_P4_TRANSPORT_USB_SERIAL_JTAG" in transport
-    assert "usb_write_all(line" in transport
+    # Bulk USB replies must never wait for TX-idle inside the transport mutex:
+    # that wait can add ~100 ms and stalls protocol replies/RX under host
+    # backpressure. The screenshot path keeps its drained delivery barrier.
+    assert "usb_write_all(line" not in transport
+    assert "usb_queue_all(line" in transport
+    assert "static void transport_send_line_nowait(" in transport
+    assert "transport_send_line_impl(line, ctx, false);" in transport
     assert "uart_write_all(header" in screenshot
     assert "usb_write_all(header" in screenshot
     assert "reply_ctx" in screenshot
@@ -1246,6 +1252,29 @@ def test_p4_protocol_replies_are_routed_back_to_the_command_origin():
     assert "xSemaphoreTake(g_render_mutex" in handler
     assert "pet_p4_renderer_logical_framebuffer" in handler
     assert "pet_p4_renderer_render" not in handler
+
+
+def test_p4_rx_error_reply_never_waits_for_usb_tx_idle():
+    """A full protocol queue must not stall the USB/UART RX task on TX drain.
+
+    Long-reply diagnosis: the USB RX task is the only consumer of the CDC ring.
+    Blocking it in transport_send_line()'s drained USB path adds up to 100 ms
+    per rejected frame and back-pressures the host tty write while the ring is
+    full; the queue-busy reply must stay queue-only and bounded.
+    """
+    source = read("main/pet_p4_main.c")
+    enqueue = source[
+        source.index("static bool enqueue_protocol_line"):
+        source.index("static void protocol_worker_task")
+    ]
+    assert "xQueueSend(g_protocol_queue" in enqueue
+    assert "transport_send_line_nowait(queue_busy" in enqueue
+    assert "else send_line(queue_busy, reply_ctx)" in enqueue
+    helper = source[
+        source.index("static void transport_send_line_nowait"):
+        source.index("static void send_screenshot_chunk")
+    ]
+    assert "transport_send_line_impl(line, ctx, false);" in helper
 
 
 def test_p4_runtime_serializes_state_and_defers_native_usb_callback_work():
@@ -1272,7 +1301,7 @@ def test_p4_protocol_executor_and_lcd_handoff_do_not_share_mutable_render_state(
     renderer = read("main/pet_p4_renderer.c")
     native_header = read("main/pet_p4_usb_native.h")
 
-    assert "PET_P4_PROTOCOL_QUEUE_DEPTH 24" in main
+    assert "PET_P4_PROTOCOL_QUEUE_DEPTH 48" in main
     assert "protocol_worker_task" in main
     assert "xQueueSend(g_protocol_queue" in main
     assert "xQueueReceive(g_protocol_queue" in main

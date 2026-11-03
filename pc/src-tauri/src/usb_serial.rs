@@ -54,7 +54,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -266,6 +266,16 @@ const P4_CH343_RAW_WRITE_GAP: Duration = Duration::from_micros(500);
 #[cfg(not(windows))]
 const P4_CH343_RAW_WRITE_GAP: Duration = Duration::from_micros(250);
 const P4_FIRMWARE_CHUNK_RETRY_DELAY: Duration = Duration::from_millis(1);
+// Diagnosed long-reply stall: the macOS tty write can time out for a few hundred
+// milliseconds while the board and the app both stay alive (see
+// docs/p4-usb-cdc-long-reply-diagnosis-2026-11-03.md). The realtime player
+// recovers by dropping the late audio chunk and resuming on the next one, so a
+// bounded number of those transient stalls must not mark the whole port
+// disconnected (which would end the session and raise a false
+// "客户端未连接"). Audio chunks and frames during active capture share the
+// budget; any successful write resets it. Permanent errors and every other
+// frame still fail closed, as does an exhausted budget.
+const MAX_TRANSIENT_REALTIME_STALLS: u32 = 5;
 
 // native USB bulk is the high-speed ESP32-P4 OTG data plane. UART remains as a fallback.
 struct NativeUsbP4Transport {
@@ -1283,6 +1293,8 @@ pub struct UsbSerialManager {
     appearance_sync_active: Arc<AtomicBool>,
     appearance_sync_cancel_requested: Arc<AtomicBool>,
     serial_body_write_active: Arc<AtomicBool>,
+    // Consecutive transient realtime stalls; reset by any successful write.
+    transient_realtime_stalls: Arc<AtomicU32>,
     next_connection_id: Arc<AtomicU64>,
     asset_ack_waiters: Arc<Mutex<Vec<AssetAckWaiter>>>,
     widget_ack_waiters: Arc<Mutex<Vec<WidgetAckWaiter>>>,
@@ -1365,6 +1377,7 @@ impl UsbSerialManager {
             appearance_sync_active: Arc::new(AtomicBool::new(false)),
             appearance_sync_cancel_requested: Arc::new(AtomicBool::new(false)),
             serial_body_write_active: Arc::new(AtomicBool::new(false)),
+            transient_realtime_stalls: Arc::new(AtomicU32::new(0)),
             next_connection_id: Arc::new(AtomicU64::new(0)),
             asset_ack_waiters: Arc::new(Mutex::new(Vec::new())),
             widget_ack_waiters: Arc::new(Mutex::new(Vec::new())),
@@ -1591,6 +1604,8 @@ impl UsbSerialManager {
             *conn = Some(connection);
             cache_usb_status(&self.status_snapshot, conn.as_ref());
         }
+        // A reconnected port starts with a fresh transient-stall budget.
+        self.transient_realtime_stalls.store(0, Ordering::Release);
         on_message(initial_hello.topic, initial_hello.payload);
 
         // Start reader thread
@@ -1720,6 +1735,18 @@ impl UsbSerialManager {
                 cache_usb_status(&self.status_snapshot, None);
             }
         }
+    }
+
+    /// Drop a connection that stopped answering liveness probes so the
+    /// existing auto-connect loop can probe and restore the port in the
+    /// background. Records a fixed classification only; never port/driver text.
+    pub(crate) fn force_reconnect(&self, reason: &str) {
+        transfer_log::record(
+            "connection",
+            "forced_reconnect",
+            serde_json::json!({ "reason": reason, "ok": false }),
+        );
+        self.disconnect();
     }
 
     /// Send a message to the device
@@ -1910,6 +1937,9 @@ impl UsbSerialManager {
         // even after media itself stopped using flush()/tcdrain().
         let live_frame = audio_frame || topic == "widget/data" || topic == "app/snapshot" || topic == "ui/text-pixels"
             || (!bulk_frame && conn.capture_active.load(Ordering::Acquire));
+        // Preserved for the recovery decision below; the typed report is lost
+        // once the failure is rendered into a user-facing error string.
+        let mut live_error_kind: Option<&'static str> = None;
         let write_result = {
             let _pause = (!live_frame).then(|| SerialReaderPause::new(&self.serial_body_write_active));
             (|| {
@@ -1934,7 +1964,18 @@ impl UsbSerialManager {
                         transfer_log::record("connection",event,details.clone());
                         crate::realtime_chat_log::record(payload.get("sessionId").and_then(serde_json::Value::as_str).unwrap_or(""),event,details);
                     }
-                    return result.map(|_|()).map_err(|error| format!("Live serial write failed: {error}"));
+                    return match result {
+                        Ok(_) => Ok(()),
+                        Err(error) => {
+                            live_error_kind = error.report.error_kind;
+                            // Terminate the truncated JSON line (best effort, one
+                            // bounded write) so the board discards it instead of
+                            // concatenating the next frame onto a partial line and
+                            // losing that frame too.
+                            let _ = conn.writer.write(b"\n");
+                            Err(format!("Live serial write failed: {error}"))
+                        }
+                    };
                 }
                 if let Some(write_slice_bytes) = paced_slice_bytes {
                     write_serial_bytes_paced(
@@ -1957,10 +1998,30 @@ impl UsbSerialManager {
             })()
         };
         if let Err(error) = write_result {
+            // A diagnosed USB CDC OUT stall is a transient tty write timeout
+            // (~0.4-1.5 s) while the board stays alive. During a realtime
+            // conversation the player drops the late audio chunk and resumes on
+            // the next one, so tearing the port down here would turn a
+            // sub-second stall into a lost session and a false "客户端未连接"
+            // banner. Audio chunks and any frame during active capture get this
+            // grace; a permanent error, any frame outside that path, or an
+            // exhausted budget still fails closed below.
+            let capture_active = conn.capture_active.load(Ordering::Acquire);
+            let transient_realtime_stall = live_frame
+                && (topic == "audio/play_chunk" || capture_active)
+                && matches!(live_error_kind, Some("timeout" | "would_block" | "interrupted"));
+            if transient_realtime_stall
+                && self.transient_realtime_stalls.fetch_add(1, Ordering::AcqRel) + 1
+                    < MAX_TRANSIENT_REALTIME_STALLS
+            {
+                return Err(error);
+            }
             conn.connected = false;
             cache_usb_status(&self.status_snapshot, Some(conn));
             return Err(error);
         }
+        // Any successful frame proves the transport is alive again.
+        self.transient_realtime_stalls.store(0, Ordering::Release);
 
         let text_target = (conn.capabilities["bubblePixels"] == "p4-text-alpha-v1"
             && bubble_pixels::is_text_topic(topic))
@@ -2112,6 +2173,78 @@ impl UsbSerialManager {
                 .to_string());
         }
         Ok(response)
+    }
+
+    /// Bounded USB liveness probe for background recovery.
+    ///
+    /// macOS can leave a stale tty writable after sleep, so a successful write
+    /// is not evidence that the board is still there. Send a `system/heartbeat`
+    /// with a requestId and require the matching `protocol/ack` (with
+    /// `requestTopic=system/heartbeat`) within `timeout`. The caller decides
+    /// whether a timeout means reconnecting. This never retries and never waits
+    /// longer than the supplied bound.
+    pub(crate) fn probe_liveness(
+        &self,
+        expected_board_device_id: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let expected_board_device_id =
+            validate_expected_board_device_id(expected_board_device_id)?;
+        // Bounded, metadata-only failure classification for the connection log;
+        // never persist driver text or port paths.
+        let record_failure = |reason: &'static str| {
+            transfer_log::record(
+                "connection",
+                "liveness_probe_failed",
+                serde_json::json!({ "reason": reason, "ok": false }),
+            );
+        };
+        let request_id = format!("liveness-{}", uuid::Uuid::new_v4());
+        let (sender, receiver) = mpsc::channel();
+        self.device_response_waiters
+            .lock()
+            .map_err(|error| error.to_string())?
+            .push(DeviceResponseWaiter {
+                request_id: request_id.clone(),
+                response_topic: "protocol/ack".to_string(),
+                sender,
+            });
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if let Err(error) = self.send_to_board(
+            expected_board_device_id,
+            "system/heartbeat",
+            &serde_json::json!({ "tsMs": ts_ms, "requestId": request_id.clone() }),
+        ) {
+            self.remove_device_response_waiter(&request_id, "protocol/ack");
+            record_failure("send_failed");
+            return Err(error);
+        }
+        let response = match receiver.recv_timeout(timeout) {
+            Ok(response) => response,
+            Err(_) => {
+                self.remove_device_response_waiter(&request_id, "protocol/ack");
+                record_failure("ack_timeout");
+                return Err("heartbeat acknowledgement timed out".to_string());
+            }
+        };
+        let request_topic = response
+            .get("requestTopic")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if request_topic != "system/heartbeat" {
+            record_failure("ack_topic_mismatch");
+            return Err(format!(
+                "heartbeat acknowledgement topic mismatch: {request_topic}"
+            ));
+        }
+        if response.get("ok").and_then(|value| value.as_bool()) == Some(false) {
+            record_failure("ack_rejected");
+            return Err("device rejected heartbeat".to_string());
+        }
+        Ok(())
     }
 
     pub(crate) fn media_request(&self, board: &str, topic: &str, mut payload: serde_json::Value) -> Result<serde_json::Value,String> {
@@ -6771,6 +6904,246 @@ mod tests {
         let before_widget_flushes=stats.lock().unwrap().flushes;
         manager.send_widget_data("p4-test",&serde_json::json!({"source":"computer.status"})).unwrap();
         assert_eq!(stats.lock().unwrap().flushes,before_widget_flushes,"background widgets must not block in driver drain");
+    }
+
+    struct FailingWriter(std::io::ErrorKind);
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(self.0, "synthetic serial failure"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    fn connection_with_writer(
+        manager: &UsbSerialManager,
+        writer: Box<dyn Write + Send>,
+        capture_active: &Arc<AtomicBool>,
+    ) {
+        *manager.connection.lock().unwrap() = Some(UsbConnection {
+            connection_id: 1, port_name: "test".into(), baud_rate: P4_USB_UART_BAUD,
+            writer,
+            board_device_id: "p4-test".into(), runtime: "esp-p4".into(), device_model: String::new(),
+            firmware: String::new(), build_id: String::new(), git_sha: String::new(), build_dirty: false,
+            protocol_schema: 7, wire_protocol: String::new(), capabilities: serde_json::Value::Null,
+            connected: true, cancel_reader: Arc::new(AtomicBool::new(false)),
+            capture_active: Arc::clone(capture_active),
+        });
+        // Mirror the connect path so status() reflects the injected handle.
+        let guard = manager.connection.lock().unwrap();
+        cache_usb_status(&manager.status_snapshot, guard.as_ref());
+    }
+    fn failing_connection_with_capture(
+        manager: &UsbSerialManager,
+        kind: std::io::ErrorKind,
+        capture_active: &Arc<AtomicBool>,
+    ) {
+        connection_with_writer(manager, Box::new(FailingWriter(kind)), capture_active);
+    }
+    fn failing_connection(manager: &UsbSerialManager, kind: std::io::ErrorKind) {
+        failing_connection_with_capture(manager, kind, &Arc::new(AtomicBool::new(false)));
+    }
+
+    #[test]
+    fn liveness_probe_requires_a_heartbeat_ack_and_times_out_boundedly() {
+        struct RecordingWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let manager = UsbSerialManager::new();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        connection_with_writer(
+            &manager,
+            Box::new(RecordingWriter(written.clone())),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        let started = Instant::now();
+        let error = manager
+            .probe_liveness("p4-test", Duration::from_millis(40))
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "liveness probe must stay inside its supplied bound",
+        );
+        assert!(
+            manager.device_response_waiters.lock().unwrap().is_empty(),
+            "a timed-out probe must remove its waiter",
+        );
+        let bytes = written.lock().unwrap().clone();
+        let line = String::from_utf8_lossy(&bytes);
+        let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(request["topic"], "system/heartbeat");
+        assert!(request["payload"]["requestId"]
+            .as_str()
+            .unwrap()
+            .starts_with("liveness-"));
+        assert!(request["payload"]["tsMs"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn liveness_probe_accepts_only_the_matching_heartbeat_ack() {
+        struct ChannelWriter(std::sync::mpsc::Sender<Vec<u8>>);
+        impl Write for ChannelWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        fn probe_with_ack(
+            request_topic: &'static str,
+            ok: bool,
+        ) -> (Result<(), String>, Arc<Mutex<Vec<DeviceResponseWaiter>>>) {
+            let manager = UsbSerialManager::new();
+            let (written_tx, written_rx) = std::sync::mpsc::channel();
+            connection_with_writer(
+                &manager,
+                Box::new(ChannelWriter(written_tx)),
+                &Arc::new(AtomicBool::new(false)),
+            );
+            let probe_manager = manager.clone();
+            let probe = thread::spawn(move || {
+                probe_manager.probe_liveness("p4-test", Duration::from_secs(2))
+            });
+            let mut line = Vec::new();
+            while !line.ends_with(b"\n") {
+                line.extend(written_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+            }
+            let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(request["topic"], "system/heartbeat");
+            let request_id = request["payload"]["requestId"].as_str().unwrap().to_string();
+            resolve_device_response(
+                &manager.device_response_waiters,
+                "protocol/ack",
+                &serde_json::json!({
+                    "requestId": request_id, "requestTopic": request_topic, "ok": ok,
+                }),
+            );
+            (probe.join().unwrap(), manager.device_response_waiters.clone())
+        }
+
+        let (result, waiters) = probe_with_ack("system/heartbeat", true);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(waiters.lock().unwrap().is_empty());
+
+        let (result, _) = probe_with_ack("audio/play_chunk", true);
+        assert!(
+            result.unwrap_err().contains("topic mismatch"),
+            "an unrelated protocol/ack must not prove liveness",
+        );
+
+        let (result, _) = probe_with_ack("system/heartbeat", false);
+        assert!(result.unwrap_err().contains("rejected"));
+    }
+
+    #[test]
+    fn liveness_timeout_forces_a_reconnect_and_a_fresh_port_can_be_probed() {
+        // A stale handle keeps accepting writes: only the missing heartbeat ACK
+        // may drop it, and the existing auto-connect path then installs a fresh
+        // port. Both halves are exercised here without real hardware.
+        let manager = UsbSerialManager::new();
+        failing_connection(&manager, std::io::ErrorKind::TimedOut);
+        assert!(manager.status().connected);
+        assert!(manager
+            .probe_liveness("p4-test", Duration::from_millis(30))
+            .is_err());
+        manager.force_reconnect("liveness_failed");
+        assert!(!manager.status().connected);
+        assert!(manager.connection.lock().unwrap().is_none());
+
+        // Fresh connection from the auto-connect probe: a responding board ACKs
+        // its liveness heartbeat and the link is usable again in the background.
+        struct ChannelWriter(std::sync::mpsc::Sender<Vec<u8>>);
+        impl Write for ChannelWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        connection_with_writer(
+            &manager,
+            Box::new(ChannelWriter(written_tx)),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(manager.status().connected);
+        let probe_manager = manager.clone();
+        let probe = thread::spawn(move || {
+            probe_manager.probe_liveness("p4-test", Duration::from_secs(2))
+        });
+        let mut line = Vec::new();
+        while !line.ends_with(b"\n") {
+            line.extend(written_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        let request: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        let request_id = request["payload"]["requestId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        resolve_device_response(
+            &manager.device_response_waiters,
+            "protocol/ack",
+            &serde_json::json!({
+                "requestId": request_id, "requestTopic": "system/heartbeat", "ok": true,
+            }),
+        );
+        assert!(probe.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn transient_audio_chunk_stalls_keep_the_port_until_the_budget_is_exhausted() {
+        let manager = UsbSerialManager::new();
+        failing_connection(&manager, std::io::ErrorKind::TimedOut);
+        // The diagnosed long-reply stall: a bounded tty write timeout on one
+        // audio chunk must not disconnect the port (the player drops the frame
+        // and continues), but repeated stalls still fail closed.
+        for attempt in 1..MAX_TRANSIENT_REALTIME_STALLS {
+            assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"x"})).is_err());
+            assert!(
+                manager.connection.lock().unwrap().as_ref().unwrap().connected,
+                "transient audio stall {attempt} must not tear the port down",
+            );
+        }
+        assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"x"})).is_err());
+        assert!(
+            !manager.connection.lock().unwrap().as_ref().unwrap().connected,
+            "exhausted transient-stall budget must fail closed",
+        );
+    }
+
+    #[test]
+    fn permanent_errors_and_non_realtime_live_stalls_still_fail_closed() {
+        // A truly gone link (broken pipe) disconnects on the first error.
+        let manager = UsbSerialManager::new();
+        failing_connection(&manager, std::io::ErrorKind::BrokenPipe);
+        assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"x"})).is_err());
+        assert!(!manager.connection.lock().unwrap().as_ref().unwrap().connected);
+
+        // During an active realtime conversation, HUD/subtitle/heartbeat frames
+        // hit the same transient stall and share the bounded port budget instead
+        // of ending the session on the first timeout.
+        let manager = UsbSerialManager::new();
+        let capture = Arc::new(AtomicBool::new(true));
+        failing_connection_with_capture(&manager, std::io::ErrorKind::TimedOut, &capture);
+        assert!(manager.send("ui/conversation", &serde_json::json!({"state":"speaking"})).is_err());
+        assert!(
+            manager.connection.lock().unwrap().as_ref().unwrap().connected,
+            "frames during active capture must share the bounded transient budget",
+        );
+
+        // Outside an active conversation the same transient live frame keeps the
+        // previous fail-closed behavior.
+        let manager = UsbSerialManager::new();
+        failing_connection(&manager, std::io::ErrorKind::TimedOut);
+        assert!(manager.send("ui/conversation", &serde_json::json!({"state":"speaking"})).is_err());
+        assert!(
+            !manager.connection.lock().unwrap().as_ref().unwrap().connected,
+            "non-realtime live frames must not use the transient budget",
+        );
     }
 
     #[test]

@@ -83,6 +83,7 @@ test('wrong methods answer 405 JSON', async (t) => {
     ['/health', 'POST'],
     ['/sessions', 'POST'],
     ['/inject', 'GET'],
+    ['/task', 'DELETE'],
     ['/events', 'POST'],
     ['/approval/decision', 'GET'],
   ]) {
@@ -93,7 +94,7 @@ test('wrong methods answer 405 JSON', async (t) => {
 
 test('invalid JSON bodies answer 400 invalid-json', async (t) => {
   const { url } = await startTestServer(t)
-  for (const path of ['/inject', '/approval/decision']) {
+  for (const path of ['/inject', '/task', '/approval/decision']) {
     const { status, body } = await requestJson(`${url}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

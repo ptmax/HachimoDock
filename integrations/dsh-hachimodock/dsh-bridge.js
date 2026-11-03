@@ -32,11 +32,12 @@
  * @module @hachimodock/dsh-bridge/dsh-bridge
  */
 
-const { randomUUID } = require('node:crypto')
+const { randomUUID, createHash } = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { BridgeServer, DEFAULT_PORT, DEFAULT_APPROVAL_TIMEOUT_MS, boundString } = require('./server')
+const { BridgeServer, DEFAULT_PORT, DEFAULT_APPROVAL_TIMEOUT_MS, boundString, httpError } = require('./server')
+const { createDshTaskRegistry } = require('./tasks')
 const DEFAULT_BRIDGE_PROFILE = path.join(os.homedir(), '.claw-pet', 'pet-bridge.json')
 const NEVER_APPROVAL_TIMEOUT_MS = 99999
 
@@ -332,9 +333,9 @@ function turnEndState(data) {
   const kind = typeof data?.reason?.kind === 'string' ? data.reason.kind : ''
   if (kind === 'error') return 'error'
   if (kind === 'completed') return 'done'
-  if (kind === 'aborted' || kind === 'interrupted' || kind === 'blocked'
-      || kind === 'max-tokens' || kind === 'forked') return 'stopped'
-  /* Older hosts omit the reason; preserve the historical completed behavior. */
+  // Older hosts omit the reason entirely; preserve the historical completed
+  // behavior. Any other reported ending is a stopped turn, never a completion.
+  if (kind !== '') return 'stopped'
   return 'done'
 }
 
@@ -357,6 +358,7 @@ function forwardSessionEvent(bridge, session, event) {
     }
     case 'turn/start':
       rememberSessionState(bridge, sessionId, 'working')
+      bridge.tasks.noteTurnStart(sessionId, data.turn)
       bridge.server.publish('turn', {
         sessionId,
         phase: 'start',
@@ -367,12 +369,14 @@ function forwardSessionEvent(bridge, session, event) {
       const text = assistantMessageText(data.message)
       if (text) {
         rememberSessionText(bridge, sessionId, text)
+        bridge.tasks.noteAssistant(sessionId, text)
         publishSessionSummary(bridge, session)
       }
       return
     }
     case 'turn/end':
       rememberSessionState(bridge, sessionId, turnEndState(data))
+      bridge.tasks.finishTurn(sessionId, data.turn, data.reason?.kind)
       bridge.server.publish('turn', {
         sessionId,
         phase: 'end',
@@ -386,6 +390,7 @@ function forwardSessionEvent(bridge, session, event) {
       remember(bridge.toolNames, `${sessionId}:${callId}`, name)
       // Tool-running is an active device state, not just a transient event.
       rememberSessionState(bridge, sessionId, 'tool_running')
+      bridge.tasks.noteTool(sessionId, 'start')
       bridge.server.publish('tool', { sessionId, phase: 'start', name, callId: callId || undefined, ok: true })
       return
     }
@@ -400,6 +405,7 @@ function forwardSessionEvent(bridge, session, event) {
       const name = bridge.toolNames.get(key) ?? 'tool'
       bridge.toolNames.delete(key)
       rememberSessionState(bridge, sessionId, 'working')
+      bridge.tasks.noteTool(sessionId, 'end')
       bridge.server.publish('tool', {
         sessionId,
         phase: 'end',
@@ -699,6 +705,105 @@ function resolveApprovalTimeoutMs(bridge) {
   return bridge.options.approvalTimeoutMs
 }
 
+/** SHA-256 of one dispatch request, used only for duplicate-retry comparison. */
+function taskRequestHash(text) {
+  return createHash('sha256').update(text, 'utf8').digest('hex')
+}
+
+/**
+ * Accept one tracked task for a live DSH agent.
+ *
+ * The task is registered before `followup()` so a concurrent duplicate POST is
+ * idempotent. The registry is process-local; a plugin restart drops tasks and
+ * the PC must treat the result as unknown rather than re-prompting DSH.
+ *
+ * @param {object} bridge - bridge state.
+ * @param {{taskId: string, sessionId: string, text: string, origin: string, metadata: object}} args - dispatch request.
+ * @returns {Promise<object>} public task acceptance body.
+ */
+async function dispatchTask(bridge, args) {
+  const taskId = typeof args?.taskId === 'string' ? args.taskId.trim() : ''
+  const text = typeof args?.text === 'string' ? args.text : ''
+  const requestedSessionId =
+    typeof args?.sessionId === 'string' && args.sessionId.trim() !== '' ? args.sessionId.trim() : 'auto'
+  if (taskId === '' || taskId.length > 128 || /[\u0000-\u001f]/.test(taskId)) {
+    throw httpError(400, 'invalid-request', 'taskId must be a bounded string')
+  }
+  if (text.trim() === '') throw httpError(400, 'invalid-request', 'text must be non-empty')
+  const textHash = taskRequestHash(text.trim())
+  bridge.tasks.sweep()
+  const existing = bridge.tasks.record(taskId)
+  if (existing) {
+    if (existing.textHash !== textHash || existing.requestedSessionId !== requestedSessionId) {
+      throw httpError(409, 'duplicate-conflict', 'taskId was already used for a different request')
+    }
+    return { ok: true, ...bridge.tasks.get(existing.taskId), duplicate: true }
+  }
+  const target = resolveTargetSession(bridge, requestedSessionId)
+  if (!target) {
+    throw httpError(409, 'session-not-found', `no live DSH session matches ${JSON.stringify(requestedSessionId)}`)
+  }
+  let agent
+  try {
+    agent = bridge.ctx.agents?.get?.(target.id)
+  } catch (error) {
+    bridge.logger.warn(error)
+  }
+  if (!agent) throw httpError(409, 'agent-not-live', `session ${target.id} has no live agent`)
+  if (typeof agent.followup !== 'function') {
+    throw httpError(500, 'followup-failed', 'agent does not expose followup()')
+  }
+  const messageId = randomUUID()
+  const message = {
+    id: messageId,
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'user' },
+  }
+  const wasRunning = agent.status === 'running' || agent.running === true
+  const accepted = bridge.tasks.accept({
+    taskId,
+    messageId,
+    sessionId: target.id,
+    requestedSessionId,
+    textHash,
+    queued: wasRunning,
+  })
+  if (accepted.duplicate) {
+    return { ok: true, ...bridge.tasks.get(taskId), duplicate: true }
+  }
+  try {
+    agent.followup(message)
+  } catch (error) {
+    bridge.tasks.fail(taskId, 'followup-failed')
+    bridge.logger.warn(error)
+    throw httpError(500, 'followup-failed', 'agent.followup() failed')
+  }
+  bridge.logger.info({
+    taskId,
+    sessionId: target.id,
+    queued: wasRunning,
+    origin: typeof args?.origin === 'string' ? boundString(args.origin, 80) : 'unknown',
+  })
+  return { ok: true, ...bridge.tasks.get(taskId), duplicate: false }
+}
+
+/**
+ * Read one tracked task.
+ * @param {object} bridge - bridge state.
+ * @param {{taskId: string}} args - lookup request.
+ * @returns {Promise<{ok: true, task: object}>} task body.
+ */
+async function getTask(bridge, args) {
+  const taskId = typeof args?.taskId === 'string' ? args.taskId.trim() : ''
+  if (taskId === '' || taskId.length > 128) {
+    throw httpError(400, 'invalid-request', 'taskId must be a bounded string')
+  }
+  const task = bridge.tasks.get(taskId)
+  if (!task) throw httpError(404, 'task-not-found', 'unknown or expired task')
+  return { ok: true, task }
+}
+
 /**
  * Cancel the active turn of one live DSH session.
  * @param {object} bridge - bridge state.
@@ -716,8 +821,11 @@ async function interruptSession(bridge, args = {}) {
   }
   if (!agent) return { ok: false, error: 'agent-not-live' }
   const running = agent.status === 'running' || agent.running === true
-  if (!running) return { ok: true, sessionId: target.id, interrupted: false, state: 'idle' }
   if (typeof agent.cancel !== 'function') return { ok: false, error: 'agent-unsupported' }
+  // Accepted/queued task records can exist before the agent flips its status;
+  // always stop them when the caller asks to interrupt this session.
+  bridge.tasks.cancelSession(target.id)
+  if (!running) return { ok: true, sessionId: target.id, interrupted: false, state: 'idle' }
   agent.cancel({ kind: 'user' })
   return { ok: true, sessionId: target.id, interrupted: true, state: 'cancelled' }
 }
@@ -749,31 +857,46 @@ async function handleApprovalRequest(bridge, request, next) {
         if (!oldest.done) bridge.approvalLinks.delete(oldest.value)
       }
     }
-    // Native Web/Desktop approval and the device are both live answerers.
-    // Never let the native answerer's immediate "unavailable" short-circuit
-    // the device; race only meaningful decisions, then let the device timeout
-    // remain the fail-closed terminal path.
-    const nativeOutcome = Promise.resolve()
-      .then(() => (bridge.options.mirrorNative ? delegate() : 'unavailable'))
-      .catch(() => 'unavailable')
-    const outcome = await new Promise((resolve) => {
-      let settled = false
-      const finish = (source, value) => {
-        if (settled) return
-        settled = true
-        resolve({ source, value })
-      }
-      prompt.outcome.then((value) => finish('device', value))
-      nativeOutcome.then((value) => {
-        if (value === 'allowed-once' || value === 'rejected') finish('native', value)
+    const waitingSession = request?.agent?.session
+    if (waitingSession) rememberSessionState(bridge, sessionId, 'waiting_user')
+    bridge.tasks.noteApproval(sessionId, true)
+    try {
+      // Native Web/Desktop approval and the device are both live answerers.
+      // Never let the native answerer's immediate "unavailable" short-circuit
+      // the device; race only meaningful decisions, then let the device timeout
+      // remain the fail-closed terminal path.
+      const nativeOutcome = Promise.resolve()
+        .then(() => (bridge.options.mirrorNative ? delegate() : 'unavailable'))
+        .catch(() => 'unavailable')
+      const outcome = await new Promise((resolve) => {
+        let settled = false
+        const finish = (source, value) => {
+          if (settled) return
+          settled = true
+          resolve({ source, value })
+        }
+        prompt.outcome.then((value) => finish('device', value))
+        nativeOutcome.then((value) => {
+          if (value === 'allowed-once' || value === 'rejected') finish('native', value)
+        })
       })
-    })
-    if (outcome.source === 'native') {
-      bridge.server.cancelApproval(prompt.requestId, outcome.value)
-      return outcome.value
+      if (outcome.source === 'native') {
+        bridge.server.cancelApproval(prompt.requestId, outcome.value)
+        return outcome.value
+      }
+      if (outcome.value === 'allowed-once' || outcome.value === 'rejected') return outcome.value
+      return 'unavailable'
+    } finally {
+      bridge.tasks.noteApproval(sessionId, false)
+      let running = false
+      try {
+        const agent = bridge.ctx.agents?.get?.(sessionId)
+        running = agent?.status === 'running' || agent?.running === true
+      } catch {
+        running = false
+      }
+      rememberSessionState(bridge, sessionId, running ? 'working' : 'idle')
     }
-    if (outcome.value === 'allowed-once' || outcome.value === 'rejected') return outcome.value
-    return 'unavailable'
   } catch (error) {
     bridge.logger.warn(error)
     return 'unavailable'
@@ -804,8 +927,12 @@ function createBridge(ctx, config = {}) {
     toolNames: new Map(),
     askedApprovals: new Map(),
     approvalLinks: new Map(),
+    tasks: null,
     server: null,
   }
+  bridge.tasks = createDshTaskRegistry({
+    now: () => (bridge.server ? bridge.server.now() : Date.now()),
+  })
   bridge.server = new BridgeServer({
     port: options.port,
     approvalTimeoutMs: options.approvalTimeoutMs,
@@ -824,6 +951,8 @@ function createBridge(ctx, config = {}) {
     },
     inject: (args) => injectToSession(bridge, args),
     interrupt: (args) => interruptSession(bridge, args),
+    dispatchTask: (args) => dispatchTask(bridge, args),
+    getTask: (args) => getTask(bridge, args),
   })
 
   // Compact control-plane forwarding to GET /events.
@@ -858,6 +987,36 @@ function createBridge(ctx, config = {}) {
       logger.warn(error)
     }
   })
+  // Tracked-task correlation: the loop claims one queued user message at a
+  // turn boundary and reports its turn; that is the only reliable proof that
+  // this task (not a pre-existing turn) started.
+  ctx.on('agent/inbox/claimed', (payload) => {
+    try {
+      if (!payload || typeof payload !== 'object') return
+      const messageId = typeof payload.message?.id === 'string' ? payload.message.id : ''
+      if (messageId === '') return
+      const session = payload.agent?.session
+      const sessionId = session && typeof session.id === 'string' ? session.id : undefined
+      bridge.tasks.claim({
+        messageId,
+        turn: Number.isSafeInteger(payload.turn) ? payload.turn : undefined,
+        sessionId,
+      })
+      if (session) publishSessionSummary(bridge, session)
+    } catch (error) {
+      logger.warn(error)
+    }
+  })
+  ctx.on('agent/inbox/discarded', (payload) => {
+    try {
+      if (!payload || typeof payload !== 'object') return
+      const messageId = typeof payload.message?.id === 'string' ? payload.message.id : ''
+      if (messageId === '') return
+      bridge.tasks.discard({ messageId })
+    } catch (error) {
+      logger.warn(error)
+    }
+  })
 
   // The answerer itself: terminal for HachimoDock, delegating by config.
   // Prepend so HachimoDock becomes the first approval answerer. With
@@ -870,6 +1029,8 @@ function createBridge(ctx, config = {}) {
   bridge.handleApprovalRequest = (request, next) => handleApprovalRequest(bridge, request, next)
   bridge.interruptSession = (args) => interruptSession(bridge, args)
   bridge.injectToSession = (args) => injectToSession(bridge, args)
+  bridge.dispatchTask = (args) => dispatchTask(bridge, args)
+  bridge.getTask = (args) => getTask(bridge, args)
   bridge.listSessions = () => bridge.server.listSessions()
   bridge.resolveTargetSession = (sessionId) => resolveTargetSession(bridge, sessionId)
   bridge.summarizeSession = (session) => summarizeSession(bridge, session)
@@ -905,4 +1066,6 @@ module.exports = {
   forwardSessionEvent,
   summarizeSession,
   resolveTargetSession,
+  dispatchTask,
+  getTask,
 }

@@ -10,7 +10,8 @@ test("realtime delegation targets the current editor independently of display-fo
   assert.doesNotMatch(source, /ctx\.target|target_current\(/);
   assert.match(source, /无需绑定设备跟随会话/);
   assert.match(source, /reserve\(&mut store, ctx, ""\)/);
-  assert.match(source, /let \(agent, _\) = crate::resolve_usb_inject_target\(&self.board\)/);
+  assert.match(source, /let \(agent, session\) = crate::resolve_usb_inject_target\(&self.board\)/);
+  assert.match(source, /self.followed_session = if session.trim\(\).is_empty\(\)/);
   assert.match(source, /if !ctx.supports_default_agent\(\)/);
   assert.match(rust("realtime_chat.rs"), /with_followed_agent\(\)/);
 });

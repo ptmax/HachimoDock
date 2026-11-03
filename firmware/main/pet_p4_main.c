@@ -56,7 +56,11 @@ static const char *TAG = "pet-p4";
 #define PET_P4_UART_READ_CHUNK_BYTES 2048
 #define PET_P4_TRANSPORT_RX_TASK_STACK_BYTES 8192
 #define PET_P4_PROTOCOL_TASK_STACK_BYTES 12288
-#define PET_P4_PROTOCOL_QUEUE_DEPTH 24
+// Deep enough to absorb a burst of audio chunks, capture status and UI frames
+// while the protocol worker briefly waits on a transport lock. Overflow is
+// still reported as command_queue_busy, but dropping the line must not add a
+// drained USB wait to the RX task (see transport_send_line_nowait).
+#define PET_P4_PROTOCOL_QUEUE_DEPTH 48
 #define PET_P4_MAIN_RENDER_INTERVAL_MS 50ULL
 #define PET_P4_MAIN_LOOP_DELAY_MS 1
 #define PET_P4_MAIN_RX_HEALTH_TIMEOUT_MS 1000ULL
@@ -233,13 +237,13 @@ static void transport_send_line_impl(const char *line, void *ctx, bool drain) {
   }
   if (route == PET_P4_TRANSPORT_USB_SERIAL_JTAG
       || (route == PET_P4_TRANSPORT_BROADCAST && usb_protocol_seen())) {
-    if (drain) {
-      usb_write_all(line, strlen(line));
-      usb_write_all("\n", 1);
-    } else {
-      usb_queue_all(line, strlen(line));
-      usb_queue_all("\n", 1);
-    }
+    /* USB Serial/JTAG frames stay ordered in the driver's TX ring, and the
+     * protocol is asynchronous. Waiting for TX-idle adds up to 100 ms per frame
+     * inside this mutex; when the host drains IN slowly that wait can stall
+     * protocol replies, the RX error path and anything else holding
+     * g_state_mutex. Queue the complete frame and let the driver deliver it. */
+    usb_queue_all(line, strlen(line));
+    usb_queue_all("\n", 1);
   }
   if (route == PET_P4_TRANSPORT_WIFI
       || (route == PET_P4_TRANSPORT_BROADCAST && pet_p4_wifi_client_connected())) {
@@ -254,10 +258,9 @@ static void transport_send_line_impl(const char *line, void *ctx, bool drain) {
 static void transport_send_line(const char *line, void *ctx) {
   const char audio_prefix[] = "{\"topic\":\"audio/";
   const char media_prefix[] = "{\"topic\":\"media/";
-  // A media chunk contains only 80 ms of audio. Waiting for USB TX completion
-  // before queuing the newline delays its ACK by ~100 ms on native USB and
-  // guarantees underruns. Queue the complete frame under the same mutex, as
-  // for realtime audio; firmware/widget transfers keep their drained path.
+  // Media/audio frames queue immediately. UART (no hardware flow control) keeps
+  // its drained path for bulk replies; USB Serial/JTAG is always queue-only
+  // because waiting for TX-idle inside this mutex can add ~100 ms per frame.
   bool audio = line && (strncmp(line, audio_prefix, sizeof(audio_prefix) - 1) == 0
     || strncmp(line, media_prefix, sizeof(media_prefix) - 1) == 0);
   transport_send_line_impl(line, ctx, !audio);
@@ -266,6 +269,13 @@ static void transport_send_line(const char *line, void *ctx) {
 static void transport_send_audio_line(const char *line, void *ctx) {
   // Driver queues copy each frame; draining twice per 20 ms frame stalls capture.
   // The transport mutex still prevents JSON/console interleaving.
+  transport_send_line_impl(line, ctx, false);
+}
+
+/* Rejections emitted from the transport RX task must never wait for TX-idle: a
+ * slow host drain would otherwise stop the receiver (and its CDC ring) for up
+ * to 100 ms per rejected line while the protocol queue is full. */
+static void transport_send_line_nowait(const char *line, void *ctx) {
   transport_send_line_impl(line, ctx, false);
 }
 
@@ -436,10 +446,10 @@ static bool enqueue_protocol_line(
     return true;
   }
   free(line_copy);
-  send_line(
-    "{\"topic\":\"protocol/error\",\"payload\":{\"ok\":false,\"error\":\"command_queue_busy\"}}",
-    reply_ctx
-  );
+  static const char queue_busy[] =
+    "{\"topic\":\"protocol/error\",\"payload\":{\"ok\":false,\"error\":\"command_queue_busy\"}}";
+  if (send_line == transport_send_line) transport_send_line_nowait(queue_busy, reply_ctx);
+  else send_line(queue_busy, reply_ctx);
   return false;
 }
 

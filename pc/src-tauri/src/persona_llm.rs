@@ -154,7 +154,7 @@ where F: FnMut(&str), E: FnMut(crate::web_search::Event) {
     body["tools"].as_array_mut().unwrap().extend(crate::local_tools::definitions());
     attach_desktop_tool(&mut body, desktop.is_some());
     if let Some(context)=desktop.as_ref() {
-        body["messages"].as_array_mut().unwrap().insert(1,json!({"role":"system","content":format!("设备当前跟随的桌面 Agent 是 {}。用户直接说任务即可，通常省略 desktop_agent.agent，让原生工具沿用当前跟随；不要要求用户再说‘让某个 Agent 帮我’。只有用户明确指定目标时才填写 agent；Work 是 WorkBuddy 的简称，对应 workbuddy。若当前跟随目标不支持派发，应说明限制，不擅自切换到 Codex 或 WorkBuddy。",context.default_agent())}));
+        body["messages"].as_array_mut().unwrap().insert(1,json!({"role":"system","content":format!("设备当前跟随的桌面 Agent 是 {}。用户直接说任务即可，通常省略 desktop_agent.agent，让原生工具沿用当前跟随；不要要求用户再说‘让某个 Agent 帮我’。只有用户明确指定目标时才填写 agent；Work 是 WorkBuddy 的简称，对应 workbuddy，DeepSeek/DSH 对应 dsh。若跟随 DeepSeek Harness，任务会注入它在设备上绑定或最近活跃的 live DSH 会话，不新建、不恢复会话；没有 live 会话、插件未加载或跟随其他 Agent 时不要派发 DSH，也不擅自切换跟随。若当前跟随目标不支持派发，应说明限制，不擅自切换到 Codex 或 WorkBuddy。",context.default_agent())}));
     }
     if let Some(snapshot) = desktop.as_ref().and_then(crate::desktop_agent::conversation_receipt) {
         attach_desktop_receipt(&mut body, snapshot);

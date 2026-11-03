@@ -5,8 +5,8 @@
  *
  * This module knows nothing about Cordis or DSH. It owns:
  *   - one loopback `node:http` server (`127.0.0.1` only),
- *   - the `/health`, `/sessions`, `/inject`, `/events`, `/approval/decision`
- *     contract endpoints from `docs/dsh-integration-contract.md`,
+ *   - the `/health`, `/sessions`, `/inject`, `/task`, `/interrupt`, `/events`,
+ *     `/approval/decision` contract endpoints from `docs/dsh-integration-contract.md`,
  *   - the bounded event ring buffer behind `GET /events?after=<seq>`,
  *   - pending approval requests and their idempotent one-shot decisions.
  *
@@ -18,6 +18,8 @@
  *   GET  /health             -> {"ok":true,"version":1,"sessions":N,"pendingApprovals":N}
  *   GET  /sessions           -> {"sessions":[{id,title,cwd,lastModified,status,agentId}]}
  *   POST /inject             -> text/event-stream: token | tool | done | error
+ *   POST /task               -> {"ok":true,"taskId":...,"sessionId":...,"state":"accepted|queued"}
+ *   GET  /task?taskId=<id>   -> {"ok":true,"task":{...}} | 404 task-not-found
  *   GET  /events?after=<seq> -> text/event-stream: id/event/data frames
  *   POST /approval/decision  -> {"ok":true,"requestId":...,"accepted":true} | 400 | 409
  *
@@ -39,6 +41,14 @@ const NEVER_APPROVAL_TIMEOUT_MS = 99999
 const MAX_BODY_BYTES = 64 * 1024
 /** Hard cap on `/inject` text after JSON decoding. */
 const MAX_INJECT_TEXT_CHARS = 32 * 1024
+/** Hard cap on one dispatched task text after JSON decoding. */
+const MAX_TASK_TEXT_CHARS = 32 * 1024
+/**
+ * `/task` accepts UTF-8 CJK text within the 32K-character contract. The
+ * generic 64 KB body cap is too small for that (32K CJK can exceed 64 KB), so
+ * this route has its own bounded body limit.
+ */
+const MAX_TASK_BODY_BYTES = 256 * 1024
 /** Bounded replay window for `/events?after=<seq>`. */
 const EVENT_BUFFER_LIMIT = 512
 /** How many terminal approval ids stay queryable for duplicate detection. */
@@ -216,6 +226,8 @@ class BridgeServer {
    * @param {() => Array<object>} [options.listSessions] - compact session summaries.
    * @param {(args: {sessionId: string, text: string, emit: (event: object) => void, signal: AbortSignal}) => Promise<void>} [options.inject] - prompt delivery.
    * @param {(args: {sessionId: string}) => Promise<object>} [options.interrupt] - cancel the active turn.
+   * @param {(args: {taskId: string, sessionId: string, text: string, origin: string, metadata: object}) => Promise<object>} [options.dispatchTask] - submit one tracked task.
+   * @param {(args: {taskId: string}) => Promise<object>} [options.getTask] - read one tracked task.
    * @param {{info?: Function, warn?: Function, error?: Function}} [options.logger] - optional logger.
    * @param {() => number} [options.now] - clock.
    * @param {() => string} [options.createRequestId] - approval id factory.
@@ -233,6 +245,16 @@ class BridgeServer {
     this.interrupt =
       options.interrupt ??
       (async () => ({ ok: false, error: 'interrupt-unavailable' }))
+    this.dispatchTask =
+      options.dispatchTask ??
+      (async () => {
+        throw httpError(503, 'bridge-unavailable', 'task dispatch adapter is not configured')
+      })
+    this.getTask =
+      options.getTask ??
+      (async () => {
+        throw httpError(404, 'task-not-found', 'unknown task')
+      })
     this.logger = options.logger ?? null
     this.now = options.now ?? (() => Date.now())
     this.createRequestId = options.createRequestId ?? (() => `req-${randomUUID()}`)
@@ -558,6 +580,11 @@ class BridgeServer {
       if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
       return this.handleInterrupt(req, res)
     }
+    if (path === '/task') {
+      if (method === 'POST') return this.handleTask(req, res)
+      if (method === 'GET') return this.handleTaskStatus(req, res, url)
+      return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+    }
     if (path === '/events') {
       if (method !== 'GET') return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
       return this.handleEvents(req, res, url)
@@ -670,6 +697,84 @@ class BridgeServer {
       sendJson(res, 200, result)
     } catch (error) {
       sendJson(res, 500, { ok: false, error: 'interrupt-failed', message: String(error?.message || error) })
+    }
+  }
+
+  /**
+   * POST /task: accept one tracked task for a live DSH agent.
+   * @param {import('node:http').IncomingMessage} req - request.
+   * @param {import('node:http').ServerResponse} res - response.
+   * @returns {Promise<void>} settles after the response.
+   */
+  async handleTask(req, res) {
+    let body
+    try {
+      body = await readJsonBody(req, MAX_TASK_BODY_BYTES)
+    } catch (error) {
+      this.failRequest(res, error)
+      return
+    }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'body must be a JSON object' })
+      return
+    }
+    const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : ''
+    if (taskId === '' || taskId.length > 128 || /[\u0000-\u001f]/.test(taskId)) {
+      sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'taskId must be a bounded string' })
+      return
+    }
+    const text = typeof body.text === 'string' ? body.text : ''
+    if (text.trim() === '') {
+      sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'text must be a non-empty string' })
+      return
+    }
+    if (text.length > MAX_TASK_TEXT_CHARS) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'invalid-request',
+        message: `text exceeds ${MAX_TASK_TEXT_CHARS} characters`,
+      })
+      return
+    }
+    const sessionId =
+      typeof body.sessionId === 'string' && body.sessionId.trim() !== '' ? body.sessionId.trim() : 'auto'
+    if (sessionId.length > 512) {
+      sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'sessionId is too long' })
+      return
+    }
+    const origin = typeof body.origin === 'string' ? (boundString(body.origin.trim(), 80) ?? 'unknown') : 'unknown'
+    const metadata =
+      body.metadata !== null && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+        ? body.metadata
+        : {}
+    try {
+      const result = await this.dispatchTask({ taskId, sessionId, text, origin, metadata })
+      sendJson(res, 200, result)
+    } catch (error) {
+      this.failRequest(res, error)
+    }
+  }
+
+  /**
+   * GET /task?taskId=<id>: report one tracked task.
+   * @param {import('node:http').IncomingMessage} req - request.
+   * @param {import('node:http').ServerResponse} res - response.
+   * @param {URL} url - parsed request URL.
+   * @returns {Promise<void>} settles after the response.
+   */
+  async handleTaskStatus(_req, res, url) {
+    const taskId = typeof url.searchParams.get('taskId') === 'string'
+      ? url.searchParams.get('taskId').trim()
+      : ''
+    if (taskId === '' || taskId.length > 128 || /[\u0000-\u001f]/.test(taskId)) {
+      sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'taskId must be a bounded string' })
+      return
+    }
+    try {
+      const result = await this.getTask({ taskId })
+      sendJson(res, 200, result)
+    } catch (error) {
+      this.failRequest(res, error)
     }
   }
 
@@ -891,8 +996,12 @@ module.exports = {
   DEFAULT_PORT,
   DEFAULT_APPROVAL_TIMEOUT_MS,
   MAX_BODY_BYTES,
+  MAX_INJECT_TEXT_CHARS,
+  MAX_TASK_TEXT_CHARS,
+  MAX_TASK_BODY_BYTES,
   EVENT_BUFFER_LIMIT,
   isLoopbackAddress,
   readJsonBody,
   boundString,
+  httpError,
 }

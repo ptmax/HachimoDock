@@ -51,6 +51,12 @@ const FINAL_CAPTURE_LIMIT: usize = 576; // > 8 s final wait + existing 128-frame
 const POST_SPEAK_GUARD: Duration = Duration::from_millis(250);
 const PLAYBACK_LEAD_MS: u64 = 1200;
 const PLAY_CHUNK_BYTES: usize = 3200; // 100 ms
+// Bounded recovery for the diagnosed long-reply USB CDC stall: a tty write can
+// time out for a few hundred ms while the board stays alive, so a late 100 ms
+// chunk is dropped and the session continues. Each frame already has a bounded
+// transport retry (8 x 1.5 s); this only bounds how many consecutive stalled
+// chunks may be dropped before the session fails closed.
+const AUDIO_WRITE_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const VAD_ABS_MIN: f32 = 380.0;
 const VAD_NOISE_RATIO: f32 = 2.6;
 // AEC can leave tiny speech-shaped residuals that WebRTC VAD labels as speech.
@@ -394,7 +400,14 @@ fn realtime_entry_context(context: &str) -> bool {
 pub fn handle_input_event(app: &AppHandle, payload: &Value) -> bool {
     if let Some(session) = active_session() {
         if payload.get("boardDeviceId").and_then(Value::as_str) == Some(session.board_device_id.as_str()) {
-            if payload.get("action").and_then(Value::as_str) == Some(ACTION_ID) { request_stop(&session, "key"); }
+            let action = payload.get("action").and_then(Value::as_str).unwrap_or_default();
+            if action == ACTION_ID {
+                request_stop(&session, "key");
+            } else if action == "dsh_interrupt" {
+                // The device's configured DSH interrupt must reach the DSH task
+                // even while realtime chat owns every other physical key.
+                crate::handle_dsh_interrupt_action(app, payload);
+            }
             return true; // No Agent/session navigation or submission while realtime owns this board.
         }
     }
@@ -718,6 +731,65 @@ impl Player {
     }
 }
 
+/// Bounded recovery for one transient board audio write stall.
+///
+/// The diagnosed long-reply stall (docs/p4-usb-cdc-long-reply-diagnosis-2026-11-03.md)
+/// is a few-hundred-millisecond macOS tty write timeout while the board and the
+/// app stay alive. A late 100 ms chunk is already useless, so drop it and keep
+/// the reply going; permanent transport loss or a sustained stall still ends
+/// the session (fail closed). No unbounded retry lives here: each frame already
+/// has the transport layer's bounded 8 x 1.5 s recovery.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlaybackWriteRecovery {
+    consecutive_failures: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PlaybackWriteAction {
+    DropChunk,
+    Stop,
+}
+
+impl PlaybackWriteRecovery {
+    fn on_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn on_failure(&mut self, error: &str) -> PlaybackWriteAction {
+        if !playback_write_error_is_transient(error) {
+            return PlaybackWriteAction::Stop;
+        }
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures > AUDIO_WRITE_MAX_CONSECUTIVE_FAILURES {
+            PlaybackWriteAction::Stop
+        } else {
+            PlaybackWriteAction::DropChunk
+        }
+    }
+}
+
+/// Only queue/tty timeouts are worth a bounded drop. Broken pipe, an unplugged
+/// board, unknown IO errors and non-serial send failures all fail closed.
+fn playback_write_error_is_transient(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    let transient = ["timeout", "would_block", "interrupted"]
+        .iter()
+        .any(|marker| error.contains(marker));
+    let permanent = [
+        "broken_pipe",
+        "not_connected",
+        "permission_denied",
+        "write_zero",
+        "write_progress_unknown",
+        "io_error",
+        "not connected",
+        "connection lost",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker));
+    transient && !permanent
+}
+
 /// Dedicated thread: packs PCM into 100 ms `audio/play_chunk` frames and paces them so the board
 /// never holds more than ~1.2 s of audio ahead of real time.
 fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> Player {
@@ -742,7 +814,8 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
         let mut seq: u32 = 0;
         let mut begin_at: Option<Instant> = None;
         let mut sent_bytes: u64 = 0;
-        let flush_chunk = |usb: &UsbSerialManager, turn_id: &str, seq: &mut u32, chunk: &[u8], begin_at: &mut Option<Instant>, sent_bytes: &mut u64, expected: u64| {
+        let mut write_recovery = PlaybackWriteRecovery::default();
+        let flush_chunk = |usb: &UsbSerialManager, turn_id: &str, seq: &mut u32, chunk: &[u8], begin_at: &mut Option<Instant>, sent_bytes: &mut u64, expected: u64, recovery: &mut PlaybackWriteRecovery| {
             if chunk.is_empty() {
                 return;
             }
@@ -768,10 +841,27 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
             }
             if let Err(error) = result {
                 eprintln!("[realtime-chat] device audio transport write failed: {error}");
-                if let Ok(mut status) = session.status.lock() { status.error = "设备音频传输失败，请检查 USB 连接后重试".into(); }
-                request_stop(&session, "playback_write_failed");
-                return;
+                match recovery.on_failure(&error) {
+                    PlaybackWriteAction::DropChunk => {
+                        // Bounded recovery: this late chunk is already useless, so
+                        // drop it and resume the stream on the next one instead of
+                        // ending the reply. seq/sent_bytes stay put because the
+                        // dropped audio was never played.
+                        diagnostics::record(&session.id, "playback_write_gap", json!({
+                            "seq":*seq, "bytes":chunk.len(), "elapsedMs":elapsed_ms,
+                            "consecutive":recovery.consecutive_failures,
+                            "errorKind":diagnostics::error_kind(&error), "ok":false,
+                        }));
+                        return;
+                    }
+                    PlaybackWriteAction::Stop => {
+                        if let Ok(mut status) = session.status.lock() { status.error = "设备音频传输失败，请检查 USB 连接后重试".into(); }
+                        request_stop(&session, "playback_write_failed");
+                        return;
+                    }
+                }
             }
+            recovery.on_success();
             *seq += 1;
             *sent_bytes += chunk.len() as u64;
         };
@@ -780,6 +870,7 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
             if expected != epoch.load(Ordering::SeqCst) { continue; }
             if current_epoch != expected {
                 pending.clear(); begin_at = None; sent_bytes = 0;
+                write_recovery = PlaybackWriteRecovery::default();
                 send_board(&usb, &board, "audio/play_flush", json!({"sessionId":turn_id}));
                 current_epoch = expected;
             }
@@ -791,6 +882,7 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
                     seq = 0;
                     begin_at = None;
                     sent_bytes = 0;
+                    write_recovery = PlaybackWriteRecovery::default();
                     send_board(
                         &usb,
                         &board,
@@ -808,13 +900,13 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
                     pending.extend_from_slice(&bytes);
                     while pending.len() >= PLAY_CHUNK_BYTES {
                         let chunk: Vec<u8> = pending.drain(..PLAY_CHUNK_BYTES).collect();
-                        flush_chunk(&usb, &turn_id, &mut seq, &chunk, &mut begin_at, &mut sent_bytes, expected);
+                        flush_chunk(&usb, &turn_id, &mut seq, &chunk, &mut begin_at, &mut sent_bytes, expected, &mut write_recovery);
                         if session.cancelled.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != expected { pending.clear(); break; }
                     }
                 }
                 PlayerCmd::End(done) => {
                     let chunk = std::mem::take(&mut pending);
-                    flush_chunk(&usb, &turn_id, &mut seq, &chunk, &mut begin_at, &mut sent_bytes, expected);
+                    flush_chunk(&usb, &turn_id, &mut seq, &chunk, &mut begin_at, &mut sent_bytes, expected, &mut write_recovery);
                     if session.cancelled.load(Ordering::SeqCst) || epoch.load(Ordering::SeqCst) != expected { continue; }
                     send_board(&usb, &board, "audio/play_end", json!({ "sessionId": turn_id, "bytes": sent_bytes }));
                     if let Some(started) = begin_at {
@@ -848,6 +940,7 @@ fn spawn_player(usb: UsbSerialManager, board: String, session: Arc<Session>) -> 
                     send_board(&usb, &board, "audio/play_flush", json!({ "sessionId": turn_id }));
                     begin_at = None;
                     sent_bytes = 0;
+                    write_recovery = PlaybackWriteRecovery::default();
                 }
             }
         }
@@ -994,7 +1087,16 @@ async fn run_session(
             Err(error) => { finish(&app, &usb, &session, "config", &error).await; return; }
         }
         if recognizer.is_none() && !vad.in_speech && vad.speech_run==0 && pending_speech.is_none() && deferred_audio.is_empty() {
-            if let Some(message)=crate::desktop_agent::take_notification(&session.id,&board) {
+            let approval_pending = crate::dsh_approval::device_approval_pending();
+            let notification = if approval_pending {
+                // Terminal announcements wait for the modal, but the one-time
+                // waiting_user receipt is delivered so the user knows why the
+                // device stopped responding to spoken requests.
+                crate::desktop_agent::take_permission_notification(&session.id,&board)
+            } else {
+                crate::desktop_agent::take_notification(&session.id,&board)
+            };
+            if let Some(message)=notification {
                 diagnostics::record(&session.id,"desktop_receipt",json!({"stage":"playback_started", "chars":message.chars().count()}));
                 desktop_conversation.push("desktop_receipt", &message);
                 let notification_turn=format!("{}-desktop-{}",session.id,now_ms());
@@ -1018,7 +1120,11 @@ async fn run_session(
                 hud(&usb,&board,&session.id,"listening",&name,"");
                 continue;
             }
-            let progress=crate::desktop_agent::progress(&session.id,&board).unwrap_or_default();
+            let progress = if approval_pending {
+                "等待设备授权".to_string()
+            } else {
+                crate::desktop_agent::progress(&session.id,&board).unwrap_or_default()
+            };
             if progress!=desktop_progress {
                 hud(&usb,&board,&session.id,"listening",&name,&progress);
                 desktop_progress=progress;
@@ -1150,6 +1256,21 @@ async fn run_session(
                                 vad.reset();
                                 publish(&app, &session, |s| {s.state="listening".into(); s.transcript=text.clone();});
                                 hud(&usb, &board, &session.id, "listening", &name, "");
+                                continue;
+                            }
+                            if crate::dsh_approval::device_approval_pending() {
+                                // A device approval is modal and must be settled by
+                                // keys/native UI; a spoken "允许" is chat text and must
+                                // not reach the model or authorize anything.
+                                diagnostics::record(&session.id,"approval_gated",json!({
+                                    "turn":turns+1,
+                                    "chars":text.chars().count(),
+                                    "ok":false,
+                                }));
+                                publish(&app,&session,|s| {s.state="listening".into(); s.transcript=text.clone();});
+                                hud(&usb,&board,&session.id,"listening",&name,"等待设备授权");
+                                vad.reset();
+                                last_activity=Instant::now();
                                 continue;
                             }
                             turns += 1;
@@ -2283,6 +2404,150 @@ mod tests {
         for _ in 0..3 {assert_ne!(rx.recv().unwrap().0,epoch);}
         assert!(matches!(rx.recv().unwrap(),(1,PlayerCmd::Flush)));
         assert!(matches!(rx.recv().unwrap(),(1,PlayerCmd::Begin(id)) if id=="new"));
+    }
+
+    #[test]
+    fn transient_audio_write_stalls_are_dropped_within_a_bounded_budget() {
+        use super::*;
+        let mut recovery = PlaybackWriteRecovery::default();
+        for failure in 1..=AUDIO_WRITE_MAX_CONSECUTIVE_FAILURES {
+            assert_eq!(
+                recovery.on_failure("Live serial write failed: timeout after 704 bytes (3 retries)"),
+                PlaybackWriteAction::DropChunk,
+                "consecutive failure {failure} must stay recoverable",
+            );
+            assert_eq!(recovery.consecutive_failures, failure);
+        }
+        // A recovered write clears the budget: occasional stalls never end a reply.
+        recovery.on_success();
+        assert_eq!(recovery.on_failure("Live serial write failed: would_block after 0 bytes (0 retries)"),
+            PlaybackWriteAction::DropChunk);
+        // A sustained stall still fails closed instead of dropping audio forever.
+        for _ in 0..=AUDIO_WRITE_MAX_CONSECUTIVE_FAILURES {
+            recovery.on_failure("Live serial write failed: timeout after 0 bytes (8 retries)");
+        }
+        assert_eq!(recovery.on_failure("Live serial write failed: timeout after 0 bytes (8 retries)"),
+            PlaybackWriteAction::Stop);
+    }
+
+    #[test]
+    fn permanent_or_unknown_audio_write_errors_fail_closed() {
+        use super::*;
+        for error in [
+            "Live serial write failed: broken_pipe after 128 bytes (0 retries)",
+            "Live serial write failed: not_connected after 0 bytes (0 retries)",
+            "Live serial write failed: permission_denied after 0 bytes (0 retries)",
+            "Live serial write failed: write_zero after 0 bytes (0 retries)",
+            "Live serial write failed: write_progress_unknown after 64 bytes (0 retries)",
+            "Live serial write failed: io_error after 64 bytes (0 retries)",
+            "Connection lost",
+            "Not connected",
+            "设备音频传输失败",
+        ] {
+            let mut recovery = PlaybackWriteRecovery::default();
+            assert_eq!(recovery.on_failure(error), PlaybackWriteAction::Stop, "{error}");
+        }
+        // A transient marker must not override a permanent classification.
+        let mut recovery = PlaybackWriteRecovery::default();
+        assert_eq!(recovery.on_failure("write_progress_unknown timeout"), PlaybackWriteAction::Stop);
+    }
+
+    #[test]
+    fn late_tts_callback_after_flush_cannot_replay_the_previous_sentence() {
+        let (tx, rx) = std_mpsc::channel();
+        let player = Player { tx, epoch: Arc::new(AtomicU64::new(0)) };
+        // speak_one_logged() captures the epoch before synthesis starts, so a
+        // callback that arrives after a flush keeps the pre-flush epoch.
+        let synthesis_epoch = player.epoch();
+        player.send(PlayerCmd::Begin("old-turn".into())).unwrap();
+        player.send(PlayerCmd::Flush).unwrap();
+        player.send_at(synthesis_epoch, PlayerCmd::Subtitle("旧句子".into())).unwrap();
+        player.send_at(synthesis_epoch, PlayerCmd::Pcm(vec![7; PLAY_CHUNK_BYTES])).unwrap();
+        player.send(PlayerCmd::Begin("new-turn".into())).unwrap();
+        let current = player.epoch();
+        assert_eq!(current, synthesis_epoch + 1);
+        let mut stale = Vec::new();
+        let mut fresh = Vec::new();
+        while let Ok((epoch, cmd)) = rx.try_recv() {
+            if epoch == current { fresh.push(cmd); } else { stale.push((epoch, cmd)); }
+        }
+        // The player thread skips every command whose epoch is not current:
+        // the old sentence's late PCM/subtitle can never repaint the new bubble.
+        assert_eq!(stale.len(), 3);
+        assert!(stale.iter().all(|(epoch, _)| *epoch == synthesis_epoch));
+        assert_eq!(fresh.len(), 2);
+        assert!(matches!(fresh[0], PlayerCmd::Flush));
+        assert!(matches!(&fresh[1], PlayerCmd::Begin(id) if id == "new-turn"));
+    }
+
+    #[test]
+    fn reply_that_teaches_the_stop_word_does_not_self_interrupt_playback() {
+        tauri::async_runtime::block_on(async {
+            let (_tx, mut rx) = mpsc::channel(4);
+            let mut deferred = (0..PROCESSED_SPEECH_START_FRAMES)
+                .map(|_| Input::Pcm(frame(180), Some(true))).collect();
+            let mut vad = Vad::new();
+            let (session, _) = routing_session();
+            {
+                let mut status = session.status.lock().unwrap();
+                status.state = "speaking".into();
+                status.reply = "不想听的话，你可以说停来结束".into();
+            }
+            vad.session = Some(Arc::new(session));
+            let mut guards = Vec::new();
+            let completed = Arc::new(AtomicBool::new(false));
+            let flag = completed.clone();
+            let reply = async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            };
+            let result = verify_barge_in_with(reply, &mut rx, &mut deferred, &mut vad, true, |frames| {
+                let (mut probe, guard) = fake_barge_probe(frames, &[], true); guards.push(guard);
+                let (tx, events) = mpsc::unbounded_channel(); probe.events = events;
+                tx.send(StreamingSpeechEvent::Final { revision: 1, text: "停".into(), confidence: None }).unwrap();
+                Ok(probe)
+            }).await.unwrap();
+            assert!(result.is_none(), "an echoed stop word must not cancel the reply");
+            assert!(completed.load(Ordering::SeqCst), "the original reply must keep running");
+        });
+    }
+
+    #[test]
+    fn explicit_command_with_voice_evidence_interrupts_playback_immediately() {
+        tauri::async_runtime::block_on(async {
+            let (_tx, mut rx) = mpsc::channel(4);
+            let mut deferred = (0..PROCESSED_SPEECH_START_FRAMES)
+                .map(|_| Input::Pcm(frame(180), Some(true))).collect();
+            let mut vad = Vad::new();
+            let (session, _) = routing_session();
+            {
+                let mut status = session.status.lock().unwrap();
+                status.state = "speaking".into();
+                status.reply = "正在播放音乐".into();
+            }
+            vad.session = Some(Arc::new(session));
+            let mut guards = Vec::new();
+            let completed = Arc::new(AtomicBool::new(false));
+            let flag = completed.clone();
+            let reply = async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            };
+            let speech = timeout(Duration::from_secs(2), verify_barge_in_with(
+                reply, &mut rx, &mut deferred, &mut vad, true, |frames| {
+                    let (mut probe, guard) = fake_barge_probe(frames, &[], true); guards.push(guard);
+                    let (tx, events) = mpsc::unbounded_channel(); probe.events = events;
+                    // Partial transcript only: the command must not wait for a final.
+                    tx.send(StreamingSpeechEvent::Partial { revision: 1, text: "换歌".into(), confidence: None }).unwrap();
+                    Ok(probe)
+                })).await.expect("explicit command must confirm without a terminal transcript")
+                .unwrap().expect("explicit command must interrupt");
+            assert_eq!(speech.text, "换歌");
+            assert!(!speech.reply_completed);
+            assert!(!completed.load(Ordering::SeqCst), "confirming the command drops the old reply");
+        });
     }
 
     #[test]

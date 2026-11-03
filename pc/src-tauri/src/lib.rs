@@ -105,6 +105,7 @@ mod service_credentials;
 mod voice_draft;
 mod realtime_chat;
 mod desktop_agent;
+mod dsh_task;
 #[cfg(target_os = "macos")]
 mod realtime_audio_macos;
 mod reference_image;
@@ -135,7 +136,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{Emitter, Manager, RunEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 const DEVICE_AP_SSID: &str = "claw-pet";
 const DEVICE_AP_PASSWORD: &str = "88888888";
@@ -1241,8 +1242,89 @@ fn submit_dsh_voice_composer(session_id: &str) -> Result<(), String> {
     dsh_voice_post("/voice/submit", &serde_json::json!({ "sessionId": session_id }))
 }
 
-fn interrupt_dsh_session(session_id: &str) -> Result<(), String> {
-    dsh_voice_post("/interrupt", &serde_json::json!({ "sessionId": session_id }))
+fn interrupt_dsh_session(session_id: &str) -> Result<bool, String> {
+    crate::dsh_task::interrupt(session_id)
+}
+
+/// Handle one device `dsh_interrupt` action. Shared by the normal USB message
+/// path and realtime chat (which owns the board and would otherwise swallow
+/// the configured interrupt button). Returns true when the action was ours.
+pub(crate) fn handle_dsh_interrupt_action(emitter: &AppHandle, payload: &serde_json::Value) -> bool {
+    if payload.get("action").and_then(|value| value.as_str()) != Some("dsh_interrupt")
+        || payload.get("handledLocally").and_then(|value| value.as_bool()) == Some(true)
+    {
+        return false;
+    }
+    let board_device_id = payload
+        .get("boardDeviceId")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let (agent_id, session_id) = resolve_usb_inject_target(&board_device_id);
+    if agent_id != "deepseek-harness" {
+        let _ = emitter.emit(
+            "usb-input-action-result",
+            serde_json::json!({
+                "ok": false,
+                "pending": false,
+                "view": "dsh_interrupt",
+                "actionType": "dsh_interrupt",
+                "agentId": agent_id,
+                "sessionId": session_id,
+                "message": "打断 DSH 任务仅在跟随 DeepSeek Harness 时可用",
+            }),
+        );
+        return true;
+    }
+    let emitter = emitter.clone();
+    thread::spawn(move || {
+        match interrupt_dsh_session(&session_id) {
+            Ok(true) => {
+                let _ = emitter.emit(
+                    "usb-input-action-result",
+                    serde_json::json!({
+                        "ok": true,
+                        "pending": false,
+                        "view": "dsh_interrupt",
+                        "actionType": "dsh_interrupt",
+                        "agentId": "deepseek-harness",
+                        "sessionId": session_id,
+                        "message": "已发送打断请求",
+                    }),
+                );
+            }
+            Ok(false) => {
+                let _ = emitter.emit(
+                    "usb-input-action-result",
+                    serde_json::json!({
+                        "ok": false,
+                        "pending": false,
+                        "view": "dsh_interrupt",
+                        "actionType": "dsh_interrupt",
+                        "agentId": "deepseek-harness",
+                        "sessionId": session_id,
+                        "message": "DSH 没有正在执行的任务，未发送打断",
+                    }),
+                );
+            }
+            Err(error) => {
+                let _ = emitter.emit(
+                    "usb-input-action-result",
+                    serde_json::json!({
+                        "ok": false,
+                        "pending": false,
+                        "view": "dsh_interrupt",
+                        "actionType": "dsh_interrupt",
+                        "agentId": "deepseek-harness",
+                        "sessionId": session_id,
+                        "message": "打断 DSH 任务失败",
+                        "error": error,
+                    }),
+                );
+            }
+        }
+    });
+    true
 }
 
 fn submit_device_voice_via_agent_bus(context: Arc<DeviceVoiceContext>, text: String) {
@@ -2838,64 +2920,7 @@ fn handle_incoming_device_message(
         if realtime_chat::handle_input_event(emitter, &payload) {
             return;
         }
-        if payload.get("action").and_then(|value| value.as_str()) == Some("dsh_interrupt")
-            && payload
-                .get("handledLocally")
-                .and_then(|value| value.as_bool())
-                != Some(true)
-        {
-            let board_device_id = payload
-                .get("boardDeviceId")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let (agent_id, session_id) = resolve_usb_inject_target(&board_device_id);
-            if agent_id != "deepseek-harness" {
-                let _ = emitter.emit(
-                    "usb-input-action-result",
-                    serde_json::json!({
-                        "ok": false,
-                        "pending": false,
-                        "actionType": "dsh_interrupt",
-                        "agentId": agent_id,
-                        "sessionId": session_id,
-                        "message": "打断 DSH 任务仅在跟随 DeepSeek Harness 时可用",
-                    }),
-                );
-                return;
-            }
-            let emitter = emitter.clone();
-            thread::spawn(move || {
-                match interrupt_dsh_session(&session_id) {
-                    Ok(()) => {
-                        let _ = emitter.emit(
-                            "usb-input-action-result",
-                            serde_json::json!({
-                                "ok": true,
-                                "pending": false,
-                                "actionType": "dsh_interrupt",
-                                "agentId": "deepseek-harness",
-                                "sessionId": session_id,
-                                "message": "已发送打断请求",
-                            }),
-                        );
-                    }
-                    Err(error) => {
-                        let _ = emitter.emit(
-                            "usb-input-action-result",
-                            serde_json::json!({
-                                "ok": false,
-                                "pending": false,
-                                "actionType": "dsh_interrupt",
-                                "agentId": "deepseek-harness",
-                                "sessionId": session_id,
-                                "message": "打断 DSH 任务失败",
-                                "error": error,
-                            }),
-                        );
-                    }
-                }
-            });
+        if handle_dsh_interrupt_action(emitter, &payload) {
             return;
         }
         let Some(agent_input) = extract_usb_agent_input(&topic, &payload) else {
@@ -10316,21 +10341,88 @@ fn start_native_session_feed(usb_manager: usb_serial::UsbSerialManager) {
     });
 }
 
+/// P4 firmware ACKs `system/heartbeat` requestIds, which is what makes the
+/// bounded liveness probe meaningful. Legacy/other board runtimes keep the old
+/// write-only heartbeat so their compatibility path is unchanged.
+fn supports_liveness_probe(runtime: &str) -> bool {
+    runtime.eq_ignore_ascii_case("esp-p4")
+}
+
+/// macOS sleep stops the monotonic clock used by `Instant` while the wall clock
+/// keeps advancing. A large wall/monotonic difference therefore means the
+/// process just resumed from sleep and the USB link must be re-verified
+/// immediately instead of trusting the previous cadence.
+fn wake_gap_detected(wall_delta_ms: u64, monotonic_delta_ms: u64) -> bool {
+    wall_delta_ms > monotonic_delta_ms.saturating_add(10_000)
+}
+
 fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(2));
-        if !usb_manager.status().connected {
-            continue;
-        }
-        if let Err(error) = usb_manager.send(
-            "system/heartbeat",
-            &serde_json::json!({ "tsMs": current_timestamp_ms() }),
-        ) {
-            eprintln!("[usb-heartbeat] send failed, forcing reconnect: {}", error);
-            // A stale writer can keep status.connected=true after the board
-            // disappears. Dropping the connection lets start_usb_auto_connect
-            // probe and restore the port without a manual rescan.
-            usb_manager.disconnect();
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+    // Bounded liveness probe: after macOS sleep a stale tty can keep accepting
+    // writes, so the board must ACK the heartbeat. On timeout the connection is
+    // dropped and the existing auto-connect loop re-probes in the background.
+    const LIVENESS_ACK_TIMEOUT: Duration = Duration::from_secs(4);
+    thread::spawn(move || {
+        let mut last_wall = std::time::SystemTime::now();
+        let mut last_monotonic = Instant::now();
+        loop {
+            thread::sleep(HEARTBEAT_INTERVAL);
+            let wall_now = std::time::SystemTime::now();
+            let monotonic_now = Instant::now();
+            let wall_delta_ms = wall_now
+                .duration_since(last_wall)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let monotonic_delta_ms = monotonic_now
+                .duration_since(last_monotonic)
+                .as_millis() as u64;
+            last_wall = wall_now;
+            last_monotonic = monotonic_now;
+            let resumed_from_sleep = wake_gap_detected(wall_delta_ms, monotonic_delta_ms);
+            if resumed_from_sleep {
+                eprintln!(
+                    "[usb-liveness] wake gap detected (wall {} ms, monotonic {} ms), probing now",
+                    wall_delta_ms, monotonic_delta_ms
+                );
+            }
+            let status = usb_manager.status();
+            if !status.connected || status.board_device_id.is_empty() {
+                continue;
+            }
+            if !supports_liveness_probe(&status.runtime) {
+                // Compatibility: runtimes without heartbeat ACKs keep the
+                // previous bounded write-only heartbeat.
+                if let Err(error) = usb_manager.send(
+                    "system/heartbeat",
+                    &serde_json::json!({ "tsMs": current_timestamp_ms() }),
+                ) {
+                    eprintln!("[usb-heartbeat] send failed, forcing reconnect: {}", error);
+                    usb_manager.force_reconnect("heartbeat_write_failed");
+                }
+                continue;
+            }
+            // Bulk transfers deliberately pause the serial reader; their ACKs
+            // cannot arrive until that write path resumes, so skip the probe.
+            if usb_manager.transfer_in_progress() {
+                continue;
+            }
+            match usb_manager.probe_liveness(&status.board_device_id, LIVENESS_ACK_TIMEOUT) {
+                Ok(()) => {
+                    if resumed_from_sleep {
+                        eprintln!("[usb-liveness] connection survived wake");
+                    }
+                }
+                Err(error) => {
+                    // The writer can stay "connected" over a stale handle forever;
+                    // dropping the connection lets start_usb_auto_connect probe and
+                    // restore the port without a manual rescan or foregrounding.
+                    eprintln!(
+                        "[usb-liveness] heartbeat acknowledgement failed, forcing reconnect: {}",
+                        error
+                    );
+                    usb_manager.force_reconnect("liveness_failed");
+                }
+            }
         }
     });
 }
@@ -10839,6 +10931,10 @@ fn set_keep_awake_mode(block_sleep: bool) -> Result<(), String> {
 }
 
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    let _process_activity = realtime_audio_macos::ProcessActivity::begin(
+        "HachimoDock background USB transport",
+    );
     #[cfg(target_os = "macos")]
     restart_app_nap_guard(false);
     let usb_manager = usb_serial::UsbSerialManager::new();
@@ -14161,6 +14257,85 @@ mod tests {
         assert!(source.contains("fn start_usb_host_heartbeat("));
         assert!(source.contains("start_usb_host_heartbeat(usb_manager.clone())"));
         assert!(!state_forwarder.contains("system/heartbeat"));
+    }
+
+    #[test]
+    fn liveness_probe_only_runs_for_p4_runtime() {
+        assert!(supports_liveness_probe("esp-p4"));
+        assert!(supports_liveness_probe("ESP-P4"));
+        assert!(!supports_liveness_probe("linux"));
+        assert!(!supports_liveness_probe(""));
+    }
+
+    #[test]
+    fn wake_gap_detects_sleep_resume_without_clock_noise() {
+        // Normal heartbeat cadence: wall and monotonic clocks agree.
+        assert!(!wake_gap_detected(2_010, 2_000));
+        // Small wall-clock adjustments are ignored (no reconnect churn).
+        assert!(!wake_gap_detected(12_000, 2_000));
+        // macOS sleep: wall advanced hours while the monotonic clock advanced
+        // roughly one tick, so the heartbeat probes immediately after resume.
+        assert!(wake_gap_detected(4 * 60 * 60 * 1_000, 2_000));
+        assert!(wake_gap_detected(61_000, 2_000));
+    }
+
+    #[test]
+    fn usb_liveness_probe_forces_a_bounded_background_reconnect() {
+        let source = include_str!("lib.rs");
+        let heartbeat = &source[source
+            .find("fn start_usb_host_heartbeat(")
+            .expect("heartbeat")
+            ..source
+                .find("fn start_usb_state_forwarder(")
+                .expect("state forwarder")];
+        // Liveness is proven by a protocol ACK, not by write success: a stale
+        // tty after sleep keeps accepting writes. The probe is bounded and the
+        // existing auto-connect loop performs the re-probe.
+        assert!(heartbeat.contains("probe_liveness("));
+        assert!(heartbeat.contains("LIVENESS_ACK_TIMEOUT"));
+        assert!(heartbeat.contains("usb_manager.force_reconnect(\"liveness_failed\")"));
+        assert!(heartbeat.contains("wake_gap_detected("));
+        assert!(heartbeat.contains("thread::sleep(HEARTBEAT_INTERVAL)"));
+        // Bulk transfers pause the serial reader; their ACK cannot arrive until
+        // the write path resumes, so the probe must be skipped then.
+        assert!(heartbeat.contains("usb_manager.transfer_in_progress()"));
+        // P4 uses the ACK probe; other runtimes keep the bounded write-only
+        // heartbeat for compatibility.
+        assert!(heartbeat.contains("supports_liveness_probe(&status.runtime)"));
+        assert!(heartbeat.contains("heartbeat_write_failed"));
+        let usb = include_str!("usb_serial.rs");
+        let probe = &usb[usb
+            .find("pub(crate) fn probe_liveness(")
+            .expect("liveness probe")
+            ..usb
+                .find("pub(crate) fn media_request(")
+                .expect("media request")];
+        assert!(probe.contains("\"system/heartbeat\""));
+        assert!(probe.contains("protocol/ack"));
+        assert!(probe.contains("ack_timeout"));
+        assert!(probe.contains("\"liveness_probe_failed\""));
+        assert!(usb.contains("\"forced_reconnect\""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keep_awake_off_does_not_block_system_sleep() {
+        // OFF: only the user-activity assertion; ON: the existing blocking mode.
+        assert_eq!(caffeinate_flag(false), "-u");
+        assert_eq!(caffeinate_flag(true), "-imsu");
+        // The process-lifetime NSProcessInfo activity is separate from
+        // caffeinate and must never request PreventSystemSleep (idle system or
+        // display sleep disabled).
+        let source = include_str!("realtime_audio_macos.rs");
+        let options = source
+            .split("fn activity_options()")
+            .nth(1)
+            .expect("activity options");
+        let options_body = options.split('}').next().unwrap_or_default();
+        assert!(!options_body.contains("IdleSystemSleepDisabled"));
+        assert!(source.contains("pub(crate) struct ProcessActivity"));
+        let lib = include_str!("lib.rs");
+        assert!(lib.contains("realtime_audio_macos::ProcessActivity::begin("));
     }
 
     #[test]

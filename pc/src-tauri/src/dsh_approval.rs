@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -20,6 +21,25 @@ use crate::usb_serial::UsbSerialManager;
 
 const DEFAULT_BRIDGE_URL: &str = "http://127.0.0.1:17892";
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// True while a DSH approval is being mirrored to the device and no decision
+/// has settled yet. Realtime voice must not send utterances to the model (or
+/// dispatch tasks) during this window: a spoken "允许" is chat text, never a
+/// device approval.
+static DEVICE_APPROVAL_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the device is currently the terminal answerer for a DSH approval.
+pub fn device_approval_pending() -> bool {
+    DEVICE_APPROVAL_PENDING.load(Ordering::SeqCst)
+}
+
+fn set_device_approval_pending(value: bool) {
+    DEVICE_APPROVAL_PENDING.store(value, Ordering::SeqCst);
+}
+
+fn clear_device_approval_pending() {
+    set_device_approval_pending(false);
+}
 
 type DecisionSender = mpsc::Sender<String>;
 
@@ -213,6 +233,16 @@ fn wait_for_device_decision(
     if let Ok(mut pending) = pending_decisions().lock() {
         pending.insert(request_id.clone(), sender);
     }
+    // Set before the USB send so a concurrent realtime turn cannot slip a
+    // model request in between the prompt becoming visible and the flag.
+    set_device_approval_pending(true);
+    struct PendingGuard;
+    impl Drop for PendingGuard {
+        fn drop(&mut self) {
+            clear_device_approval_pending();
+        }
+    }
+    let _pending_guard = PendingGuard;
     if let Err(error) = usb.send("approval/request", &request) {
         eprintln!("[dsh-approval] usb approval/request failed: {error}");
         if let Ok(mut pending) = pending_decisions().lock() {
@@ -277,6 +307,9 @@ pub fn handle_device_decision(payload: &Value) -> bool {
         .and_then(|mut pending| pending.remove(&request_id));
     if let Some(sender) = sender {
         let normalized = if decision == "allow" { "allow" } else { "deny" };
+        // Resume realtime voice immediately; the guard in the waiting thread
+        // remains a second belt-and-braces clear.
+        clear_device_approval_pending();
         let _ = sender.send(normalized.to_string());
     } else {
         eprintln!("[dsh-approval] ignored stale decision {request_id}");
@@ -312,6 +345,7 @@ fn run_event_stream(usb: UsbSerialManager, base_url: String) -> Result<(), Strin
                         thread::spawn(move || wait_for_device_decision(usb, request, base_url));
                     }
                 } else if event == "approval-cancel" || event == "approval-expired" {
+                    clear_device_approval_pending();
                     if let Some(request_id) = payload.get("requestId").and_then(Value::as_str) {
                         let outcome = payload
                             .get("outcome")
@@ -434,6 +468,16 @@ mod tests {
         assert!(device_request_payload(&json!({"tool": "bash"})).is_none());
         assert!(parse_sse_block("session", "{\"type\":\"session\"}").is_some());
         assert!(parse_sse_block("approval", "not-json").is_none());
+    }
+
+    #[test]
+    fn device_approval_pending_flag_clears_on_every_terminal_path() {
+        clear_device_approval_pending();
+        assert!(!device_approval_pending());
+        set_device_approval_pending(true);
+        assert!(device_approval_pending());
+        clear_device_approval_pending();
+        assert!(!device_approval_pending());
     }
 
     #[test]

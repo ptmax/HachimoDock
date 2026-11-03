@@ -51,7 +51,7 @@ test('the bundle patch mounts the plugin row', () => {
 
 test('runtime modules only require Node built-ins and relative files', () => {
   const allowedNode = /^node:/
-  for (const file of ['index.js', 'server.js', 'dsh-bridge.js']) {
+  for (const file of ['index.js', 'server.js', 'dsh-bridge.js', 'tasks.js']) {
     const source = readFileSync(join(packageRoot, file), 'utf8')
     const matches = [...source.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((match) => match[1])
     for (const specifier of matches) {

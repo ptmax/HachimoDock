@@ -67,10 +67,14 @@ rejects any non-loopback peer.
 | `GET` | `/health` | Liveness and counts |
 | `GET` | `/sessions` | Live session summaries |
 | `POST` | `/inject` | Deliver a prompt; streams its activity as SSE |
+| `POST` | `/task` | Submit one tracked task to a live DSH agent |
+| `GET` | `/task?taskId=<id>` | Read one tracked task's state/result |
+| `POST` | `/interrupt` | Cancel the active turn of one live DSH agent |
 | `GET` | `/events?after=<seq>` | SSE feed of approvals and compact session events |
 | `POST` | `/approval/decision` | Apply a one-shot device decision |
 
-All JSON bodies are limited to 64 KB; malformed JSON answers `400
+All JSON bodies are limited to 64 KB except `/task`, whose UTF-8 text budget
+is 32 K characters within a 256 KB body; malformed JSON answers `400
 {"ok":false,"error":"invalid-json"}`.
 
 ### `GET /health`
@@ -122,6 +126,66 @@ data: {"code":"session-not-found|agent-not-live|inject-failed","message":"..."}
 sum of `usage.outputTokens` observed for the injected work, falling back to the
 number of mirrored text characters when the provider reports no usage. Invalid
 requests are rejected with `400` before the stream opens.
+
+### `POST /task`
+
+Submit one **tracked** task to a live DSH agent. This is the realtime-voice
+dispatch path: unlike `/inject`, it returns immediately and exposes a task
+record that the HachimoDock PC bridge can poll.
+
+```json
+{"taskId":"64b2c8d4-...","sessionId":"auto","text":"用户任务原文","origin":"realtime-voice","metadata":{"board":"p4-..."}}
+```
+
+```json
+{"ok":true,"taskId":"64b2c8d4-...","sessionId":"session-...","state":"accepted","queued":false,"acceptedAt":1790000000000,"duplicate":false}
+```
+
+- `accepted`: `agent.followup()` delivered to an idle agent (starts next turn).
+- Runtime failure on a `409`/`400`/`413` is definite and is **not** retried. If
+  the POST response is lost, the HachimoDock PC probes `GET /task` with the
+  same taskId once; a hit adopts that record, a miss reports unknown. Never
+  re-POST a taskId whose outcome is ambiguous.
+- `queued`: the agent was already running; the message is in its next-turn inbox.
+- `text` is limited to 32 K characters (UTF-8; `/task` has its own 256 KB body
+  cap because 32 K CJK characters exceed the generic 64 KB JSON limit).
+- Repeat with the same `taskId` and identical `text`/`sessionId` returns the
+  original record with `"duplicate":true` and does **not** followup again.
+  Reusing an id for a different request answers
+  `409 {"ok":false,"error":"duplicate-conflict"}`.
+- `sessionId: "auto"` (or omitted) selects the most recently active live
+  session. An explicit id must be live; a stale id fails with
+  `409 session-not-found` and never falls back to another session.
+- Other errors: `400 invalid-request`, `409 agent-not-live`,
+  `500 followup-failed`.
+- Only a live session is supported: this v0 plugin does not create or resume
+  sessions, and tasks are process-local (a plugin restart loses them).
+
+### `GET /task?taskId=<id>`
+
+```json
+{"ok":true,"task":{"taskId":"...","sessionId":"session-...","state":"working","queued":false,"turn":7,"reason":"","resultExcerpt":"","acceptedAt":1790000000000,"updatedAt":1790000000100}}
+```
+
+Task lifecycle:
+
+| State | Meaning |
+|---|---|
+| `accepted` | followup accepted; the next turn has not claimed it yet |
+| `queued` | DSH was running; waiting for the next turn |
+| `working` | `agent/inbox/claimed` bound the message to a turn |
+| `tool_running` | a tool call is active |
+| `waiting_user` | a DSH approval prompt is pending for the session |
+| `done` | `turn/end` with `reason.kind === "completed"` |
+| `stopped` | `aborted` / `interrupted` / `blocked` / `max-tokens` / `forked` |
+| `error` | `turn/end` with `reason.kind === "error"` |
+| `cancelled` | the queued message was discarded before running |
+
+`resultExcerpt` is the latest assistant text of the bound turn (bounded, no
+tool/reasoning blocks). Unknown or expired ids answer
+`404 {"ok":false,"error":"task-not-found"}`; the PC treats that as unknown and
+never re-dispatches. In-memory tasks are bounded to 128 records and retained
+15 minutes after their terminal state.
 
 ### `GET /events?after=<seq>`
 
@@ -330,7 +394,7 @@ headless/acp profile the bridge's answerer is the only approval channel; keep
 
 ```bash
 cd integrations/dsh-hachimodock
-node --test            # 51 tests, no DSH process and no profile changes
+node --test            # 73 tests, no DSH process and no profile changes
 
 # or mount a bridge with fake services (useful when wiring the PC adapter):
 node -e "
@@ -343,11 +407,12 @@ curl -s http://127.0.0.1:17892/health
 
 ## Verified vs. unverified
 
-Verified in this checkout (Node 26, `node --test`, 51 tests):
+Verified in this checkout (Node 26, `node --test`, 73 tests):
 
 - HTTP contract: health, sessions, inject SSE (`token`/`tool`/`done`/`error`),
-  events SSE with `after` replay, decision `200`/`409`, body limit, loopback
-  binding, routing errors.
+  tracked task accept/status/idempotency (`accepted`/`queued`/`done`/`stopped`/
+  `cancelled`/`waiting_user`), events SSE with `after` replay, decision
+  `200`/`409`, body limit, loopback binding, routing errors.
 - DSH boundary with fake services: answerer mapping (`allowed-once`,
   `rejected`, timeout/abort/no-bridge `unavailable`), `/events` forwarding of
   turn/tool/title/approval audit events, session summaries, prompt injection
@@ -372,23 +437,28 @@ test, and are the top integration risks:
    bridge promptly answers `unavailable` on abort, but the service's race may
    make the final audited outcome `cancelled` instead; confirm the audit
    events and UI wording.
-3. **`agent.whenIdle()` under queued work.** The bridge calls `followup()`
+3. **Tracked-task turn correlation.** `agent/inbox/claimed` binds a submitted
+   message id to the turn that consumes it; `turn/end` then closes only that
+   task. Verify the event and message-id retention on a live profile. Without
+   it the PC reports accepted/queued plus the normal Session card, and never
+   announces a guessed completion.
+4. **`agent.whenIdle()` under queued work.** The bridge calls `followup()`
    then awaits `whenIdle()` so `done` reflects the whole delivered turn.
    Confirm on a live loop that a queued prompt and its follow-up turn settle
    as expected (and that an idle agent does not emit a stale `done`).
-4. **Session/event names and stream chunks.** `turn/start`, `turn/end`,
+5. **Session/event names and stream chunks.** `turn/start`, `turn/end`,
    `tool/call`, `tool/result`, `assistant/message`, `session/title`,
    `approval/asked`, `approval/decided`, and `agent/assistant-stream` chunks
    (`{type:"text-delta", text}`) were read from the shipped
    `dsh-session`/`dsh-agent-loop` builds; validate they arrive as expected on a
    live turn, and that `usage.outputTokens` is populated by the configured
    provider (the bridge falls back to character count).
-5. **Title projection availability.** `ctx.get('sessionTitle')` /
+6. **Title projection availability.** `ctx.get('sessionTitle')` /
    `ctx.get('sessionProjections')` are optional; if the profile does not mount
    them, a session shows `title: null` until its next title event.
-6. **Cold sessions.** Only `ctx.sessions.list()` (live sessions) is used; a
+7. **Cold sessions.** Only `ctx.sessions.list()` (live sessions) is used; a
    session that is not resident is not listed or injectable.
-7. **CJS loading in the real Loader.** Simulated with Node's `import()` +
+8. **CJS loading in the real Loader.** Simulated with Node's `import()` +
    `unwrapExports`; confirm the profile row imports `@hachimodock/dsh-bridge`
    and reports the correct plugin name in Loader diagnostics.
 

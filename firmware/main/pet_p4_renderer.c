@@ -1439,6 +1439,56 @@ static void draw_home_white_panel(int x, int y, int w, int h, int radius, uint16
   blend_round_rect(x + 2, y + 2, w - 4, h - 4, radius - 2, 255, 255, 255, alpha);
 }
 
+static void rgb565_components(uint16_t color, uint8_t *r, uint8_t *g, uint8_t *b) {
+  if (r) *r = (uint8_t) (((color >> 11) & 0x1F) * 255U / 31U);
+  if (g) *g = (uint8_t) (((color >> 5) & 0x3F) * 255U / 63U);
+  if (b) *b = (uint8_t) ((color & 0x1F) * 255U / 31U);
+}
+
+/* Selected cards (Agent session and realtime conversation) share one geometry
+ * and one opacity path; only the palette differs. Keeping the panel here makes
+ * the App bubble-opacity setting apply to every selected card. The caller
+ * draws text after this panel, so text stays fully opaque while the surface
+ * fades together with the idle "休息中" bubble. */
+static void draw_selected_card_panel(
+  int x,
+  int y,
+  int w,
+  int h,
+  int radius,
+  uint16_t selection,
+  uint16_t halo,
+  uint16_t surface
+) {
+  if (g_bubble_opacity_percent >= 100) {
+    fill_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, halo);
+    fill_round_rect(x + 2, y + 5, w, h, radius, rgb565(46, 50, 48));
+    fill_round_rect(x, y, w, h, radius, selection);
+    fill_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, surface);
+    return;
+  }
+  const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
+  uint8_t selection_r, selection_g, selection_b;
+  uint8_t surface_r, surface_g, surface_b;
+  rgb565_components(selection, &selection_r, &selection_g, &selection_b);
+  rgb565_components(surface, &surface_r, &surface_g, &surface_b);
+  if (ppa_blend_card_surface(x + 4, y + 4, w - 8, h - 8, radius - 4,
+      surface_r, surface_g, surface_b, alpha)) {
+    /* Draw the selection outline as opaque strokes; the large surface is PPA. */
+    fill_round_rect(x - 2, y - 2, w + 4, 2, 1, selection);
+    fill_round_rect(x - 2, y + h, w + 4, 2, 1, selection);
+    fill_round_rect(x - 2, y - 2, 2, h + 4, 1, selection);
+    fill_round_rect(x + w, y - 2, 2, h + 4, 1, selection);
+    return;
+  }
+  uint8_t halo_r, halo_g, halo_b;
+  rgb565_components(halo, &halo_r, &halo_g, &halo_b);
+  blend_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, halo_r, halo_g, halo_b, alpha);
+  blend_round_rect(x + 2, y + 5, w, h, radius, 46, 50, 48, alpha);
+  blend_round_rect(x, y, w, h, radius, selection_r, selection_g, selection_b, alpha);
+  blend_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, surface_r, surface_g, surface_b, alpha);
+}
+
 static void draw_session_card_panel(
   int x,
   int y,
@@ -1452,29 +1502,8 @@ static void draw_session_card_panel(
     draw_home_white_panel(x, y, w, h, radius, outline);
     return;
   }
-
-  uint16_t selection = rgb565(25, 151, 99);
-  uint16_t selected_surface = rgb565(237, 249, 242);
-  if (g_bubble_opacity_percent >= 100) {
-    fill_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, rgb565(173, 220, 193));
-    fill_round_rect(x + 2, y + 5, w, h, radius, rgb565(46, 50, 48));
-    fill_round_rect(x, y, w, h, radius, selection);
-    fill_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, selected_surface);
-    return;
-  }
-  const uint8_t alpha = (uint8_t) (255U * g_bubble_opacity_percent / 100U);
-  if (ppa_blend_card_surface(x + 4, y + 4, w - 8, h - 8, radius - 4, 237, 249, 242, alpha)) {
-    /* Draw the selection outline as opaque strokes; the large surface is PPA. */
-    fill_round_rect(x - 2, y - 2, w + 4, 2, 1, selection);
-    fill_round_rect(x - 2, y + h, w + 4, 2, 1, selection);
-    fill_round_rect(x - 2, y - 2, 2, h + 4, 1, selection);
-    fill_round_rect(x + w, y - 2, 2, h + 4, 1, selection);
-    return;
-  }
-  blend_round_rect(x - 2, y - 2, w + 4, h + 4, radius + 2, 173, 220, 193, alpha);
-  blend_round_rect(x + 2, y + 5, w, h, radius, 46, 50, 48, alpha);
-  blend_round_rect(x, y, w, h, radius, 25, 151, 99, alpha);
-  blend_round_rect(x + 4, y + 4, w - 8, h - 8, radius - 4, 237, 249, 242, alpha);
+  draw_selected_card_panel(x, y, w, h, radius,
+    rgb565(25, 151, 99), rgb565(173, 220, 193), rgb565(237, 249, 242));
 }
 
 static void draw_card_body_lines(
@@ -2541,13 +2570,14 @@ static void draw_bubble(const pet_p4_runtime_state_t *state,
     bool realtime = view && view->realtime_conversation;
     uint16_t selection = realtime ? rgb565(42, 119, 225) : rgb565(25, 151, 99);
     pet_p4_view_status_t status = view ? view->status : PET_P4_VIEW_STATUS_IDLE;
-    if (!realtime) draw_session_card_panel(x, y, w, h, PET_P4_SESSION_CARD_RADIUS, true, selection);
-    if (realtime) {
-      // Same card geometry, surface and shadow; replace only the selected outline.
-      fill_round_rect(x - 2, y - 2, w + 4, h + 4, PET_P4_SESSION_CARD_RADIUS + 2, rgb565(170, 205, 250));
-      fill_round_rect(x + 2, y + 5, w, h, PET_P4_SESSION_CARD_RADIUS, rgb565(46, 50, 48));
-      fill_round_rect(x, y, w, h, PET_P4_SESSION_CARD_RADIUS, selection);
-      fill_round_rect(x + 4, y + 4, w - 8, h - 8, PET_P4_SESSION_CARD_RADIUS - 4, rgb565(237, 249, 242));
+    if (!realtime) {
+      draw_session_card_panel(x, y, w, h, PET_P4_SESSION_CARD_RADIUS, true, selection);
+    } else {
+      // Same card geometry, surface and shadow; only the selected palette and
+      // outline differ. Use the shared panel so the App bubble-opacity setting
+      // dims the realtime conversation card exactly like an Agent session card.
+      draw_selected_card_panel(x, y, w, h, PET_P4_SESSION_CARD_RADIUS,
+        selection, rgb565(170, 205, 250), rgb565(237, 249, 242));
     }
     fill_round_rect(x + 10, y + 14, 7, h - 28, 2, selection);
     if (!(text.pixels && pet_bubble_pixels_draw(PET_BUBBLE_TITLE, title, 0, g_framebuffer,
@@ -3261,8 +3291,6 @@ static void draw_session_queue(
   const pet_p4_runtime_state_t *state,
   unsigned long long now_ms
 ) {
-  g_bubble_opacity_percent = state && state->bubble_opacity
-    ? state->bubble_opacity : 100;
   if (!state || state->session_queue_count == 0) {
     g_session_overlay_cache_valid = false;
     return;
@@ -5497,6 +5525,12 @@ esp_err_t pet_p4_renderer_render(
   unsigned long long now_ms
 ) {
   ESP_RETURN_ON_ERROR(pet_p4_renderer_init(), TAG, "allocate render buffers");
+  /* The App persists one bubble-opacity value for the idle "休息中" bubble, the
+   * Agent session cards and the realtime conversation card. Sync it before any
+   * panel is drawn: realtime rendering never reaches draw_session_queue(), so
+   * syncing there left the active conversation card permanently opaque. */
+  g_bubble_opacity_percent = state && state->bubble_opacity
+    ? state->bubble_opacity : 100;
   const uint16_t *previous_native = g_native_framebuffer;
   const bool previous_valid = g_last_native_valid;
   g_last_native_valid = false; /* rotation/draw failures must force a refresh */

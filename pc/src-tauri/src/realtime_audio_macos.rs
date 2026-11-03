@@ -1,12 +1,13 @@
-//! Session-scoped App Nap protection for the dedicated USB audio player.
-//! Create this on the player thread, never on the UI or a shared async worker.
+//! App Nap protection for background USB work and for the dedicated audio player.
+//! The audio activity is created on the player thread, never on the UI or a
+//! shared async worker; the process activity is created once in `run()` and
+//! lives for the app lifetime.
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSActivityOptions, NSObjectProtocol, NSProcessInfo, NSString};
 use std::{marker::PhantomData, rc::Rc};
 
 pub(crate) struct AudioActivity {
-    process: Retained<NSProcessInfo>,
-    token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    activity: ProcessActivity,
     pub(crate) qos_error: i32,
     // The QoS setting belongs to this dedicated thread, which exits with the
     // player. Prevent moving this guard to another thread or an async task.
@@ -24,27 +25,58 @@ impl AudioActivity {
                 libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0,
             )
         };
-        let process = NSProcessInfo::processInfo();
-        let token = process.beginActivityWithOptions_reason(
-            activity_options(),
-            &NSString::from_str("Realtime conversation USB audio"),
-        );
-        Self { process, token, qos_error, _thread_bound: PhantomData }
+        Self {
+            activity: ProcessActivity::begin("Realtime conversation USB audio"),
+            qos_error,
+            _thread_bound: PhantomData,
+        }
     }
 }
 
-fn activity_options() -> NSActivityOptions {
-    // Do not keep the screen awake or block user/system sleep. Protection ends
-    // on player channel close, cancellation, errors and panic unwinding.
-    NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | NSActivityOptions::LatencyCritical
+/// Process-lifetime activity for background USB work (auto-connect, heartbeat
+/// liveness probes, port recovery). It uses the same options as the audio
+/// activity: user-initiated scheduling plus latency-critical handling while
+/// idle/lid system sleep stays allowed. It never sets PreventSystemSleep, so
+/// the keep-awake switch keeps its meaning.
+pub(crate) struct ProcessActivity {
+    process: Retained<NSProcessInfo>,
+    token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
 }
 
-impl Drop for AudioActivity {
+impl ProcessActivity {
+    pub(crate) fn begin(reason: &str) -> Self {
+        let (process, token) = begin_activity(reason);
+        Self { process, token }
+    }
+}
+
+impl Drop for ProcessActivity {
     fn drop(&mut self) {
         // SAFETY: token was returned by beginActivity on this process and has
         // exactly one owner/end call. Retained releases it after endActivity.
         unsafe { self.process.endActivity(&self.token); }
     }
+}
+
+fn begin_activity(
+    reason: &str,
+) -> (
+    Retained<NSProcessInfo>,
+    Retained<ProtocolObject<dyn NSObjectProtocol>>,
+) {
+    let process = NSProcessInfo::processInfo();
+    let token = process.beginActivityWithOptions_reason(
+        activity_options(),
+        &NSString::from_str(reason),
+    );
+    (process, token)
+}
+
+fn activity_options() -> NSActivityOptions {
+    // Do not keep the screen awake or block user/system sleep. The audio guard
+    // ends on player channel close/cancellation; the process guard ends with the
+    // app. Neither requests PreventSystemSleep.
+    NSActivityOptions::UserInitiatedAllowingIdleSystemSleep | NSActivityOptions::LatencyCritical
 }
 
 #[cfg(test)]
@@ -56,6 +88,23 @@ mod tests {
         let options = activity_options();
         assert!(options.contains(NSActivityOptions::LatencyCritical));
         assert!(!options.intersects(NSActivityOptions::IdleDisplaySleepDisabled | NSActivityOptions::IdleSystemSleepDisabled));
+    }
+
+    #[test]
+    fn process_activity_never_prevents_system_sleep() {
+        let options = activity_options();
+        assert!(!options.intersects(
+            NSActivityOptions::IdleSystemSleepDisabled
+                | NSActivityOptions::IdleDisplaySleepDisabled
+        ));
+        // Creating and dropping the guard must work off the main thread too:
+        // it is held for the whole app lifetime, not tied to UI or audio work.
+        std::thread::spawn(|| {
+            let activity = ProcessActivity::begin("HachimoDock background USB test");
+            drop(activity);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

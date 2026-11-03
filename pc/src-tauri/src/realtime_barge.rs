@@ -39,23 +39,29 @@ impl Confirmation {
         voiced_frames: usize, phase: &str, reply: &str, previous_user: &str) -> bool {
         let text = normalized(text);
         if confidence.is_some_and(|c| !c.is_finite() || c < 0.6) { return false; }
-        if text == "停" { return true; }
-        if text.chars().count() < 2 { return false; }
+        let speaking = phase == "speaking";
+        // "停" is the one-character emergency stop only while nothing is being
+        // played back. During playback the reply itself often teaches
+        // "你可以说停来结束"; letting that single character bypass every gate
+        // made the speaker cut itself off. It therefore goes through the same
+        // echo and voice-evidence gates as every other explicit command.
+        if !speaking && text == "停" { return true; }
+        if text.chars().count() < 2 && !(speaking && explicit_barge_command(&text)) { return false; }
         let ms = elapsed.as_millis();
         let previous_user = normalized(previous_user);
         if !previous_user.is_empty() && previous_user.ends_with(&text) { return false; }
         // ASR alone is not a speaker detector: reject recognized playback echo.
         // Two-character residual echo is still echo. The previous >=3 guard
         // let a final "你好" from the speaker satisfy the two-character user
-        // gate and cancel playback. Explicit "停" was handled above; unrelated
-        // short commands and speech outside playback remain eligible.
-        if phase == "speaking" {
+        // gate and cancel playback. Explicit commands are also checked: a
+        // transcript that merely repeats the reply is not user intent, and
+        // unrelated short commands and speech outside playback remain eligible.
+        if speaking {
             if echo_like(&text, reply) { return false; }
             // Short ASR fragments during playback are frequently noise or echo.
-            // Explicit transport commands should act without waiting for a
-            // terminal/stable transcript.
+            // Explicit transport commands act as soon as there is enough voice
+            // evidence; they never wait for a terminal/stable transcript.
             if explicit_barge_command(&text) { return voiced_frames >= 8; }
-            if text.chars().count() < 2 { return false; }
         }
         if self.previous.is_empty() || !text.starts_with(&self.previous) {
             self.first_ms = Some(ms); self.revisions = 1;
@@ -124,7 +130,66 @@ mod tests {
         assert!(c.accept("等一下",false,None,Duration::from_millis(100),8,"speaking","现在正在检查双向实时对话",""));
         assert!(c.accept("等一下",true,None,Duration::from_millis(700),20,"speaking","现在正在检查双向实时对话",""));
         assert!(c.accept("请帮我换一首歌",true,None,Duration::from_millis(1800),20,"speaking","现在正在检查双向实时对话",""));
-        assert!(c.accept("停",true,None,Duration::from_millis(200),8,"speaking","你可以说停来结束",""));
+        // The reply above teaches the stop word. A transcript that only repeats
+        // it is playback echo, not user intent; cancelling here was the exact
+        // self-interrupt this gate exists to prevent.
+        assert!(!c.accept("停",true,None,Duration::from_millis(200),8,"speaking","你可以说停来结束",""));
         assert!(c.accept("你好",true,None,Duration::from_millis(900),12,"thinking","你好",""));
+    }
+
+    #[test]
+    fn explicit_interrupt_commands_need_eight_voiced_frames_but_no_terminal_transcript() {
+        for command in ["停", "停止", "等一下", "等等", "先别", "暂停", "换歌", "下一首", "取消"] {
+            let mut c = Confirmation::default();
+            // A partial transcript is enough: no terminal marker, revision count
+            // or stability wait is required for an explicit transport command.
+            assert!(c.accept(command, false, None, Duration::from_millis(60), 8, "speaking", "正在播放音乐", ""), "{command}");
+            // Voice evidence is the only gate; seven frames must not interrupt.
+            let mut c = Confirmation::default();
+            assert!(!c.accept(command, false, None, Duration::from_millis(60), 7, "speaking", "正在播放音乐", ""), "{command}");
+            let mut c = Confirmation::default();
+            assert!(!c.accept(command, true, None, Duration::from_millis(60), 7, "speaking", "正在播放音乐", ""), "{command}");
+        }
+    }
+
+    #[test]
+    fn exact_and_bigram_playback_echo_never_self_interrupts() {
+        for (text, reply) in [
+            // Exact echo, including the stop word every prompt teaches.
+            ("停", "不想听的话，你可以说停来结束"),
+            ("停止", "如果不想听，说停止就可以"),
+            ("取消", "已经取消了这个操作"),
+            // Near-miss ASR output: two of three bigrams overlap with the reply.
+            ("小米股涨", "今天小米股价上涨了"),
+        ] {
+            for terminal in [false, true] {
+                let mut c = Confirmation::default();
+                assert!(!c.accept(text, terminal, None, Duration::from_millis(900), 24, "speaking", reply, ""), "{text}/{reply}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_speech_still_needs_two_characters_during_playback() {
+        // One character is not a phrase; "停" remains the explicit single-char
+        // command handled by the command gate above.
+        for text in ["嗯", "好", "啊"] {
+            let mut c = Confirmation::default();
+            assert!(!c.accept(text, true, None, Duration::from_millis(900), 40, "speaking", "正在播放音乐", ""), "{text}");
+        }
+        // Two characters reach the ordinary confirmation path: a terminal
+        // transcript still needs 8 voiced frames.
+        let mut c = Confirmation::default();
+        assert!(c.accept("好呀", true, None, Duration::from_millis(900), 8, "speaking", "正在播放音乐", ""));
+        let mut c = Confirmation::default();
+        assert!(!c.accept("好呀", true, None, Duration::from_millis(900), 7, "speaking", "正在播放音乐", ""));
+    }
+
+    #[test]
+    fn previous_utterance_tail_cannot_become_an_explicit_command() {
+        // A candidate still inside the previous-utterance window is protection
+        // for a delayed cloud transcript, not fresh user speech.
+        let mut c = Confirmation::default();
+        assert!(!c.accept("等一下", true, None, Duration::from_millis(100), 20, "speaking", "正在播放音乐", "请你等一下"));
     }
 }
