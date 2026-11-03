@@ -10794,26 +10794,53 @@ fn start_usb_auto_connect(usb_manager: usb_serial::UsbSerialManager, app_handle:
 }
 
 #[cfg(target_os = "macos")]
-fn prevent_app_nap() {
-    // macOS App Nap can throttle the USB audio writer when the window is
-    // occluded. Assert user activity only; do not prevent idle/system sleep,
-    // otherwise closing the lid leaves the Mac partially awake.
+static APP_NAP_GUARD: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn caffeinate_flag(block_sleep: bool) -> &'static str {
+    if block_sleep { "-imsu" } else { "-u" }
+}
+
+#[cfg(target_os = "macos")]
+fn restart_app_nap_guard(block_sleep: bool) {
+    let mut guard = match APP_NAP_GUARD.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     let pid = std::process::id().to_string();
+    let flag = caffeinate_flag(block_sleep);
     match std::process::Command::new("/usr/bin/caffeinate")
-        .args(["-u", "-w", &pid])
+        .args([flag, "-w", &pid])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(_) => eprintln!("[app-nap] caffeinate assertion started for pid {pid}"),
+        Ok(child) => {
+            *guard = Some(child);
+            eprintln!("[app-nap] caffeinate {flag} started for pid {pid}");
+        }
         Err(error) => eprintln!("[app-nap] failed to start caffeinate: {error}"),
     }
 }
 
+#[tauri::command]
+fn set_keep_awake_mode(block_sleep: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    restart_app_nap_guard(block_sleep);
+    #[cfg(not(target_os = "macos"))]
+    let _ = block_sleep;
+    Ok(())
+}
+
 pub fn run() {
     #[cfg(target_os = "macos")]
-    prevent_app_nap();
+    restart_app_nap_guard(false);
     let usb_manager = usb_serial::UsbSerialManager::new();
     if !cfg!(feature = "composer-diagnostic") {
     if let Err(error) = sync_usb_desktop_device_id(&usb_manager) {
@@ -10958,6 +10985,7 @@ pub fn run() {
         .manage(usb_manager)
         .manage(wifi_transport::WifiTransport::new())
         .invoke_handler(tauri::generate_handler![
+            set_keep_awake_mode,
             reference_image::reference_image_mount,
             reference_image::reference_image_action,
             desktop_window::set_exit_reasons,

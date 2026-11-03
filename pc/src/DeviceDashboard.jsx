@@ -60,6 +60,10 @@ import {
   loadBubbleOpacity,
   saveBubbleOpacity,
 } from "./lib/bubble-opacity.js";
+import {
+  loadKeepAwake,
+  saveKeepAwake,
+} from "./lib/keep-awake.js";
 import ChannelMatrixCard from "./dashboard/ChannelMatrixCard.jsx";
 import BoardButtonPanel from "./dashboard/BoardButtonPanel.jsx";
 import VoiceAssistantPanel, { buildVoiceSummary, formatVoiceSessionOption } from "./dashboard/VoiceAssistantPanel.jsx";
@@ -810,6 +814,15 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
   const updateBubbleOpacity = useCallback((value) => {
     setBubbleOpacity(saveBubbleOpacity(value));
   }, []);
+  const [keepAwake, setKeepAwake] = useState(loadKeepAwake);
+  const toggleKeepAwake = useCallback(() => {
+    setKeepAwake((current) => saveKeepAwake(!current));
+  }, []);
+  useEffect(() => {
+    invoke("set_keep_awake_mode", { blockSleep: keepAwake }).catch((error) => {
+      console.warn("Failed to update keep-awake mode", error);
+    });
+  }, [keepAwake]);
   useEffect(() => {
     if (!usb.connected) return undefined;
     // Sliders fire continuously while dragging. Coalesce them so the USB
@@ -1560,6 +1573,8 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
           onUpdateDeviceControl={updateDeviceControl}
           bubbleOpacity={bubbleOpacity}
           onUpdateBubbleOpacity={updateBubbleOpacity}
+          keepAwake={keepAwake}
+          onToggleKeepAwake={toggleKeepAwake}
           onUpdateFirmware={usb.connected && usb.runtime === P4_RUNTIME_ID
             ? () => {
               setFirmwareTargetBoardDeviceId(usb.boardDeviceId || "");
