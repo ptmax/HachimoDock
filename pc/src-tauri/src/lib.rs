@@ -10796,10 +10796,11 @@ fn start_usb_auto_connect(usb_manager: usb_serial::UsbSerialManager, app_handle:
 #[cfg(target_os = "macos")]
 fn prevent_app_nap() {
     // macOS App Nap can throttle the USB audio writer when the window is
-    // occluded. Keep a user-activity/idle assertion for this process only.
+    // occluded. Assert user activity only; do not prevent idle/system sleep,
+    // otherwise closing the lid leaves the Mac partially awake.
     let pid = std::process::id().to_string();
     match std::process::Command::new("/usr/bin/caffeinate")
-        .args(["-imsu", "-w", &pid])
+        .args(["-u", "-w", &pid])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
