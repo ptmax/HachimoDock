@@ -45,7 +45,7 @@ fn metadata(details: Value) -> Value {
     for key in ["hits","prepared"]{
         if let Some(v)=details.get(key).and_then(Value::as_u64).filter(|v|*v<=10000){out.insert(key.into(),json!(v));}
     }
-    for key in ["bytes", "writtenBytes", "retries", "osError", "frames", "turn", "chars", "elapsedMs", "bufferedMs", "positionMs", "generation", "uptimeMs", "seq", "ok", "count", "steps", "hintFrames", "rejectedFrames", "peakRms", "replyFrames", "argIndex", "expectedArgs", "actualArgs", "dspFrames", "dspLastUs", "dspMaxUs", "dspAecUs", "dspNsUs", "dspVadUs", "aecReferenceSamples", "internalFreeBytes", "internalLargestBytes", "captureTxLastUs", "captureTxMaxUs", "captureStackMinBytes"] {
+    for key in ["bytes", "writtenBytes", "retries", "osError", "frames", "turn", "chars", "elapsedMs", "bufferedMs", "positionMs", "generation", "uptimeMs", "seq", "ok", "count", "steps", "hintFrames", "rejectedFrames", "voicedFrames", "periodicFrames", "peakRms", "replyFrames", "argIndex", "expectedArgs", "actualArgs", "dspFrames", "dspLastUs", "dspMaxUs", "dspAecUs", "dspNsUs", "dspVadUs", "aecReferenceSamples", "internalFreeBytes", "internalLargestBytes", "captureTxLastUs", "captureTxMaxUs", "captureStackMinBytes"] {
         if let Some(v) = details.get(key).filter(|v| v.is_number() || v.is_boolean()) { out.insert(key.into(), v.clone()); }
     }
     for key in ["state", "reason", "errorKind", "stage"] {
@@ -150,8 +150,10 @@ mod tests {
     #[test]
     fn vad_diagnostics_allow_counts_but_never_audio_or_transcripts() {
         let safe = metadata(json!({"frames":250,"hintFrames":20,"rejectedFrames":8,"replyFrames":120,
-            "peakRms":160,"pcm":"private audio","transcript":"private words","peakRmsText":"secret"}));
-        assert_eq!(safe, json!({"frames":250,"hintFrames":20,"rejectedFrames":8,"replyFrames":120,"peakRms":160}));
+            "voicedFrames":12,"periodicFrames":11,"peakRms":160,
+            "pcm":"private audio","transcript":"private words","peakRmsText":"secret"}));
+        assert_eq!(safe, json!({"frames":250,"hintFrames":20,"rejectedFrames":8,"replyFrames":120,
+            "voicedFrames":12,"periodicFrames":11,"peakRms":160}));
     }
     #[test]
     fn logs_are_bounded_private_metadata_only() {

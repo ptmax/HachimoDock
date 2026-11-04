@@ -1,4 +1,5 @@
-//! Text evidence for speculative ASR. No transcript or PCM is persisted.
+//! Text evidence for speculative ASR plus the bounded no-transcript short-command fallback.
+//! No transcript or PCM is persisted.
 use std::time::Duration;
 use std::collections::HashSet;
 pub fn protect_previous_tail(candidate_age: Option<Duration>) -> bool {
@@ -32,6 +33,73 @@ fn explicit_barge_command(text: &str) -> bool {
 pub fn normalized(text: &str) -> String {
     text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
+
+/// Acoustic evidence for a finalized barge candidate whose cloud ASR returned
+/// no words at all. Only frames that pass the periodic near-end voice check are
+/// counted, so a burst of clicks, coughs, bangs or residual playback hiss does
+/// not accumulate any evidence here.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct NoTranscriptEvidence {
+    pub periodic_frames: usize,
+    pub peak_rms: f32,
+}
+
+impl NoTranscriptEvidence {
+    pub fn observe_periodic(&mut self, rms: f32) {
+        self.periodic_frames += 1;
+        if rms.is_finite() {
+            self.peak_rms = self.peak_rms.max(rms);
+        }
+    }
+}
+
+// A short command ("停", "等等", "暂停") is often below the cloud ASR's
+// minimum finalization length, so its Final can carry no text at all. The
+// fallback below only restores the interrupt for that exact failure mode; it
+// never replaces a transcript and never applies to long speech or to tasks
+// that are still thinking.
+pub const NO_TRANSCRIPT_MIN_VOICED_FRAMES: usize = 8; // 160 ms, same as the barge gate
+pub const NO_TRANSCRIPT_MAX_VOICED_FRAMES: usize = 34; // 680 ms; longer = normal speech
+// 75% of the minimum voiced evidence: a plosive onset ("停") may spend one or
+// two of the first eight frames, but the vowel body must still dominate.
+pub const NO_TRANSCRIPT_MIN_PERIODIC_FRAMES: usize = 6;
+pub const NO_TRANSCRIPT_MIN_PEAK_RMS: f32 = 260.0;
+pub const NO_TRANSCRIPT_MAX_PEAK_RMS: f32 = 12_000.0;
+
+/// Should an empty cloud Final be treated as a short stop command?
+///
+/// All of the following must hold, so ordinary playback echo, noise and normal
+/// speech cannot reach this path:
+/// - the Final was actually requested (`finish()` was sent) after the candidate
+///   ended, i.e. the ASR genuinely had its chance to return text;
+/// - the reply is still playing (`state == "speaking"`), so this can never
+///   cancel an agent task while it is thinking or executing;
+/// - the reply has not already completed, so there is nothing to interrupt;
+/// - the cloud returned no meaningful text and never emitted a textual Partial:
+///   if ASR heard *anything*, even a rejected fragment, the transcript path
+///   owns the decision and this fallback stays closed;
+/// - the candidate is short once voiced (8–34 frames) and at least 75% of the
+///   voiced frames are periodic near-end speech with a bounded peak level.
+pub fn no_transcript_short_command(
+    phase: &str,
+    reply_completed: bool,
+    final_requested: bool,
+    heard_partial_text: bool,
+    text: &str,
+    voiced_frames: usize,
+    evidence: NoTranscriptEvidence,
+) -> bool {
+    if !final_requested || reply_completed || phase != "speaking" { return false; }
+    if heard_partial_text { return false; }
+    if !normalized(text).is_empty() { return false; }
+    if !(NO_TRANSCRIPT_MIN_VOICED_FRAMES..=NO_TRANSCRIPT_MAX_VOICED_FRAMES).contains(&voiced_frames) {
+        return false;
+    }
+    if evidence.periodic_frames < NO_TRANSCRIPT_MIN_PERIODIC_FRAMES { return false; }
+    if evidence.periodic_frames * 4 < voiced_frames * 3 { return false; }
+    (NO_TRANSCRIPT_MIN_PEAK_RMS..=NO_TRANSCRIPT_MAX_PEAK_RMS).contains(&evidence.peak_rms)
+}
+
 #[derive(Default)]
 pub struct Confirmation { previous: String, first_ms: Option<u128>, revisions: usize }
 impl Confirmation {
@@ -191,5 +259,59 @@ mod tests {
         // for a delayed cloud transcript, not fresh user speech.
         let mut c = Confirmation::default();
         assert!(!c.accept("等一下", true, None, Duration::from_millis(100), 20, "speaking", "正在播放音乐", "请你等一下"));
+    }
+
+    fn short_command_evidence() -> NoTranscriptEvidence {
+        let mut evidence = NoTranscriptEvidence::default();
+        for _ in 0..12 { evidence.observe_periodic(900.0); }
+        evidence
+    }
+
+    #[test]
+    fn empty_final_stop_needs_a_finalized_short_voiced_utterance_during_playback() {
+        let evidence = short_command_evidence();
+        assert!(no_transcript_short_command("speaking", false, true, false, "", 12, evidence));
+        assert!(no_transcript_short_command("speaking", false, true, false, "  ……！", 12, evidence));
+        // A real transcript is handled by the ASR-confirmed path, never here.
+        assert!(!no_transcript_short_command("speaking", false, true, false, "停", 12, evidence));
+        assert!(!no_transcript_short_command("speaking", false, true, false, "嗯", 12, evidence));
+        // If the cloud emitted any textual Partial, it heard something; the
+        // transcript path owns that decision even when its Final is empty.
+        assert!(!no_transcript_short_command("speaking", false, true, true, "", 12, evidence));
+        // The ASR must have been asked for its Final; an unsolicited empty
+        // event is not evidence that the short command was fully submitted.
+        assert!(!no_transcript_short_command("speaking", false, false, false, "", 12, evidence));
+        // Never cancel an agent task that is still thinking or executing.
+        assert!(!no_transcript_short_command("thinking", false, true, false, "", 12, evidence));
+        assert!(!no_transcript_short_command("listening", false, true, false, "", 12, evidence));
+        // Once playback finished there is nothing left to interrupt.
+        assert!(!no_transcript_short_command("speaking", true, true, false, "", 12, evidence));
+    }
+
+    #[test]
+    fn empty_final_stop_rejects_long_speech_weak_voice_and_incoherent_noise() {
+        // Longer than a short command: normal speech must use the transcript path.
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", NO_TRANSCRIPT_MAX_VOICED_FRAMES + 1, short_command_evidence()));
+        // Not enough voice evidence at all.
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", NO_TRANSCRIPT_MIN_VOICED_FRAMES - 1, short_command_evidence()));
+        // Soft near-end blip below the peak gate.
+        let mut weak = NoTranscriptEvidence::default();
+        for _ in 0..12 { weak.observe_periodic(NO_TRANSCRIPT_MIN_PEAK_RMS - 1.0); }
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, weak));
+        // A loud bang near clipping is not a command.
+        let mut loud = NoTranscriptEvidence::default();
+        for _ in 0..12 { loud.observe_periodic(NO_TRANSCRIPT_MAX_PEAK_RMS + 1.0); }
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, loud));
+        // Aperiodic noise can trip the energy VAD but contributes no periodic frames.
+        let noise = NoTranscriptEvidence { periodic_frames: 2, peak_rms: 2000.0 };
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, noise));
+        // Mostly noise with a couple of voiced frames stays rejected.
+        let mixed = NoTranscriptEvidence { periodic_frames: 8, peak_rms: 2000.0 };
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, mixed));
+        // Plosive onset tolerance: the minimum candidate needs six periodic frames.
+        let minimum_ok = NoTranscriptEvidence { periodic_frames: 6, peak_rms: 900.0 };
+        assert!(no_transcript_short_command("speaking", false, true, false, "", 8, minimum_ok));
+        let minimum_low = NoTranscriptEvidence { periodic_frames: 5, peak_rms: 900.0 };
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", 8, minimum_low));
     }
 }

@@ -8,7 +8,9 @@
  *          `realtime-chat-request` event that lets the UI resolve the active appearance when the
  *          board key is pressed. AEC/VAD-capable boards stay listening during replies;
  *          candidate speech is checked by streaming ASR before barge-in cancels generation,
- *          TTS and queued playback. Empty/noise candidates leave the reply intact. Global gain applies once at the output boundary.
+ *          TTS and queued playback. Empty/noise candidates leave the reply intact, except a
+ *          bounded short periodic near-end command whose empty Final is the only evidence.
+ *          Global gain applies once at the output boundary.
  * [Pos] Tauri-side orchestrator for 实时对话, with current-window Codex delegation,
  *       bounded session-local handoff history and isolated result announcements.
  * [Sync] Update `pc/.folder.md` and `pc/docs/realtime-chat.md`; wire changes also update `firmware/protocol.md`.
@@ -730,6 +732,56 @@ impl Vad {
     }
 }
 
+// ---- no-transcript short-command evidence ---------------------------------------------------
+
+const PERIODIC_MIN_HZ: f32 = 80.0;
+const PERIODIC_MAX_HZ: f32 = 400.0;
+const PERIODIC_MIN_CORRELATION: f32 = 0.55;
+// A vowel has a low zero-crossing rate; clicks, claps, coughs and broadband
+// hiss are dominated by high-frequency crossings and must not count as voiced.
+const PERIODIC_MAX_ZCR: f32 = 0.20;
+
+/// Near-end voiced-speech evidence for the no-transcript barge fallback.
+///
+/// This is deliberately only a *voice* check, never a command-word check: the
+/// cloud Final is empty, so the fallback relies on the board's AEC/VAD hint,
+/// the PC energy VAD, short duration and pitch periodicity. Playback echo and
+/// arbitrary noise fail at the AEC/VAD gate or here (aperiodic, high ZCR).
+fn periodic_voice_frame(frame: &[u8]) -> bool {
+    let samples: Vec<f32> = frame
+        .chunks_exact(2)
+        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]) as f32)
+        .collect();
+    if samples.len() < 64 || Vad::rms(frame) < PROCESSED_VAD_ABS_MIN {
+        return false;
+    }
+    let mean = samples.iter().map(|v| *v as f64).sum::<f64>() / samples.len() as f64;
+    let centered: Vec<f32> = samples.iter().map(|v| (*v as f64 - mean) as f32).collect();
+    if centered.iter().map(|v| v * v).sum::<f32>() <= f32::EPSILON {
+        return false;
+    }
+    let min_lag = (16_000.0 / PERIODIC_MAX_HZ).ceil() as usize;
+    let max_lag = ((16_000.0 / PERIODIC_MIN_HZ).floor() as usize).min(centered.len() - 2);
+    let mut best = 0.0f32;
+    for lag in min_lag..=max_lag {
+        let (mut numerator, mut left, mut right) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..(centered.len() - lag) {
+            numerator += centered[i] * centered[i + lag];
+            left += centered[i] * centered[i];
+            right += centered[i + lag] * centered[i + lag];
+        }
+        let denominator = (left * right).sqrt();
+        if denominator > f32::EPSILON {
+            best = best.max(numerator / denominator);
+        }
+    }
+    if best < PERIODIC_MIN_CORRELATION {
+        return false;
+    }
+    let crossings = centered.windows(2).filter(|pair| (pair[0] > 0.0) != (pair[1] > 0.0)).count();
+    crossings as f32 / (centered.len() - 1) as f32 <= PERIODIC_MAX_ZCR
+}
+
 // ---- board playback sender ------------------------------------------------------------------
 
 enum PlayerCmd {
@@ -1033,6 +1085,11 @@ async fn run_session(
         let _ = player.send(PlayerCmd::Subtitle(greeting.clone()));
         let _ = player.send(PlayerCmd::Pcm(greeting_pcm));
         match listen_with_verified_barge_in(async {wait_playback(&player).await; Ok(())}, &mut rx, &mut deferred_audio, &mut vad, duplex).await {
+            Ok(Some(speech)) if speech.no_transcript_stop => {
+                let _ = player.send(PlayerCmd::Flush);
+                tts.interrupt();
+                diagnostics::record(&session.id,"voice_stop",json!({"turn":0,"chars":0,"reason":"no_transcript"}));
+            }
             Ok(frames) => pending_speech = frames,
             Err(error) => {finish(&app, &usb, &session, "audio", &error).await; return;}
         }
@@ -1136,9 +1193,16 @@ async fn run_session(
                 };
                 match listen_with_verified_barge_in(announcement,&mut rx,&mut deferred_audio,&mut vad,duplex).await {
                     Ok(speech)=>{
-                        diagnostics::record(&session.id,"desktop_receipt",json!({"stage":"playback_finished", "ok":speech.as_ref().is_none_or(|s|s.reply_completed), "reason":if speech.as_ref().is_some_and(|s|!s.reply_completed) {"interrupted"} else {"completed"}}));
+                        let silent_stop = speech.as_ref().is_some_and(|s|s.no_transcript_stop);
+                        diagnostics::record(&session.id,"desktop_receipt",json!({"stage":"playback_finished", "ok":speech.as_ref().is_none_or(|s|s.reply_completed), "reason":if silent_stop {"no_transcript_stop"} else if speech.as_ref().is_some_and(|s|!s.reply_completed) {"interrupted"} else {"completed"}}));
                         if speech.as_ref().is_some_and(|s|!s.reply_completed) {let _=player.send(PlayerCmd::Flush);tts.interrupt();}
-                        pending_speech=speech;
+                        if silent_stop {
+                            diagnostics::record(&session.id,"voice_stop",json!({"turn":session.status.lock().map(|s|s.turns).unwrap_or(0),"chars":0,"reason":"no_transcript"}));
+                            vad.reset();
+                            pending_speech=None;
+                        } else {
+                            pending_speech=speech;
+                        }
                     }
                     Err(error)=>{diagnostics::record(&session.id,"desktop_receipt",json!({"stage":"playback_finished", "ok":false, "errorKind":diagnostics::error_kind(&error)}));let _=player.send(PlayerCmd::Flush);publish(&app,&session,|s|s.error=error);}
                 }
@@ -1322,11 +1386,21 @@ async fn run_session(
                                         let _ = player.send(PlayerCmd::Flush);
                                         tts.interrupt();
                                         crate::smart_home::cancel_voice_session(&session.id);
-                                        diagnostics::record(&session.id,"barge_in",json!({"turn":turns,"bytes":speech.stats.frames*FRAME_BYTES,"reason":"asr_confirmed"}));
+                                        let reason = if speech.no_transcript_stop { "no_transcript_short_command" } else { "asr_confirmed" };
+                                        diagnostics::record(&session.id,"barge_in",json!({"turn":turns,"bytes":speech.stats.frames*FRAME_BYTES,"reason":reason}));
                                         let partial=session.status.lock().map(|s|s.reply.clone()).unwrap_or_default();
                                         remember_interrupted_reply(&mut history,&mut desktop_conversation,&user_text,&partial);
                                     }
-                                    pending_speech = Some(speech);
+                                    if speech.no_transcript_stop {
+                                        // The cloud lost the words, so this is a stop,
+                                        // not a new user turn. Keep listening.
+                                        diagnostics::record(&session.id,"voice_stop",json!({"turn":turns,"chars":0,"reason":"no_transcript"}));
+                                        vad.reset();
+                                        publish(&app, &session, |s| {s.state="listening".into(); s.transcript.clear();});
+                                        hud(&usb, &board, &session.id, "listening", &name, "");
+                                    } else {
+                                        pending_speech = Some(speech);
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(error) => {
@@ -1371,6 +1445,10 @@ struct VerifiedSpeech {
     text: String,
     reply_completed: bool,
     terminal: bool,
+    /// The cloud Final carried no text; a short, clearly voiced near-end
+    /// command is the only evidence. It stops playback but is not handed to
+    /// the conversation loop as a new user turn.
+    no_transcript_stop: bool,
 }
 
 fn is_explicit_stop(text: &str) -> bool {
@@ -1407,7 +1485,7 @@ fn start_barge_probe(frames: Vec<Vec<u8>>) -> Result<VerifiedSpeech, String> {
         recognizer.push_pcm(&frame)?;
         stats.observe(&frame);
     }
-    Ok(VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false })
+    Ok(VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false })
 }
 
 async fn listen_with_verified_barge_in<F>(reply: F, rx: &mut mpsc::Receiver<Input>, deferred: &mut VecDeque<Input>, vad: &mut Vad, duplex: bool)
@@ -1434,6 +1512,15 @@ where F: std::future::Future<Output=Result<(), String>>,
             vad.previous_user.clone()
         } else { String::new() };
         diagnostics::record(&vad.diagnostic_session, "barge_candidate", json!({"frames":frames.len(),"bufferedMs":deferred.len()*20,"state":candidate_phase}));
+        // Evidence for the no-transcript fallback starts from exactly the
+        // frames that satisfied the barge gate (`vad.speech_run`), not from the
+        // older preroll. Only periodic near-end voice counts; noise left after
+        // AEC contributes nothing.
+        let mut evidence = barge_policy::NoTranscriptEvidence::default();
+        let seeded = vad.speech_run.min(frames.len());
+        for frame in &frames[frames.len() - seeded..] {
+            if periodic_voice_frame(frame) { evidence.observe_periodic(Vad::rms(frame)); }
+        }
         let mut probe = match start(frames) {
             Ok(probe) => probe,
             Err(error) => {
@@ -1450,6 +1537,9 @@ where F: std::future::Future<Output=Result<(), String>>,
         let mut unvoiced_run = 0usize;
         let mut confirmation = barge_policy::Confirmation::default();
         let mut input_finished = false;
+        // Any textual Partial proves the cloud heard something. The fallback
+        // then stays closed even if the Final itself carries no words.
+        let mut heard_partial_text = false;
         let mut rejection = "no_transcript";
         loop {
             // Poll ASR and the reply even when Windows has delivered a burst of
@@ -1464,9 +1554,32 @@ where F: std::future::Future<Output=Result<(), String>>,
                             StreamingSpeechEvent::Final {text,confidence,..} => (text,true,confidence),
                             _ => unreachable!(),
                         };
+                        if !terminal && !barge_policy::normalized(&text).is_empty() {
+                            heard_partial_text = true;
+                        }
                         // Terminal empty/single-character candidates cannot improve.
                         // Reject now instead of leaving a completed stream polling.
-                        if terminal && !has_barge_in_text(&text) { break; }
+                        // The one exception is a Final that carried no text at all
+                        // after `finish()` was requested: for the diagnosed short
+                        // "停"/"等等" failure the cloud loses the words entirely.
+                        // That fallback still requires short periodic near-end voice
+                        // and an actively playing reply; see the barge policy.
+                        if terminal && !has_barge_in_text(&text) {
+                            let phase = vad.session.as_ref().and_then(|s| s.status.lock().ok().map(|s| s.state.clone()))
+                                .unwrap_or_else(|| "thinking".into());
+                            if barge_policy::no_transcript_short_command(&phase, probe.reply_completed, input_finished, heard_partial_text, &text, voiced_frames, evidence) {
+                                probe.text.clear();
+                                probe.terminal = true;
+                                probe.no_transcript_stop = true;
+                                diagnostics::record(&vad.diagnostic_session,"barge_confirmed",json!({
+                                    "chars":0,"elapsedMs":started.elapsed().as_millis(),"frames":probe.stats.frames,
+                                    "state":phase,"reason":"no_transcript_short_command",
+                                    "voicedFrames":voiced_frames,"periodicFrames":evidence.periodic_frames,
+                                    "peakRms":evidence.peak_rms.round()}));
+                                return Ok(Some(probe));
+                            }
+                            break;
+                        }
                         if !has_barge_in_text(&text) { continue; }
                         if input_finished && !terminal { continue; }
                         let (phase, reply_text) = vad.session.as_ref().and_then(|s| s.status.lock().ok().map(|s| (s.state.clone(),s.reply.clone())))
@@ -1524,8 +1637,10 @@ where F: std::future::Future<Output=Result<(), String>>,
                     }
                     probe.stats.observe(&pcm);
                     added_frames += 1;
-                    if speech == Some(true) && Vad::rms(&pcm) >= PROCESSED_VAD_ABS_MIN {
+                    let frame_rms = Vad::rms(&pcm);
+                    if speech == Some(true) && frame_rms >= PROCESSED_VAD_ABS_MIN {
                         voiced_frames += 1; unvoiced_run = 0;
+                        if periodic_voice_frame(&pcm) { evidence.observe_periodic(frame_rms); }
                     } else {
                         unvoiced_run += 1;
                     }
@@ -1543,7 +1658,7 @@ where F: std::future::Future<Output=Result<(), String>>,
                 }
             }
         }
-        diagnostics::record(&vad.diagnostic_session,"barge_rejected",json!({"reason":rejection,"elapsedMs":started.elapsed().as_millis(),"frames":probe.stats.frames}));
+        diagnostics::record(&vad.diagnostic_session,"barge_rejected",json!({"reason":rejection,"elapsedMs":started.elapsed().as_millis(),"frames":probe.stats.frames,"voicedFrames":voiced_frames,"periodicFrames":evidence.periodic_frames,"peakRms":evidence.peak_rms.round()}));
         probe.recognizer.cancel();
         vad.reset();
         if probe.reply_completed { return Ok(None); }
@@ -2381,7 +2496,7 @@ mod tests {
         }
         let mut stats = AsrCaptureStats::default();
         for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
-        (VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false },
+        (VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false },
             (sink, if keep_events_open { Some(tx) } else { None }))
     }
 
@@ -2402,7 +2517,26 @@ mod tests {
         });
         let mut stats = AsrCaptureStats::default();
         for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
-        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false }
+        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false }
+    }
+
+    /// Fake ASR that emits one textual Partial, then an empty Final when
+    /// `finish()` arrives. Any textual evidence must close the fallback.
+    fn fake_partial_then_empty_final_probe(frames: Vec<Vec<u8>>, partial: &'static str) -> VerifiedSpeech {
+        let (recognizer, mut sink) = StreamingSpeechRecognizer::test_sink();
+        let (tx, events) = mpsc::unbounded_channel();
+        let _ = tx.send(StreamingSpeechEvent::Partial { revision: 1, text: partial.into(), confidence: None });
+        tokio::spawn(async move {
+            while let Some(command) = sink.recv().await {
+                if matches!(command, StreamingSpeechCommand::Finish) {
+                    let _ = tx.send(StreamingSpeechEvent::Final { revision: 2, text: String::new(), confidence: None });
+                    break;
+                }
+            }
+        });
+        let mut stats = AsrCaptureStats::default();
+        for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
+        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false }
     }
 
     /// Candidate speech followed by a known amount of trailing silence. The
@@ -2414,15 +2548,58 @@ mod tests {
             .collect()
     }
 
-    fn speaking_barge_session() -> Arc<Session> {
+    /// 160 Hz sine: a periodic near-end vowel-like frame, unlike `frame()`'s
+    /// alternating ±amplitude square wave (used as broadband/noise evidence).
+    fn sine_frame(amplitude: i16, hz: f32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(FRAME_BYTES);
+        for i in 0..(FRAME_BYTES / 2) {
+            let t = i as f32 / 16_000.0;
+            let v = (amplitude as f32 * (2.0 * std::f32::consts::PI * hz * t).sin()) as i16;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    fn noise_frame(amplitude: i16) -> Vec<u8> {
+        let mut seed = 0x2545_f491_u32;
+        let mut out = Vec::with_capacity(FRAME_BYTES);
+        for _ in 0..(FRAME_BYTES / 2) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let v = (seed % (2 * amplitude as u32 + 1)) as i32 - amplitude as i32;
+            out.extend_from_slice(&(v as i16).to_le_bytes());
+        }
+        out
+    }
+
+    /// A short periodic command candidate plus the trailing silence that asks
+    /// the ASR for its Final.
+    fn periodic_barge_deferred(voiced_frames: usize) -> VecDeque<Input> {
+        (0..voiced_frames).map(|_| Input::Pcm(sine_frame(1200, 160.0), Some(true)))
+            .chain((0..BARGE_FINISH_SILENCE_FRAMES).map(|_| Input::Pcm(frame(0), Some(false))))
+            .collect()
+    }
+
+    /// A noise burst that passes the energy VAD exactly like a voice would,
+    /// followed by the same trailing silence.
+    fn noise_barge_deferred(voiced_frames: usize) -> VecDeque<Input> {
+        (0..voiced_frames).map(|_| Input::Pcm(noise_frame(1500), Some(true)))
+            .chain((0..BARGE_FINISH_SILENCE_FRAMES).map(|_| Input::Pcm(frame(0), Some(false))))
+            .collect()
+    }
+
+    fn barge_session_in(state: &str) -> Arc<Session> {
         let (session, _) = routing_session();
         {
             let mut status = session.status.lock().unwrap();
-            status.state = "speaking".into();
+            status.state = state.into();
             status.reply = "正在播放音乐".into();
         }
         Arc::new(session)
     }
+
+    fn speaking_barge_session() -> Arc<Session> { barge_session_in("speaking") }
 
     #[test]
     fn barge_finish_policy_requires_voice_evidence_and_bounds_silence() {
@@ -2474,6 +2651,92 @@ mod tests {
                 assert!(result.is_none(), "{final_text}");
                 assert!(completed.load(Ordering::SeqCst), "{final_text}");
             }
+        });
+    }
+
+    #[test]
+    fn periodic_voice_check_separates_voiced_commands_from_noise() {
+        // Vowel-like pitch in the normal speech range.
+        assert!(periodic_voice_frame(&sine_frame(1200, 160.0)));
+        assert!(periodic_voice_frame(&sine_frame(700, 240.0)));
+        // Alternating ±amplitude is a Nyquist buzz, not a voice.
+        assert!(!periodic_voice_frame(&frame(180)));
+        // Broadband noise passes the same energy floor but is aperiodic.
+        assert!(!periodic_voice_frame(&noise_frame(1500)));
+        // Silence and weak near-end blips stay below the processed voice floor.
+        assert!(!periodic_voice_frame(&frame(0)));
+        assert!(!periodic_voice_frame(&sine_frame(100, 160.0)));
+    }
+
+    #[test]
+    fn empty_final_short_command_interrupts_playback_without_a_transcript() {
+        tauri::async_runtime::block_on(async {
+            for voiced_frames in [8usize, 12, 24] {
+                let (_tx, mut rx) = mpsc::channel(8);
+                let mut deferred = periodic_barge_deferred(voiced_frames);
+                let mut vad = Vad::new();
+                vad.session = Some(speaking_barge_session());
+                let reply = std::future::pending::<Result<(),String>>();
+                let speech = timeout(Duration::from_secs(2), verify_barge_in_with(reply, &mut rx, &mut deferred, &mut vad, true, |frames| {
+                    Ok(fake_finish_driven_probe(frames, ""))
+                })).await.expect("empty Final fallback must stay bounded").unwrap()
+                    .expect("a short voiced command must interrupt even without a transcript");
+                assert!(speech.no_transcript_stop, "{voiced_frames}");
+                assert_eq!(speech.text, "", "{voiced_frames}");
+                assert!(!speech.reply_completed, "{voiced_frames}");
+            }
+        });
+    }
+
+    #[test]
+    fn empty_final_ordinary_speech_noise_and_thinking_phase_still_reject() {
+        use super::barge_policy::NO_TRANSCRIPT_MAX_VOICED_FRAMES;
+        tauri::async_runtime::block_on(async {
+            let cases = [
+                ("long speech", periodic_barge_deferred(NO_TRANSCRIPT_MAX_VOICED_FRAMES + 6), "speaking"),
+                ("noise", noise_barge_deferred(12), "speaking"),
+                ("thinking", periodic_barge_deferred(12), "thinking"),
+                ("listening", periodic_barge_deferred(12), "listening"),
+            ];
+            for (label, mut deferred, state) in cases {
+                let (_tx, mut rx) = mpsc::channel(8);
+                let mut vad = Vad::new();
+                vad.session = Some(barge_session_in(state));
+                let completed = Arc::new(AtomicBool::new(false));
+                let flag = completed.clone();
+                let reply = async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                };
+                let result = timeout(Duration::from_secs(2), verify_barge_in_with(reply, &mut rx, &mut deferred, &mut vad, true, |frames| {
+                    Ok(fake_finish_driven_probe(frames, ""))
+                })).await.expect("rejection path must stay bounded").unwrap();
+                assert!(result.is_none(), "{label}");
+                assert!(completed.load(Ordering::SeqCst), "{label}");
+            }
+        });
+    }
+
+    #[test]
+    fn empty_final_after_a_textual_partial_keeps_the_transcript_path_closed() {
+        tauri::async_runtime::block_on(async {
+            let (_tx, mut rx) = mpsc::channel(8);
+            let mut deferred = periodic_barge_deferred(12);
+            let mut vad = Vad::new();
+            vad.session = Some(speaking_barge_session());
+            let completed = Arc::new(AtomicBool::new(false));
+            let flag = completed.clone();
+            let reply = async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            };
+            let result = timeout(Duration::from_secs(2), verify_barge_in_with(reply, &mut rx, &mut deferred, &mut vad, true, |frames| {
+                Ok(fake_partial_then_empty_final_probe(frames, "嗯"))
+            })).await.expect("rejection path must stay bounded").unwrap();
+            assert!(result.is_none());
+            assert!(completed.load(Ordering::SeqCst));
         });
     }
 
