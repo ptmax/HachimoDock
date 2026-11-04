@@ -5,6 +5,12 @@ use std::time::{Duration, Instant};
 const MAX_RECOVERY_RETRIES: usize = 8;
 const RECOVERY_DEADLINE: Duration = Duration::from_millis(1500);
 const RETRY_BACKOFF: Duration = Duration::from_millis(2);
+// A failed live frame can leave its already-accepted prefix in the macOS tty
+// output queue. `poll(POLLOUT)` then keeps timing out even when the board starts
+// reading again, because that stale prefix still occupies the queue. Discard it
+// at most once per stalled frame, then emit a newline boundary so the board
+// drops the truncated JSON line instead of appending the next frame to it.
+const LIVE_OUTPUT_RESET_COOLDOWN: Duration = Duration::from_millis(750);
 
 // Failed Windows overlapped completion can have unknown partial progress.
 // Retain its OS code for diagnostics, but never retry it as a zero-byte timeout.
@@ -111,6 +117,75 @@ pub(super) fn write_serial_live_frame(writer: &mut dyn Write, bytes: &[u8], slic
         }
     }
     Ok(report)
+}
+
+/// Bounded host-side recovery for a stalled OUT queue. Implemented by a clone
+/// of the real serial port; tests inject a recording double.
+pub(super) trait LiveOutputReset: Send {
+    fn discard_pending_output(&mut self) -> Result<(), String>;
+    fn pending_output_bytes(&self) -> Option<u32>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct LiveOutputResetReport {
+    pub attempted: bool,
+    pub cooldown_skipped: bool,
+    pub reset_ok: bool,
+    pub boundary_ok: bool,
+    pub pending_bytes_before: Option<u32>,
+    pub pending_bytes_after: Option<u32>,
+}
+
+/// Owns the per-connection cooldown so one stalled frame cannot purge the tty
+/// queue repeatedly. The link-stall budget itself stays in `usb_serial.rs`.
+#[derive(Debug, Default)]
+pub(super) struct LiveOutputRecovery {
+    last_attempt: Option<Instant>,
+}
+
+impl LiveOutputRecovery {
+    pub(super) fn clear(&mut self) {
+        self.last_attempt = None;
+    }
+
+    pub(super) fn recover<W: Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        reset: Option<&mut dyn LiveOutputReset>,
+    ) -> LiveOutputResetReport {
+        self.recover_at(writer, reset, Instant::now())
+    }
+
+    pub(super) fn recover_at<W: Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        reset: Option<&mut dyn LiveOutputReset>,
+        now: Instant,
+    ) -> LiveOutputResetReport {
+        let mut report = LiveOutputResetReport::default();
+        let Some(reset) = reset else { return report };
+        if self
+            .last_attempt
+            .is_some_and(|last| now.saturating_duration_since(last) < LIVE_OUTPUT_RESET_COOLDOWN)
+        {
+            report.cooldown_skipped = true;
+            return report;
+        }
+        self.last_attempt = Some(now);
+        report.attempted = true;
+        report.pending_bytes_before = reset.pending_output_bytes();
+        report.reset_ok = reset.discard_pending_output().is_ok();
+        report.pending_bytes_after = reset.pending_output_bytes();
+        if report.reset_ok {
+            // Never replay the failed frame: its prefix may already have reached
+            // the board. One bounded newline is the only write performed here.
+            report.boundary_ok = writer
+                .write(b"\n")
+                .map(|written| written == 1)
+                .unwrap_or(false);
+        }
+        report
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +345,96 @@ mod tests {
         write_serial_live_frame(&mut writer, &[1, 2, 3], 0, Duration::ZERO).unwrap();
         assert_eq!(writer.calls, vec![1, 1, 1]);
         assert_eq!(writer.bytes, vec![1, 2, 3]);
+    }
+
+    struct BoundaryWriter {
+        writes: Vec<Vec<u8>>,
+        fail_boundary: bool,
+    }
+    impl Write for BoundaryWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if self.fail_boundary {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "synthetic"));
+            }
+            self.writes.push(data.to_vec());
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    struct RecordingReset {
+        calls: usize,
+        discard_ok: bool,
+        pending_before: u32,
+        pending_after: u32,
+    }
+    impl LiveOutputReset for RecordingReset {
+        fn discard_pending_output(&mut self) -> Result<(), String> {
+            self.calls += 1;
+            if self.discard_ok { Ok(()) } else { Err("synthetic tcflush failure".into()) }
+        }
+        fn pending_output_bytes(&self) -> Option<u32> {
+            Some(if self.calls == 0 { self.pending_before } else { self.pending_after })
+        }
+    }
+    fn recording_reset() -> RecordingReset {
+        RecordingReset { calls: 0, discard_ok: true, pending_before: 4352, pending_after: 0 }
+    }
+
+    #[test]
+    fn output_reset_discards_once_then_writes_a_single_boundary() {
+        let mut writer = BoundaryWriter { writes: Vec::new(), fail_boundary: false };
+        let mut reset = recording_reset();
+        let mut recovery = LiveOutputRecovery::default();
+        let started = Instant::now();
+        let report = recovery.recover_at(&mut writer, Some(&mut reset), started);
+        assert!(report.attempted && report.reset_ok && report.boundary_ok);
+        assert_eq!(report.pending_bytes_before, Some(4352));
+        assert_eq!(report.pending_bytes_after, Some(0));
+        assert_eq!(reset.calls, 1);
+        assert_eq!(writer.writes, vec![b"\n".to_vec()], "never replay the failed frame");
+
+        // A second stalled frame inside the cooldown must not purge the queue again.
+        let report = recovery.recover_at(&mut writer, Some(&mut reset), started + Duration::from_millis(100));
+        assert!(report.cooldown_skipped && !report.attempted);
+        assert_eq!(reset.calls, 1);
+        assert_eq!(writer.writes.len(), 1);
+
+        let report = recovery.recover_at(&mut writer, Some(&mut reset), started + LIVE_OUTPUT_RESET_COOLDOWN);
+        assert!(report.attempted);
+        assert_eq!(reset.calls, 2);
+        assert_eq!(writer.writes.len(), 2);
+    }
+
+    #[test]
+    fn failed_output_reset_skips_the_boundary_and_is_reported() {
+        let mut writer = BoundaryWriter { writes: Vec::new(), fail_boundary: false };
+        let mut reset = RecordingReset { calls: 0, discard_ok: false, pending_before: 4352, pending_after: 4352 };
+        let report = LiveOutputRecovery::default().recover_at(&mut writer, Some(&mut reset), Instant::now());
+        assert!(report.attempted && !report.reset_ok && !report.boundary_ok);
+        assert_eq!(report.pending_bytes_after, Some(4352));
+        assert!(writer.writes.is_empty(), "a failed flush must not inject a boundary");
+    }
+
+    #[test]
+    fn boundary_failure_is_reported_without_retry() {
+        let mut writer = BoundaryWriter { writes: Vec::new(), fail_boundary: true };
+        let mut reset = recording_reset();
+        let report = LiveOutputRecovery::default().recover_at(&mut writer, Some(&mut reset), Instant::now());
+        assert!(report.attempted && report.reset_ok && !report.boundary_ok);
+        assert_eq!(reset.calls, 1);
+        assert!(writer.writes.is_empty());
+    }
+
+    #[test]
+    fn missing_or_disconnected_output_reset_is_a_noop() {
+        let mut writer = BoundaryWriter { writes: Vec::new(), fail_boundary: false };
+        let report = LiveOutputRecovery::default().recover_at(&mut writer, None, Instant::now());
+        assert!(!report.attempted && !report.cooldown_skipped);
+        assert!(writer.writes.is_empty());
+        // No reset handler must not consume the cooldown used by a later real one.
+        let mut reset = recording_reset();
+        let report = LiveOutputRecovery::default().recover_at(&mut writer, Some(&mut reset), Instant::now());
+        assert!(report.attempted);
+        assert_eq!(reset.calls, 1);
     }
 }

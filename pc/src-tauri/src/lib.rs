@@ -10365,6 +10365,7 @@ fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
     thread::spawn(move || {
         let mut last_wall = std::time::SystemTime::now();
         let mut last_monotonic = Instant::now();
+        let mut write_backpressure_streak: u32 = 0;
         loop {
             thread::sleep(HEARTBEAT_INTERVAL);
             let wall_now = std::time::SystemTime::now();
@@ -10387,6 +10388,7 @@ fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
             }
             let status = usb_manager.status();
             if !status.connected || status.board_device_id.is_empty() {
+                write_backpressure_streak = 0;
                 continue;
             }
             if !supports_liveness_probe(&status.runtime) {
@@ -10406,20 +10408,40 @@ fn start_usb_host_heartbeat(usb_manager: usb_serial::UsbSerialManager) {
             if usb_manager.transfer_in_progress() {
                 continue;
             }
-            match usb_manager.probe_liveness(&status.board_device_id, LIVENESS_ACK_TIMEOUT) {
+            match usb_manager.probe_liveness_classified(&status.board_device_id, LIVENESS_ACK_TIMEOUT) {
                 Ok(()) => {
+                    write_backpressure_streak = 0;
                     if resumed_from_sleep {
                         eprintln!("[usb-liveness] connection survived wake");
                     }
                 }
-                Err(error) => {
+                Err(failure) => {
+                    // A write timeout means the host tty output queue is
+                    // backpressured; the board's IN stream can still be healthy.
+                    // Defer reconnecting through a bounded number of probe
+                    // cycles instead of turning one stalled heartbeat into a
+                    // false disconnect during a long reply.
+                    if failure.kind == usb_serial::LivenessFailureKind::WriteBackpressure {
+                        write_backpressure_streak = write_backpressure_streak.saturating_add(1);
+                        if !usb_serial::liveness_failure_forces_reconnect(
+                            failure.kind,
+                            write_backpressure_streak,
+                        ) {
+                            eprintln!(
+                                "[usb-liveness] heartbeat write backpressured ({}), deferring reconnect: {}",
+                                write_backpressure_streak, failure.message
+                            );
+                            continue;
+                        }
+                    }
                     // The writer can stay "connected" over a stale handle forever;
                     // dropping the connection lets start_usb_auto_connect probe and
                     // restore the port without a manual rescan or foregrounding.
                     eprintln!(
                         "[usb-liveness] heartbeat acknowledgement failed, forcing reconnect: {}",
-                        error
+                        failure.message
                     );
+                    write_backpressure_streak = 0;
                     usb_manager.force_reconnect("liveness_failed");
                 }
             }
@@ -14291,7 +14313,9 @@ mod tests {
         // Liveness is proven by a protocol ACK, not by write success: a stale
         // tty after sleep keeps accepting writes. The probe is bounded and the
         // existing auto-connect loop performs the re-probe.
-        assert!(heartbeat.contains("probe_liveness("));
+        assert!(heartbeat.contains("probe_liveness_classified("));
+        assert!(heartbeat.contains("LivenessFailureKind::WriteBackpressure"));
+        assert!(heartbeat.contains("liveness_failure_forces_reconnect("));
         assert!(heartbeat.contains("LIVENESS_ACK_TIMEOUT"));
         assert!(heartbeat.contains("usb_manager.force_reconnect(\"liveness_failed\")"));
         assert!(heartbeat.contains("wake_gap_detected("));

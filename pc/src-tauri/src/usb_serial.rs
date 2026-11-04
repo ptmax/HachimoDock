@@ -63,7 +63,9 @@ mod appearance_transaction;
 mod connection_handle;
 mod live_audio_pacing;
 mod media_arbitration;
-use live_audio_pacing::write_serial_live_frame;
+use live_audio_pacing::{
+    write_serial_live_frame, LiveOutputRecovery, LiveOutputReset, LiveOutputResetReport,
+};
 #[cfg(windows)]
 mod windows_serial;
 mod firmware_transaction;
@@ -276,6 +278,53 @@ const P4_FIRMWARE_CHUNK_RETRY_DELAY: Duration = Duration::from_millis(1);
 // budget; any successful write resets it. Permanent errors and every other
 // frame still fail closed, as does an exhausted budget.
 const MAX_TRANSIENT_REALTIME_STALLS: u32 = 5;
+// A heartbeat write that times out proves host OUT backpressure, not that the
+// board disappeared: the IN stream can remain healthy while the macOS tty
+// output queue is stuck. A stale handle is proven by a write that succeeds but
+// receives no ACK. Defer reconnect across this many probe cycles before treating
+// a persistently unwritable OUT path as a dead link.
+pub(crate) const MAX_LIVENESS_WRITE_BACKPRESSURE: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LivenessFailureKind {
+    WriteBackpressure,
+    WritePermanent,
+    AckTimeout,
+    AckMismatch,
+    AckRejected,
+    InvalidBoardId,
+}
+
+#[derive(Debug)]
+pub(crate) struct LivenessFailure {
+    pub kind: LivenessFailureKind,
+    pub message: String,
+}
+
+pub(crate) fn serial_write_error_is_backpressure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "would_block",
+        "would block",
+        "interrupted",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
+pub(crate) fn liveness_failure_forces_reconnect(
+    kind: LivenessFailureKind,
+    backpressure_streak: u32,
+) -> bool {
+    match kind {
+        LivenessFailureKind::WriteBackpressure => {
+            backpressure_streak >= MAX_LIVENESS_WRITE_BACKPRESSURE
+        }
+        _ => true,
+    }
+}
 
 // native USB bulk is the high-speed ESP32-P4 OTG data plane. UART remains as a fallback.
 struct NativeUsbP4Transport {
@@ -615,6 +664,39 @@ impl<'a> SerialReaderPause<'a> {
 impl Drop for SerialReaderPause<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(not(windows))]
+struct SerialOutputReset {
+    port: Box<dyn serialport::SerialPort>,
+}
+
+#[cfg(not(windows))]
+impl LiveOutputReset for SerialOutputReset {
+    fn discard_pending_output(&mut self) -> Result<(), String> {
+        self.port
+            .clear(serialport::ClearBuffer::Output)
+            .map_err(|error| error.to_string())
+    }
+
+    fn pending_output_bytes(&self) -> Option<u32> {
+        self.port.bytes_to_write().ok()
+    }
+}
+
+fn live_write_stage(topic: &str) -> &'static str {
+    match topic {
+        "audio/play_chunk" => "audio_chunk",
+        "audio/play_begin" => "audio_begin",
+        "audio/play_end" => "audio_end",
+        "audio/play_flush" => "audio_flush",
+        "audio/conversation" => "conversation",
+        "ui/conversation" => "conversation_ui",
+        "widget/data" => "widget",
+        "app/snapshot" => "app_snapshot",
+        "system/heartbeat" => "heartbeat",
+        _ => "other_live",
     }
 }
 
@@ -1295,6 +1377,9 @@ pub struct UsbSerialManager {
     serial_body_write_active: Arc<AtomicBool>,
     // Consecutive transient realtime stalls; reset by any successful write.
     transient_realtime_stalls: Arc<AtomicU32>,
+    // Out-queue purger bound to the current connection generation.
+    live_output_reset: Arc<Mutex<Option<(u64, Box<dyn LiveOutputReset>)>>>,
+    live_output_recovery: Arc<Mutex<LiveOutputRecovery>>,
     next_connection_id: Arc<AtomicU64>,
     asset_ack_waiters: Arc<Mutex<Vec<AssetAckWaiter>>>,
     widget_ack_waiters: Arc<Mutex<Vec<WidgetAckWaiter>>>,
@@ -1378,6 +1463,8 @@ impl UsbSerialManager {
             appearance_sync_cancel_requested: Arc::new(AtomicBool::new(false)),
             serial_body_write_active: Arc::new(AtomicBool::new(false)),
             transient_realtime_stalls: Arc::new(AtomicU32::new(0)),
+            live_output_reset: Arc::new(Mutex::new(None)),
+            live_output_recovery: Arc::new(Mutex::new(LiveOutputRecovery::default())),
             next_connection_id: Arc::new(AtomicU64::new(0)),
             asset_ack_waiters: Arc::new(Mutex::new(Vec::new())),
             widget_ack_waiters: Arc::new(Mutex::new(Vec::new())),
@@ -1575,6 +1662,17 @@ impl UsbSerialManager {
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::SeqCst) + 1;
         let cancel_reader = Arc::new(AtomicBool::new(false));
         let capture_active = Arc::new(AtomicBool::new(false));
+        // Keep a duplicated handle for bounded tty output purges. This is the
+        // macOS host-side escape hatch when a live frame left the OUT queue
+        // stuck; it never resets the board or replays protocol data.
+        #[cfg(not(windows))]
+        let output_reset: Option<Box<dyn LiveOutputReset>> = probed
+            .writer
+            .try_clone()
+            .ok()
+            .map(|port| Box::new(SerialOutputReset { port }) as Box<dyn LiveOutputReset>);
+        #[cfg(windows)]
+        let output_reset: Option<Box<dyn LiveOutputReset>> = None;
 
         let mut connection = UsbConnection {
             connection_id,
@@ -1604,8 +1702,15 @@ impl UsbSerialManager {
             *conn = Some(connection);
             cache_usb_status(&self.status_snapshot, conn.as_ref());
         }
-        // A reconnected port starts with a fresh transient-stall budget.
+        // A reconnected port starts with a fresh transient-stall budget and a
+        // fresh output-reset cooldown.
         self.transient_realtime_stalls.store(0, Ordering::Release);
+        if let Ok(mut reset) = self.live_output_reset.lock() {
+            *reset = output_reset.map(|reset| (connection_id, reset));
+        }
+        if let Ok(mut recovery) = self.live_output_recovery.lock() {
+            recovery.clear();
+        }
         on_message(initial_hello.topic, initial_hello.payload);
 
         // Start reader thread
@@ -1733,6 +1838,12 @@ impl UsbSerialManager {
                 }
                 *conn = None;
                 cache_usb_status(&self.status_snapshot, None);
+            }
+            if let Ok(mut reset) = self.live_output_reset.lock() {
+                *reset = None;
+            }
+            if let Ok(mut recovery) = self.live_output_recovery.lock() {
+                recovery.clear();
             }
         }
     }
@@ -1940,6 +2051,7 @@ impl UsbSerialManager {
         // Preserved for the recovery decision below; the typed report is lost
         // once the failure is rendered into a user-facing error string.
         let mut live_error_kind: Option<&'static str> = None;
+        let mut live_reset_report = LiveOutputResetReport::default();
         let write_result = {
             let _pause = (!live_frame).then(|| SerialReaderPause::new(&self.serial_body_write_active));
             (|| {
@@ -1949,12 +2061,7 @@ impl UsbSerialManager {
                         paced_slice_bytes.unwrap_or(bytes.len()), P4_CH343_SERIAL_WRITE_GAP);
                     let report=match &result {Ok(report)=>report,Err(error)=>&error.report};
                     if result.is_err() || report.retries > 0 {
-                        let stage=match topic {
-                            "audio/play_chunk"=>"audio_chunk", "audio/play_begin"=>"audio_begin",
-                            "audio/play_end"=>"audio_end", "audio/play_flush"=>"audio_flush",
-                            "audio/conversation"=>"conversation", "ui/conversation"=>"conversation_ui",
-                            "widget/data"=>"widget", "app/snapshot"=>"app_snapshot", "system/heartbeat"=>"heartbeat", _=>"other_live",
-                        };
+                        let stage=live_write_stage(topic);
                         let event=if result.is_ok() {"live_write_recovered"}else{"live_write_failed"};
                         // Never log JSON bodies, PCM, board IDs or driver text.
                         let details=serde_json::json!({"stage":stage,"ok":result.is_ok(),
@@ -1968,11 +2075,45 @@ impl UsbSerialManager {
                         Ok(_) => Ok(()),
                         Err(error) => {
                             live_error_kind = error.report.error_kind;
-                            // Terminate the truncated JSON line (best effort, one
-                            // bounded write) so the board discards it instead of
-                            // concatenating the next frame onto a partial line and
-                            // losing that frame too.
-                            let _ = conn.writer.write(b"\n");
+                            if topic == "audio/play_chunk"
+                                && matches!(
+                                    live_error_kind,
+                                    Some("timeout" | "would_block" | "interrupted")
+                                )
+                            {
+                                // A partial audio frame may still occupy the tty
+                                // output queue after the driver gives up. Purge
+                                // it once per stalled frame, then write exactly
+                                // one newline boundary so the next frame is not
+                                // concatenated onto a truncated JSON line.
+                                live_reset_report =
+                                    self.discard_stalled_live_output(conn);
+                                if live_reset_report.attempted {
+                                    let details = serde_json::json!({
+                                        "stage":live_write_stage(topic),
+                                        "pendingBytesBefore":live_reset_report.pending_bytes_before,
+                                        "pendingBytesAfter":live_reset_report.pending_bytes_after,
+                                        "resetOk":live_reset_report.reset_ok,
+                                        "boundaryOk":live_reset_report.boundary_ok,
+                                        "generation":conn.connection_id,
+                                    });
+                                    transfer_log::record(
+                                        "connection",
+                                        "live_output_reset",
+                                        details.clone(),
+                                    );
+                                    crate::realtime_chat_log::record(
+                                        payload.get("sessionId").and_then(serde_json::Value::as_str).unwrap_or(""),
+                                        "live_output_reset",
+                                        details,
+                                    );
+                                }
+                            }
+                            // Fall back to the previous single best-effort
+                            // newline when no purge ran or the boundary failed.
+                            if !live_reset_report.boundary_ok {
+                                let _ = conn.writer.write(b"\n");
+                            }
                             Err(format!("Live serial write failed: {error}"))
                         }
                     };
@@ -1999,17 +2140,23 @@ impl UsbSerialManager {
         };
         if let Err(error) = write_result {
             // A diagnosed USB CDC OUT stall is a transient tty write timeout
-            // (~0.4-1.5 s) while the board stays alive. During a realtime
-            // conversation the player drops the late audio chunk and resumes on
-            // the next one, so tearing the port down here would turn a
-            // sub-second stall into a lost session and a false "客户端未连接"
-            // banner. Audio chunks and any frame during active capture get this
-            // grace; a permanent error, any frame outside that path, or an
-            // exhausted budget still fails closed below.
+            // while the board stays alive. During a realtime conversation the
+            // player drops the late audio chunk and resumes on the next one, so
+            // tearing the port down would turn a sub-second stall into a lost
+            // session and a false "客户端未连接" banner.
             let capture_active = conn.capture_active.load(Ordering::Acquire);
-            let transient_realtime_stall = live_frame
-                && (topic == "audio/play_chunk" || capture_active)
-                && matches!(live_error_kind, Some("timeout" | "would_block" | "interrupted"));
+            let transient = matches!(
+                live_error_kind,
+                Some("timeout" | "would_block" | "interrupted")
+            );
+            let audio_payload = topic == "audio/play_chunk";
+            // Only the audio payload drives the port budget. Heartbeats,
+            // subtitles and UI/snapshot frames during capture are replaceable and
+            // must not be the fifth stall that tears down a healthy conversation.
+            if transient && live_frame && capture_active && !audio_payload {
+                return Err(error);
+            }
+            let transient_realtime_stall = live_frame && transient && audio_payload;
             if transient_realtime_stall
                 && self.transient_realtime_stalls.fetch_add(1, Ordering::AcqRel) + 1
                     < MAX_TRANSIENT_REALTIME_STALLS
@@ -2034,6 +2181,25 @@ impl UsbSerialManager {
         }
 
         Ok(())
+    }
+
+    /// Purge a stalled macOS tty output queue at most once per cooldown and
+    /// leave one protocol boundary. This is host-side only: it does not replay
+    /// the failed frame, reset the board, or change the reconnect policy.
+    fn discard_stalled_live_output(&self, conn: &mut UsbConnection) -> LiveOutputResetReport {
+        let Ok(mut slot) = self.live_output_reset.lock() else {
+            return LiveOutputResetReport::default();
+        };
+        let Some((generation, reset)) = slot.as_mut() else {
+            return LiveOutputResetReport::default();
+        };
+        if *generation != conn.connection_id {
+            return LiveOutputResetReport::default();
+        }
+        let Ok(mut recovery) = self.live_output_recovery.lock() else {
+            return LiveOutputResetReport::default();
+        };
+        recovery.recover(conn.writer.as_mut(), Some(reset.as_mut()))
     }
 
     /// Flush the writer
@@ -2188,8 +2354,23 @@ impl UsbSerialManager {
         expected_board_device_id: &str,
         timeout: Duration,
     ) -> Result<(), String> {
-        let expected_board_device_id =
-            validate_expected_board_device_id(expected_board_device_id)?;
+        self.probe_liveness_classified(expected_board_device_id, timeout)
+            .map_err(|failure| failure.message)
+    }
+
+    /// Typed form used by the host heartbeat: a transient write failure is
+    /// backpressure, not proof that the board vanished. The caller bounds how
+    /// many probe cycles may stay unwritable before reconnecting.
+    pub(crate) fn probe_liveness_classified(
+        &self,
+        expected_board_device_id: &str,
+        timeout: Duration,
+    ) -> Result<(), LivenessFailure> {
+        let expected_board_device_id = validate_expected_board_device_id(expected_board_device_id)
+            .map_err(|message| LivenessFailure {
+                kind: LivenessFailureKind::InvalidBoardId,
+                message,
+            })?;
         // Bounded, metadata-only failure classification for the connection log;
         // never persist driver text or port paths.
         let record_failure = |reason: &'static str| {
@@ -2203,7 +2384,10 @@ impl UsbSerialManager {
         let (sender, receiver) = mpsc::channel();
         self.device_response_waiters
             .lock()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| LivenessFailure {
+                kind: LivenessFailureKind::WritePermanent,
+                message: error.to_string(),
+            })?
             .push(DeviceResponseWaiter {
                 request_id: request_id.clone(),
                 response_topic: "protocol/ack".to_string(),
@@ -2219,15 +2403,27 @@ impl UsbSerialManager {
             &serde_json::json!({ "tsMs": ts_ms, "requestId": request_id.clone() }),
         ) {
             self.remove_device_response_waiter(&request_id, "protocol/ack");
-            record_failure("send_failed");
-            return Err(error);
+            let kind = if serial_write_error_is_backpressure(&error) {
+                LivenessFailureKind::WriteBackpressure
+            } else {
+                LivenessFailureKind::WritePermanent
+            };
+            record_failure(if kind == LivenessFailureKind::WriteBackpressure {
+                "write_backpressure"
+            } else {
+                "send_failed"
+            });
+            return Err(LivenessFailure { kind, message: error });
         }
         let response = match receiver.recv_timeout(timeout) {
             Ok(response) => response,
             Err(_) => {
                 self.remove_device_response_waiter(&request_id, "protocol/ack");
                 record_failure("ack_timeout");
-                return Err("heartbeat acknowledgement timed out".to_string());
+                return Err(LivenessFailure {
+                    kind: LivenessFailureKind::AckTimeout,
+                    message: "heartbeat acknowledgement timed out".to_string(),
+                });
             }
         };
         let request_topic = response
@@ -2236,13 +2432,19 @@ impl UsbSerialManager {
             .unwrap_or_default();
         if request_topic != "system/heartbeat" {
             record_failure("ack_topic_mismatch");
-            return Err(format!(
-                "heartbeat acknowledgement topic mismatch: {request_topic}"
-            ));
+            return Err(LivenessFailure {
+                kind: LivenessFailureKind::AckMismatch,
+                message: format!(
+                    "heartbeat acknowledgement topic mismatch: {request_topic}"
+                ),
+            });
         }
         if response.get("ok").and_then(|value| value.as_bool()) == Some(false) {
             record_failure("ack_rejected");
-            return Err("device rejected heartbeat".to_string());
+            return Err(LivenessFailure {
+                kind: LivenessFailureKind::AckRejected,
+                message: "device rejected heartbeat".to_string(),
+            });
         }
         Ok(())
     }
@@ -6909,7 +7111,16 @@ mod tests {
     struct FailingWriter(std::io::ErrorKind);
     impl Write for FailingWriter {
         fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(self.0, "synthetic serial failure"))
+            // Mirror the OS-display text that the real tty writer produces:
+            // the liveness classifier only sees the rendered error string.
+            let message = match self.0 {
+                std::io::ErrorKind::TimedOut => "Operation timed out",
+                std::io::ErrorKind::WouldBlock => "operation would block",
+                std::io::ErrorKind::Interrupted => "Interrupted system call",
+                std::io::ErrorKind::BrokenPipe => "Broken pipe",
+                _ => "synthetic serial failure",
+            };
+            Err(std::io::Error::new(self.0, message))
         }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
@@ -7124,15 +7335,15 @@ mod tests {
         assert!(!manager.connection.lock().unwrap().as_ref().unwrap().connected);
 
         // During an active realtime conversation, HUD/subtitle/heartbeat frames
-        // hit the same transient stall and share the bounded port budget instead
-        // of ending the session on the first timeout.
+        // are replaceable: their transient stall is dropped without consuming the
+        // audio payload's bounded port budget.
         let manager = UsbSerialManager::new();
         let capture = Arc::new(AtomicBool::new(true));
         failing_connection_with_capture(&manager, std::io::ErrorKind::TimedOut, &capture);
         assert!(manager.send("ui/conversation", &serde_json::json!({"state":"speaking"})).is_err());
         assert!(
             manager.connection.lock().unwrap().as_ref().unwrap().connected,
-            "frames during active capture must share the bounded transient budget",
+            "control frames during active capture must not tear the port down",
         );
 
         // Outside an active conversation the same transient live frame keeps the
@@ -7144,6 +7355,187 @@ mod tests {
             !manager.connection.lock().unwrap().as_ref().unwrap().connected,
             "non-realtime live frames must not use the transient budget",
         );
+    }
+
+    struct QueueRecoveryWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        calls: usize,
+        fail_first: usize,
+    }
+    impl Write for QueueRecoveryWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls <= self.fail_first {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "synthetic stalled tty output",
+                ));
+            }
+            self.bytes.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    struct CountingOutputReset {
+        calls: Arc<AtomicUsize>,
+        pending_after: u32,
+    }
+    impl LiveOutputReset for CountingOutputReset {
+        fn discard_pending_output(&mut self) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn pending_output_bytes(&self) -> Option<u32> {
+            Some(self.pending_after)
+        }
+    }
+
+    #[test]
+    fn transient_audio_stall_purges_the_tty_queue_and_recovers_on_the_next_frame() {
+        let manager = UsbSerialManager::new();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let reset_calls = Arc::new(AtomicUsize::new(0));
+        connection_with_writer(
+            &manager,
+            Box::new(QueueRecoveryWriter {
+                bytes: Arc::clone(&bytes),
+                calls: 0,
+                fail_first: 9,
+            }),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        *manager.live_output_reset.lock().unwrap() = Some((
+            1,
+            Box::new(CountingOutputReset {
+                calls: Arc::clone(&reset_calls),
+                pending_after: 0,
+            }),
+        ));
+        // One exhausted live frame (9 driver attempts x 100 ms timeout) left a
+        // partial JSON line in the tty output queue.
+        assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"x"})).is_err());
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 1, "exactly one bounded purge");
+        assert!(manager.connection.lock().unwrap().as_ref().unwrap().connected);
+        assert_eq!(bytes.lock().unwrap().as_slice(), b"\n".as_slice(), "one boundary, no frame replay");
+
+        // The next 100 ms chunk succeeds on the cleaned queue; the link budget
+        // resets and the audio payload is delivered once.
+        assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"next"})).is_ok());
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 1);
+        let written = bytes.lock().unwrap().clone();
+        assert!(written.ends_with(b"\n"));
+        assert!(String::from_utf8_lossy(&written).contains("\"next\""));
+    }
+
+    #[test]
+    fn control_frames_never_exhaust_the_audio_stall_budget() {
+        let manager = UsbSerialManager::new();
+        let capture = Arc::new(AtomicBool::new(true));
+        failing_connection_with_capture(&manager, std::io::ErrorKind::TimedOut, &capture);
+        for _ in 0..8 {
+            assert!(manager.send("ui/conversation", &serde_json::json!({"state":"speaking"})).is_err());
+            assert!(manager.send("system/heartbeat", &serde_json::json!({})).is_err());
+            assert!(
+                manager.connection.lock().unwrap().as_ref().unwrap().connected,
+                "replaceable control frames must not consume the audio payload budget",
+            );
+        }
+        for attempt in 1..MAX_TRANSIENT_REALTIME_STALLS {
+            assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"x"})).is_err());
+            assert!(
+                manager.connection.lock().unwrap().as_ref().unwrap().connected,
+                "audio stall {attempt} must stay inside the budget",
+            );
+        }
+        assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"x"})).is_err());
+        assert!(
+            !manager.connection.lock().unwrap().as_ref().unwrap().connected,
+            "the audio payload budget still fails closed when exhausted",
+        );
+    }
+
+    #[test]
+    fn permanent_errors_never_purge_the_output_queue() {
+        let manager = UsbSerialManager::new();
+        let reset_calls = Arc::new(AtomicUsize::new(0));
+        failing_connection(&manager, std::io::ErrorKind::BrokenPipe);
+        *manager.live_output_reset.lock().unwrap() = Some((
+            1,
+            Box::new(CountingOutputReset {
+                calls: Arc::clone(&reset_calls),
+                pending_after: 0,
+            }),
+        ));
+        assert!(manager.send("audio/play_chunk", &serde_json::json!({"data":"x"})).is_err());
+        assert_eq!(reset_calls.load(Ordering::SeqCst), 0);
+        assert!(!manager.connection.lock().unwrap().as_ref().unwrap().connected);
+    }
+
+    #[test]
+    fn liveness_write_backpressure_is_bounded_before_reconnecting() {
+        assert!(serial_write_error_is_backpressure(
+            "Live serial write failed: timeout after 0 bytes (8 retries)"
+        ));
+        assert!(serial_write_error_is_backpressure(
+            "Paced serial write failed: would_block"
+        ));
+        assert!(serial_write_error_is_backpressure(
+            "Write failed: Operation timed out (os error 60)"
+        ));
+        assert!(serial_write_error_is_backpressure(
+            "Paced serial write failed: operation would block"
+        ));
+        assert!(!serial_write_error_is_backpressure(
+            "Live serial write failed: broken_pipe after 64 bytes (0 retries)"
+        ));
+        assert!(!liveness_failure_forces_reconnect(
+            LivenessFailureKind::WriteBackpressure,
+            0
+        ));
+        assert!(!liveness_failure_forces_reconnect(
+            LivenessFailureKind::WriteBackpressure,
+            MAX_LIVENESS_WRITE_BACKPRESSURE - 1
+        ));
+        assert!(liveness_failure_forces_reconnect(
+            LivenessFailureKind::WriteBackpressure,
+            MAX_LIVENESS_WRITE_BACKPRESSURE
+        ));
+        assert!(liveness_failure_forces_reconnect(
+            LivenessFailureKind::AckTimeout,
+            0
+        ));
+        assert!(liveness_failure_forces_reconnect(
+            LivenessFailureKind::WritePermanent,
+            0
+        ));
+    }
+
+    #[test]
+    fn liveness_probe_classifies_a_timed_out_heartbeat_write_as_backpressure() {
+        let manager = UsbSerialManager::new();
+        failing_connection(&manager, std::io::ErrorKind::TimedOut);
+        let failure = manager
+            .probe_liveness_classified("p4-test", Duration::from_millis(30))
+            .unwrap_err();
+        assert_eq!(
+            failure.kind,
+            LivenessFailureKind::WriteBackpressure,
+            "{}",
+            failure.message
+        );
+        assert!(failure.message.contains("timed out"), "{}", failure.message);
+        assert!(!liveness_failure_forces_reconnect(
+            failure.kind,
+            1
+        ));
+
+        let manager = UsbSerialManager::new();
+        failing_connection(&manager, std::io::ErrorKind::BrokenPipe);
+        let failure = manager
+            .probe_liveness_classified("p4-test", Duration::from_millis(30))
+            .unwrap_err();
+        assert_eq!(failure.kind, LivenessFailureKind::WritePermanent);
+        assert!(liveness_failure_forces_reconnect(failure.kind, 0));
     }
 
     #[test]
