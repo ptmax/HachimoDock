@@ -1093,7 +1093,7 @@ async fn run_session(
         let _ = player.send(PlayerCmd::Subtitle(greeting.clone()));
         let _ = player.send(PlayerCmd::Pcm(greeting_pcm));
         match listen_with_verified_barge_in(async {wait_playback(&player).await; Ok(())}, &mut rx, &mut deferred_audio, &mut vad, duplex).await {
-            Ok(Some(speech)) if speech.no_transcript_stop => {
+            Ok(Some(speech)) if speech.no_transcript_stop || speech.stop_only => {
                 let _ = player.send(PlayerCmd::Flush);
                 tts.interrupt();
                 diagnostics::record(&session.id,"voice_stop",json!({"turn":0,"chars":0,"reason":"no_transcript"}));
@@ -1394,15 +1394,16 @@ async fn run_session(
                                         let _ = player.send(PlayerCmd::Flush);
                                         tts.interrupt();
                                         crate::smart_home::cancel_voice_session(&session.id);
-                                        let reason = if speech.no_transcript_stop { "no_transcript_short_command" } else { "asr_confirmed" };
+                                        let reason = if speech.no_transcript_stop { "no_transcript_short_command" } else if speech.stop_only { "explicit_stop" } else { "asr_confirmed" };
                                         diagnostics::record(&session.id,"barge_in",json!({"turn":turns,"bytes":speech.stats.frames*FRAME_BYTES,"reason":reason}));
                                         let partial=session.status.lock().map(|s|s.reply.clone()).unwrap_or_default();
                                         remember_interrupted_reply(&mut history,&mut desktop_conversation,&user_text,&partial);
                                     }
-                                    if speech.no_transcript_stop {
-                                        // The cloud lost the words, so this is a stop,
-                                        // not a new user turn. Keep listening.
-                                        diagnostics::record(&session.id,"voice_stop",json!({"turn":turns,"chars":0,"reason":"no_transcript"}));
+                                    if speech.no_transcript_stop || speech.stop_only {
+                                        // A stop phrase or a lost short command is a
+                                        // stop, not a new user turn. Keep listening.
+                                        let stop_reason = if speech.stop_only { "explicit_stop" } else { "no_transcript" };
+                                        diagnostics::record(&session.id,"voice_stop",json!({"turn":turns,"chars":if speech.stop_only {speech.text.chars().count()} else {0},"reason":stop_reason}));
                                         vad.reset();
                                         publish(&app, &session, |s| {s.state="listening".into(); s.transcript.clear();});
                                         hud(&usb, &board, &session.id, "listening", &name, "");
@@ -1457,11 +1458,16 @@ struct VerifiedSpeech {
     /// command is the only evidence. It stops playback but is not handed to
     /// the conversation loop as a new user turn.
     no_transcript_stop: bool,
+    /// The transcript is an explicit stop phrase ("停", "等等", "暂停", ...).
+    /// It interrupts playback but is not submitted as a new user turn.
+    stop_only: bool,
 }
 
 fn is_explicit_stop(text: &str) -> bool {
-    let mut chars = text.chars().filter(|ch| ch.is_alphanumeric());
-    chars.next() == Some('停') && chars.next().is_none()
+    matches!(
+        barge_policy::normalized(text).as_str(),
+        "停" | "停止" | "等等" | "等一下" | "暂停" | "先别" | "取消"
+    )
 }
 
 fn has_barge_in_text(text: &str) -> bool {
@@ -1493,7 +1499,7 @@ fn start_barge_probe(frames: Vec<Vec<u8>>) -> Result<VerifiedSpeech, String> {
         recognizer.push_pcm(&frame)?;
         stats.observe(&frame);
     }
-    Ok(VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false })
+    Ok(VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false, stop_only: false })
 }
 
 async fn listen_with_verified_barge_in<F>(reply: F, rx: &mut mpsc::Receiver<Input>, deferred: &mut VecDeque<Input>, vad: &mut Vad, duplex: bool)
@@ -1597,6 +1603,7 @@ where F: std::future::Future<Output=Result<(), String>>,
                                 probe.text.clear();
                                 probe.terminal = true;
                                 probe.no_transcript_stop = true;
+                                probe.stop_only = true;
                                 diagnostics::record(&vad.diagnostic_session,"barge_confirmed",json!({
                                     "chars":0,"elapsedMs":started.elapsed().as_millis(),"frames":probe.stats.frames,
                                     "state":phase,"reason":"no_transcript_short_command",
@@ -1616,6 +1623,7 @@ where F: std::future::Future<Output=Result<(), String>>,
                         }
                         probe.text = text;
                         probe.terminal = terminal;
+                        probe.stop_only = is_explicit_stop(&probe.text);
                         // The candidate may have ended while waiting for cloud ASR.
                         // Continue with the SAME stream; ordinary silence detection
                         // sends its final marker once, without losing later speech.
@@ -2522,7 +2530,7 @@ mod tests {
         }
         let mut stats = AsrCaptureStats::default();
         for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
-        (VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false },
+        (VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false, stop_only: false },
             (sink, if keep_events_open { Some(tx) } else { None }))
     }
 
@@ -2543,7 +2551,7 @@ mod tests {
         });
         let mut stats = AsrCaptureStats::default();
         for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
-        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false }
+        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false, stop_only: false }
     }
 
     /// Fake ASR that emits one textual Partial, then an empty Final when
@@ -2562,7 +2570,7 @@ mod tests {
         });
         let mut stats = AsrCaptureStats::default();
         for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
-        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false }
+        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false, no_transcript_stop: false, stop_only: false }
     }
 
     /// Candidate speech followed by a known amount of trailing silence. The
@@ -2770,8 +2778,8 @@ mod tests {
     fn barge_in_needs_two_real_characters_or_explicit_stop() {
         for text in ["", "  ", "……！", "嗯", "啊，！", "a", "🙂🙂"] { assert!(!has_barge_in_text(text), "{text}"); }
         for text in ["停", " 停！ ", "停下", "等 一 下！", "你好", "OK", "换歌"] { assert!(has_barge_in_text(text), "{text}"); }
-        for text in ["停", " 停！ "] { assert!(is_explicit_stop(text)); }
-        for text in ["", "停下", "停止音乐", "等一下", "不停", "嗯"] { assert!(!is_explicit_stop(text)); }
+        for text in ["停", " 停！ ", "等等", "暂停", "等一下", "停止", "先别", "取消"] { assert!(is_explicit_stop(text), "{text}"); }
+        for text in ["", "停下", "停止音乐", "不停", "嗯"] { assert!(!is_explicit_stop(text)); }
     }
 
     #[test]
