@@ -60,8 +60,10 @@ impl NoTranscriptEvidence {
 // that are still thinking.
 pub const NO_TRANSCRIPT_MIN_VOICED_FRAMES: usize = 8; // 160 ms, same as the barge gate
 pub const NO_TRANSCRIPT_MAX_VOICED_FRAMES: usize = 34; // 680 ms; longer = normal speech
-// 75% of the minimum voiced evidence: a plosive onset ("停") may spend one or
-// two of the first eight frames, but the vowel body must still dominate.
+// The real "停" trace shows 12/20 periodic frames (60%) because the plosive
+// onset is noisy while the vowel body remains periodic. Keep at least six
+// periodic frames and require half of the voiced evidence; a pure click burst
+// has no periodic frames at all.
 pub const NO_TRANSCRIPT_MIN_PERIODIC_FRAMES: usize = 6;
 pub const NO_TRANSCRIPT_MIN_PEAK_RMS: f32 = 260.0;
 pub const NO_TRANSCRIPT_MAX_PEAK_RMS: f32 = 12_000.0;
@@ -96,7 +98,7 @@ pub fn no_transcript_short_command(
         return false;
     }
     if evidence.periodic_frames < NO_TRANSCRIPT_MIN_PERIODIC_FRAMES { return false; }
-    if evidence.periodic_frames * 4 < voiced_frames * 3 { return false; }
+    if evidence.periodic_frames * 2 < voiced_frames { return false; }
     (NO_TRANSCRIPT_MIN_PEAK_RMS..=NO_TRANSCRIPT_MAX_PEAK_RMS).contains(&evidence.peak_rms)
 }
 
@@ -305,9 +307,11 @@ mod tests {
         // Aperiodic noise can trip the energy VAD but contributes no periodic frames.
         let noise = NoTranscriptEvidence { periodic_frames: 2, peak_rms: 2000.0 };
         assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, noise));
-        // Mostly noise with a couple of voiced frames stays rejected.
-        let mixed = NoTranscriptEvidence { periodic_frames: 8, peak_rms: 2000.0 };
+        // Mostly noise with only a couple of periodic frames stays rejected.
+        let mixed = NoTranscriptEvidence { periodic_frames: 5, peak_rms: 2000.0 };
         assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, mixed));
+        // Real "停" trace: 12 periodic / 20 voiced (60%) must pass.
+        assert!(no_transcript_short_command("speaking", false, true, false, "", 20, short_command_evidence()));
         // Plosive onset tolerance: the minimum candidate needs six periodic frames.
         let minimum_ok = NoTranscriptEvidence { periodic_frames: 6, peak_rms: 900.0 };
         assert!(no_transcript_short_command("speaking", false, true, false, "", 8, minimum_ok));
