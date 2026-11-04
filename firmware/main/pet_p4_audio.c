@@ -1068,6 +1068,16 @@ void pet_p4_audio_set_approval_pending(bool pending) {
   uint64_t now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
   if (pending) {
     g_approval_cue_block_until_ms = UINT64_MAX;
+    /* If the stop cue started just before the approval request arrived, cut
+     * it now. Incrementing the generation makes the playback loop abandon
+     * its current WAV at the next chunk; clearing the one-slot queue removes
+     * any stop cue that has not started yet. The approval cue is enqueued
+     * immediately afterwards. */
+    if (g_playback_queue
+        && !strcmp(g_last_event_cue_family, "session_terminated")) {
+      atomic_fetch_add_explicit(&g_playback_generation, 1U, memory_order_acq_rel);
+      xQueueReset(g_playback_queue);
+    }
   } else if (g_approval_cue_block_until_ms != 0) {
     g_approval_cue_block_until_ms = now_ms + 1500ULL;
   }
