@@ -359,8 +359,16 @@ fn route_session_audio(session: &Session, topic: &str, payload: &Value) -> bool 
             _ => "audio_command_rejected",
         };
         diagnostics::record(&session.id, "protocol_rejected", json!({"stage":stage,"reason":reason,"ok":false}));
+        // A single full/bad chunk is recoverable: dropping it leaves a short
+        // gap, whereas aborting the whole turn makes the device look dead.
+        // Invalid payloads still fail closed because they indicate a broken
+        // protocol stream rather than transient backpressure.
+        if reason == "audio_chunk_rejected" {
+            diagnostics::record(&session.id, "audio_chunk_dropped", json!({"ok":false,"reason":reason}));
+            return true;
+        }
         if let Ok(mut s) = session.status.lock() {
-            s.error = if reason == "audio_chunk_rejected" || reason == "audio_chunk_invalid" {
+            s.error = if reason == "audio_chunk_invalid" {
                 "设备未能接收音频数据，已停止播放；请提供实时对话日志排查 USB 传输".into()
             } else { "设备拒绝音频指令，请检查固件及设备音频状态".into() };
         }
@@ -1546,7 +1554,25 @@ where F: std::future::Future<Output=Result<(), String>>,
             // retained frames. A backlog must not starve confirmation or playback.
             tokio::select! {
                 biased;
-                _ = &mut deadline => { rejection = "confirmation_timeout"; break; }
+                _ = &mut deadline => {
+                    // A short "等等" can lose its Final entirely. If the ASR
+                    // deadline expires with no transcript, use the same bounded
+                    // acoustic fallback rather than discarding the barge.
+                    let phase = vad.session.as_ref().and_then(|s| s.status.lock().ok().map(|s| s.state.clone()))
+                        .unwrap_or_else(|| "thinking".into());
+                    if barge_policy::no_transcript_short_command(&phase, probe.reply_completed, input_finished, heard_partial_text, "", voiced_frames, evidence) {
+                        probe.text.clear();
+                        probe.terminal = true;
+                        probe.no_transcript_stop = true;
+                        diagnostics::record(&vad.diagnostic_session,"barge_confirmed",json!({
+                            "chars":0,"elapsedMs":started.elapsed().as_millis(),"frames":probe.stats.frames,
+                            "state":phase,"reason":"timeout_no_transcript_short_command",
+                            "voicedFrames":voiced_frames,"periodicFrames":evidence.periodic_frames,
+                            "peakRms":evidence.peak_rms.round()}));
+                        return Ok(Some(probe));
+                    }
+                    rejection = "confirmation_timeout"; break;
+                }
                 event = probe.events.recv() => match event {
                     Some(event @ (StreamingSpeechEvent::Partial { .. } | StreamingSpeechEvent::Final { .. })) => {
                         let (text, terminal, confidence) = match event {

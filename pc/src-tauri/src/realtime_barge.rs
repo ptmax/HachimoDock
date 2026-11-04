@@ -59,7 +59,7 @@ impl NoTranscriptEvidence {
 // never replaces a transcript and never applies to long speech or to tasks
 // that are still thinking.
 pub const NO_TRANSCRIPT_MIN_VOICED_FRAMES: usize = 8; // 160 ms, same as the barge gate
-pub const NO_TRANSCRIPT_MAX_VOICED_FRAMES: usize = 34; // 680 ms; longer = normal speech
+pub const NO_TRANSCRIPT_MAX_VOICED_FRAMES: usize = 60; // 1.2 s; "等等" often exceeds 680 ms
 // The real "停" trace shows 12/20 periodic frames (60%) because the plosive
 // onset is noisy while the vowel body remains periodic. Keep at least six
 // periodic frames and require half of the voiced evidence; a pure click burst
@@ -80,7 +80,7 @@ pub const NO_TRANSCRIPT_MAX_PEAK_RMS: f32 = 12_000.0;
 /// - the cloud returned no meaningful text and never emitted a textual Partial:
 ///   if ASR heard *anything*, even a rejected fragment, the transcript path
 ///   owns the decision and this fallback stays closed;
-/// - the candidate is short once voiced (8–34 frames) and at least 75% of the
+/// - the candidate is short once voiced (8–60 frames) and at least half of the
 ///   voiced frames are periodic near-end speech with a bounded peak level.
 pub fn no_transcript_short_command(
     phase: &str,
