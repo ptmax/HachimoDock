@@ -1403,10 +1403,15 @@ async fn run_session(
                                         // A stop phrase or a lost short command is a
                                         // stop, not a new user turn. Keep listening.
                                         let stop_reason = if speech.stop_only { "explicit_stop" } else { "no_transcript" };
-                                        diagnostics::record(&session.id,"voice_stop",json!({"turn":turns,"chars":if speech.stop_only {speech.text.chars().count()} else {0},"reason":stop_reason}));
+                                        let stop_text = if speech.stop_only { speech.text.clone() } else { String::new() };
+                                        diagnostics::record(&session.id,"voice_stop",json!({"turn":turns,"chars":stop_text.chars().count(),"reason":stop_reason}));
                                         vad.reset();
-                                        publish(&app, &session, |s| {s.state="listening".into(); s.transcript.clear();});
-                                        hud(&usb, &board, &session.id, "listening", &name, "");
+                                        publish(&app, &session, |s| {
+                                            s.state="listening".into();
+                                            if stop_text.is_empty() { s.transcript.clear(); }
+                                            else { s.transcript=stop_text.clone(); }
+                                        });
+                                        hud(&usb, &board, &session.id, "listening", &name, &stop_text);
                                     } else {
                                         pending_speech = Some(speech);
                                     }
