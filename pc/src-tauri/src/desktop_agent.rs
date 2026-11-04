@@ -48,6 +48,10 @@ pub struct Context {
     device_agent: String,
     /// Device-bound Session for the follow target, or empty for `auto`.
     followed_session: String,
+    /// Set when the UI supplied an explicit realtime target that cannot be
+    /// confirmed. Dispatch must fail closed instead of using the current
+    /// session in that case.
+    realtime_target_error: Option<String>,
     pub conversation: String,
     pub board: String,
     pub utterance: String,
@@ -109,6 +113,7 @@ impl Context {
             followed_agent: None,
             device_agent: String::new(),
             followed_session: String::new(),
+            realtime_target_error: None,
             conversation: conversation.into(),
             board: board.into(),
             utterance: format!("{conversation}-{turn}"),
@@ -131,6 +136,52 @@ impl Context {
             .unwrap_or("").trim().to_string();
         self
     }
+    /// Apply the P4 selection snapshot captured at realtime start.
+    ///
+    /// An explicit session id is authoritative even when the asynchronous
+    /// `set_p4_session_binding` commit is still in flight or a newer
+    /// auto-follow target exists: the device selection is what the user asked
+    /// for. If the target agent is missing/unknown, dispatch fails closed;
+    /// `auto` keeps the historical follow/current behaviour.
+    pub fn with_realtime_target(mut self, agent_id: &str, session_id: &str) -> Self {
+        let agent = agent_id.trim();
+        let session = session_id.trim();
+        if session.is_empty() || session.eq_ignore_ascii_case("auto") {
+            return self.with_followed_agent();
+        }
+        if agent.len() > 64 || session.len() > 512 {
+            self.realtime_target_error = Some(
+                "无法确认设备选择的派发目标，请重新在设备上选择会话后再派发；尚未派发。".into(),
+            );
+            return self;
+        }
+        self.device_agent = agent.to_string();
+        self.followed_session = session.to_string();
+        self.followed_agent = Some(agent.to_string());
+        match agent {
+            "codex" => self.agent = Agent::Codex,
+            "workbuddy" => self.agent = Agent::Workbuddy,
+            "deepseek-harness" => self.agent = Agent::Dsh,
+            _ => {
+                self.realtime_target_error = Some(
+                    "无法确认设备选择的派发目标，请重新在设备上选择会话后再派发；尚未派发。".into(),
+                );
+            }
+        }
+        self
+    }
+
+    /// Mark the realtime target as unconfirmed. Dispatch fails closed with a
+    /// stable receipt instead of falling back to the current/auto session.
+    pub fn with_target_unconfirmed(mut self, unconfirmed: bool) -> Self {
+        if unconfirmed {
+            self.realtime_target_error = Some(
+                "无法确认 DSH 当前选中的会话，请先在 DSH 中打开会话或在设备上选择；尚未派发。".into(),
+            );
+        }
+        self
+    }
+
     pub fn with_followed_agent(mut self)->Self {
         // Share the device's existing follow resolver, including its selected
         // Agent fallback when no specific session is pinned. Never use the
@@ -546,6 +597,11 @@ async fn execute_inner(ctx: &Context, input: Value, untrusted: bool) -> Result<V
     let ctx=&selected;
     if input.operation == "capabilities" {
         return Ok(capabilities());
+    }
+    if input.operation == "dispatch" {
+        if let Some(message) = ctx.realtime_target_error.clone() {
+            return Err(message);
+        }
     }
     if !ctx.supports_default_agent() {
         return Err("当前跟随的 Agent 暂不支持实时对话任务派发，未切换到其他 Agent；请先跟随 ChatGPT（Codex）、WorkBuddy 或 DeepSeek Harness。".into());
@@ -1698,6 +1754,7 @@ mod tests {
             followed_agent: None,
             device_agent: String::new(),
             followed_session: String::new(),
+            realtime_target_error: None,
             conversation: "rtc-test".into(),
             board: "board-test".into(),
             utterance: format!("rtc-test-{turn}"),
@@ -1722,6 +1779,65 @@ mod tests {
             assert!(task.session.is_empty());
         }
     }
+    #[test]
+    fn realtime_explicit_p4_target_overrides_a_stale_follow_binding() {
+        // Simulate the observed race: the global binding still points at the
+        // previous/current session while the user just selected another card.
+        let previous = crate::p4_session_binding()
+            .lock()
+            .expect("session binding")
+            .clone();
+        {
+            let mut stale_binding = crate::p4_session_binding().lock().unwrap();
+            stale_binding.board_device_id = "board-test".into();
+            stale_binding.agent_id = "deepseek-harness".into();
+            stale_binding.session_id = "session-current".into();
+            stale_binding.auto_follow = false;
+            stale_binding.generation = 7;
+        }
+        let mut stale = context("整理文档", 1);
+        stale.agent = Agent::Dsh;
+        stale.followed_agent = Some("deepseek-harness".into());
+        stale.device_agent = "deepseek-harness".into();
+        stale.followed_session = "session-current".into();
+        let pinned = stale.with_realtime_target("deepseek-harness", "session-selected");
+        assert_eq!(pinned.device_agent, "deepseek-harness");
+        assert_eq!(pinned.followed_session, "session-selected");
+        assert_eq!(dsh_requested_session(&pinned), "session-selected");
+        assert_eq!(pinned.realtime_target_error, None);
+        assert_eq!(pinned.dsh_follow_block(), None);
+        assert_eq!(crate::resolve_usb_inject_target("board-test").1, "session-current");
+        *crate::p4_session_binding().lock().unwrap() = previous;
+    }
+
+    #[tokio::test]
+    async fn realtime_unconfirmed_dsh_target_fails_closed_before_dispatch() {
+        let ctx = context("整理文档", 1)
+            .with_realtime_target("deepseek-harness", "auto")
+            .with_target_unconfirmed(true);
+        assert!(ctx.realtime_target_error.is_some());
+        let error = execute_inner(&ctx, json!({"operation":"dispatch"}), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("无法确认 DSH 当前选中的会话"));
+        assert!(error.contains("尚未派发"));
+    }
+
+    #[tokio::test]
+    async fn realtime_explicit_target_without_a_known_agent_fails_closed() {
+        let target = context("整理文档", 1).with_realtime_target("", "session-selected");
+        assert!(target.realtime_target_error.is_some());
+        let error = execute_inner(&target, json!({"operation":"dispatch"}), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("无法确认设备选择的派发目标"));
+        let unknown = context("整理文档", 1).with_realtime_target("unknown-agent", "session-selected");
+        assert!(unknown.realtime_target_error.as_deref().unwrap_or_default().contains("无法确认"));
+        // Auto keeps the historical follow/current path instead of inventing a target.
+        let auto = context("整理文档", 1);
+        assert_eq!(auto.realtime_target_error, None);
+    }
+
     #[test]
     fn dsh_agent_argument_parses_and_session_target_prefers_the_device_binding() {
         let parsed: Request = serde_json::from_value(json!({

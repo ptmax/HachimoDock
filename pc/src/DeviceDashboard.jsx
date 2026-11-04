@@ -791,6 +791,7 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     agentScan,
     refreshAgents,
     realtimeChat,
+    setP4RealtimeTarget,
     setUsageHelp,
   } = useDeviceContext();
   const { push } = useToast();
@@ -1062,6 +1063,15 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     ? (usb.boardDeviceId || onlineBoardDeviceId || binding?.boardDeviceId || "")
     : "";
 
+  const onP4SelectionChange = useCallback((sessionId, selectedAt = 0) => {
+    setP4RealtimeTarget({
+      agentId: selectedAgentId,
+      sessionId: sessionId || "auto",
+      boardDeviceId: p4TargetBoardDeviceId,
+      updatedAt: Number.isFinite(Number(selectedAt)) ? Number(selectedAt) : 0,
+    });
+  }, [p4TargetBoardDeviceId, selectedAgentId, setP4RealtimeTarget]);
+
   const mergeDismissedP4Sessions = useCallback((dismissed) => {
     setDismissedP4Sessions((current) => ({ ...current, ...dismissed }));
   }, []);
@@ -1083,7 +1093,13 @@ export default function DeviceDashboard({ active = true, binding, onUnbind, onOp
     onDismissSessions: mergeDismissedP4Sessions,
     formatSessionOption: formatVoiceSessionOption,
     push,
+    onSelectionChange: onP4SelectionChange,
   });
+  // Keep the realtime start target in sync with agent/board changes even when
+  // no session-change event is emitted (initial mount, follow switch).
+  useEffect(() => {
+    onP4SelectionChange(p4SessionSync.sessionId, p4SessionSync.selectedAt);
+  }, [onP4SelectionChange, p4SessionSync.selectedAt, p4SessionSync.sessionId]);
   const selectedAgentBusSessions = sessionFeed.sessions;
   const selectedAgentRoutingSessions = sessionFeed.routingSessions;
   const selectedAgentSessionsLoaded = sessionFeed.loaded;

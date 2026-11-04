@@ -14,6 +14,7 @@ const DEFAULT_BRIDGE_URL: &str = "http://127.0.0.1:17892";
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(3);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(2);
+const FOCUS_TIMEOUT: Duration = Duration::from_millis(800);
 /// Bounded wait for the single takeover probe after an uncertain POST.
 const TAKEOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -60,6 +61,46 @@ pub(crate) struct TaskSnapshot {
     pub accepted_at: u64,
     #[serde(default)]
     pub updated_at: u64,
+}
+
+/// Last DSH Web/Desktop main-session selection. Contains no title/content.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FocusSnapshot {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub source: String,
+    /// "user" or "restore"; a restored selection must not override a newer
+    /// explicit P4 choice after a DSH renderer restart.
+    #[serde(default)]
+    pub origin: String,
+}
+
+/// One sampled DSH UI focus state. `Ok` is authoritative for the current
+/// bridge instance; `Unsupported` is an older plugin without `/focus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusSampleStatus {
+    Ok,
+    Unsupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FocusSample {
+    pub status: FocusSampleStatus,
+    pub focus: Option<FocusSnapshot>,
+    /// Diagnostic only: an SSE client can be attached without a focus observer.
+    pub client_attached: bool,
+    /// Separate focus-observer capability marker from POST /focus heartbeats.
+    pub observer_attached: bool,
+    pub observer_capable: bool,
+    pub instance_id: String,
+    pub bridge_reachable: bool,
 }
 
 /// Dispatch result. `adopted` means the POST response was lost but the
@@ -238,6 +279,102 @@ pub(crate) async fn status(task_id: &str) -> Result<Option<TaskSnapshot>, Dispat
     status_at_with_timeout(&bridge_url(), task_id, STATUS_TIMEOUT).await
 }
 
+async fn focus_at(origin: &str) -> FocusSample {
+    let unavailable = FocusSample {
+        status: FocusSampleStatus::Unavailable,
+        focus: None,
+        client_attached: false,
+        observer_attached: false,
+        observer_capable: false,
+        instance_id: String::new(),
+        bridge_reachable: false,
+    };
+    let response = match client(FOCUS_TIMEOUT)
+        .get(format!("{origin}/focus"))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return unavailable,
+    };
+    let status = response.status().as_u16();
+    if status == 404 {
+        return FocusSample {
+            status: FocusSampleStatus::Unsupported,
+            focus: None,
+            client_attached: false,
+            observer_attached: false,
+            observer_capable: false,
+            instance_id: String::new(),
+            bridge_reachable: true,
+        };
+    }
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => {
+            return FocusSample {
+                bridge_reachable: true,
+                ..unavailable
+            }
+        }
+    };
+    if status != 200 {
+        return FocusSample {
+            bridge_reachable: true,
+            ..unavailable
+        };
+    }
+    let value: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return FocusSample {
+                bridge_reachable: true,
+                ..unavailable
+            }
+        }
+    };
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return FocusSample {
+            bridge_reachable: true,
+            ..unavailable
+        };
+    }
+    let focus = match value.get("focus") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(Value::Object(_)) => match serde_json::from_value::<FocusSnapshot>(
+            value.get("focus").cloned().unwrap_or(Value::Null),
+        ) {
+            Ok(focus) => Some(focus),
+            Err(_) => {
+                return FocusSample {
+                    bridge_reachable: true,
+                    ..unavailable
+                }
+            }
+        },
+        Some(_) => {
+            return FocusSample {
+                bridge_reachable: true,
+                ..unavailable
+            }
+        }
+    };
+    FocusSample {
+        status: FocusSampleStatus::Ok,
+        focus,
+        client_attached: value.get("clientAttached").and_then(Value::as_bool) == Some(true),
+        observer_attached: value.get("observerAttached").and_then(Value::as_bool) == Some(true),
+        observer_capable: value.get("observerCapable").and_then(Value::as_bool) == Some(true),
+        instance_id: value
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        bridge_reachable: true,
+    }
+}
+
 fn interrupt_at(origin: &str, session_id: &str) -> Result<bool, String> {
     let response = reqwest::blocking::Client::builder()
         .no_proxy()
@@ -256,6 +393,11 @@ fn interrupt_at(origin: &str, session_id: &str) -> Result<bool, String> {
     let value: Value =
         serde_json::from_str(&body).map_err(|_| "DSH interrupt response invalid".to_string())?;
     Ok(value.get("interrupted").and_then(Value::as_bool).unwrap_or(true))
+}
+
+/// Sample the DSH Web/Desktop main-session selection at realtime start.
+pub(crate) async fn focus() -> FocusSample {
+    focus_at(&bridge_url()).await
 }
 
 /// Cancel the active DSH turn through the plugin (blocking helper for the USB
@@ -448,6 +590,58 @@ mod tests {
         assert_eq!(observed.len(), 2);
         assert!(observed[1].contains("GET /task?taskId=task-1"));
         assert_eq!(observed.iter().filter(|line| line.starts_with("POST ")).count(), 1);
+    }
+
+    #[test]
+    fn focus_parses_the_selection_without_content() {
+        let origin = one_shot_server(
+            200,
+            r#"{"ok":true,"focus":{"sessionId":"session-a","updatedAt":1790000000000,"seq":4,"source":"dsh-ui","origin":"user"},"clientAttached":true,"observerAttached":true,"observerCapable":true,"instanceId":"bridge-1"}"#,
+            "GET /focus",
+        );
+        let sample = runtime().block_on(focus_at(&origin));
+        assert_eq!(sample.status, FocusSampleStatus::Ok);
+        assert_eq!(sample.focus.as_ref().unwrap().session_id, "session-a");
+        assert_eq!(sample.focus.as_ref().unwrap().seq, 4);
+        assert_eq!(sample.focus.as_ref().unwrap().origin, "user");
+        assert_eq!(sample.client_attached, true);
+        assert_eq!(sample.observer_attached, true);
+        assert_eq!(sample.observer_capable, true);
+        assert_eq!(sample.instance_id, "bridge-1");
+    }
+
+    #[test]
+    fn focus_parses_an_explicit_clear_and_legacy_404() {
+        let origin = one_shot_server(
+            200,
+            r#"{"ok":true,"focus":null,"clientAttached":true,"observerAttached":true,"observerCapable":true,"instanceId":"bridge-1"}"#,
+            "GET /focus",
+        );
+        let cleared = runtime().block_on(focus_at(&origin));
+        assert_eq!(cleared.status, FocusSampleStatus::Ok);
+        assert_eq!(cleared.focus, None);
+        assert_eq!(cleared.client_attached, true);
+        assert_eq!(cleared.observer_attached, true);
+
+        let legacy = one_shot_server(404, r#"{"ok":false,"error":"not-found"}"#, "GET /focus");
+        let unsupported = runtime().block_on(focus_at(&legacy));
+        assert_eq!(unsupported.status, FocusSampleStatus::Unsupported);
+        assert_eq!(unsupported.focus, None);
+    }
+
+    #[test]
+    fn focus_distinguishes_bridge_error_from_unreachable() {
+        let error = one_shot_server(500, r#"{"ok":false,"error":"internal"}"#, "GET /focus");
+        let reachable = runtime().block_on(focus_at(&error));
+        assert_eq!(reachable.status, FocusSampleStatus::Unavailable);
+        assert_eq!(reachable.bridge_reachable, true);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let refused = runtime().block_on(focus_at(&origin));
+        assert_eq!(refused.status, FocusSampleStatus::Unavailable);
+        assert_eq!(refused.bridge_reachable, false);
     }
 
     #[test]

@@ -296,7 +296,7 @@ export function emitPersonaVoiceUpdated(appearanceId, personaVoice) {
   }
 }
 
-export function buildRealtimeChatStartInput(appearance, boardDeviceId) {
+export function buildRealtimeChatStartInput(appearance, boardDeviceId, target = {}) {
   const personaVoice = appearance?.personaVoice
     || normalizePersonaVoice(null, {
       name: appearance?.name,
@@ -310,6 +310,14 @@ export function buildRealtimeChatStartInput(appearance, boardDeviceId) {
     systemPrompt: buildRealtimeSystemPrompt(personaVoice.persona),
     greeting: personaVoice.persona.greeting,
     voice: voiceSpecFor(personaVoice),
+    // P4-selected dispatch target snapshot. `auto` keeps the historical
+    // follow/current behaviour; an explicit id must never be silently replaced
+    // by the currently active session if the binding commit is still pending.
+    targetAgentId: text(target?.agentId),
+    targetSessionId: text(target?.sessionId) || "auto",
+    targetUpdatedAt: Number.isFinite(Number(target?.updatedAt)) && Number(target.updatedAt) > 0
+      ? Number(target.updatedAt)
+      : 0,
   };
 }
 

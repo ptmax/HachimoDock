@@ -43,6 +43,10 @@ const MAX_BODY_BYTES = 64 * 1024
 const MAX_INJECT_TEXT_CHARS = 32 * 1024
 /** Hard cap on one dispatched task text after JSON decoding. */
 const MAX_TASK_TEXT_CHARS = 32 * 1024
+/** Maximum DSH UI selection id mirrored to the PC; opaque ids only. */
+const MAX_FOCUS_SESSION_ID = 512
+/** The focus observer announces a heartbeat; absence makes capability unknown. */
+const FOCUS_OBSERVER_TTL_MS = 15000
 /**
  * `/task` accepts UTF-8 CJK text within the 32K-character contract. The
  * generic 64 KB body cap is too small for that (32K CJK can exceed 64 KB), so
@@ -258,6 +262,13 @@ class BridgeServer {
     this.logger = options.logger ?? null
     this.now = options.now ?? (() => Date.now())
     this.createRequestId = options.createRequestId ?? (() => `req-${randomUUID()}`)
+    /** Process identity; lets the PC invalidate cached DSH UI focus after restart. */
+    this.instanceId = randomUUID()
+    /** Last DSH Web/Desktop main-session selection. Opaque id only. */
+    this.focus = null
+    this.focusSeq = 0
+    /** Separate from SSE attachment: did the client half run the focus observer? */
+    this.focusObserver = null
 
     /** @type {import('node:http').Server|null} */
     this.httpServer = null
@@ -322,6 +333,8 @@ class BridgeServer {
    * @returns {Promise<void>} settles after the listener is closed.
    */
   async close() {
+    this.focus = null
+    this.focusObserver = null
     for (const requestId of [...this.pending.keys()]) this.settleApproval(requestId, 'unavailable', { expired: true })
     for (const subscriber of [...this.subscribers]) this.closeSubscriber(subscriber)
     this.subscribers.clear()
@@ -362,6 +375,130 @@ class BridgeServer {
     if (this.events.length > EVENT_BUFFER_LIMIT) this.events.splice(0, this.events.length - EVENT_BUFFER_LIMIT)
     for (const subscriber of this.subscribers) this.writeToSubscriber(subscriber, event)
     return event
+  }
+
+  /**
+   * @returns {boolean} whether the DSH client half is attached to `/events`.
+   */
+  hasClientSubscriber() {
+    for (const subscriber of this.subscribers) {
+      if (subscriber.role === 'client') return true
+    }
+    return false
+  }
+
+  /**
+   * Public focus snapshot. Contains no title/content, only the opaque id.
+   * @returns {{sessionId:string, updatedAt:number, seq:number, source:string}|null} focus or null.
+   */
+  focusState() {
+    return this.focus === null ? null : { ...this.focus }
+  }
+
+  /**
+   * @returns {{instanceId:string, clientAttached:boolean, focus:object|null}} client-visible focus envelope.
+   */
+  focusEnvelope() {
+    const observer = this.focusObserver !== null
+      && this.now() - this.focusObserver.attachedAt <= FOCUS_OBSERVER_TTL_MS
+      ? this.focusObserver
+      : null
+    return {
+      instanceId: this.instanceId,
+      // Kept for diagnostics only: an SSE client is not evidence that the
+      // focus observer is installed (old/cached client halves are not).
+      clientAttached: this.hasClientSubscriber(),
+      observerAttached: observer !== null,
+      observerCapable: observer !== null && observer.capable === true,
+      focus: this.focusState(),
+    }
+  }
+
+  /**
+   * POST /focus: record the DSH UI main-session selection (client half only).
+   * Accepts the simple `text/plain` JSON request the browser client sends.
+   * @param {import('node:http').IncomingMessage} req - request.
+   * @param {import('node:http').ServerResponse} res - response.
+   * @returns {Promise<void>} settles after the response.
+   */
+  async handleFocusUpdate(req, res) {
+    let body
+    try {
+      body = await readJsonBody(req)
+    } catch (error) {
+      this.failRequest(res, error)
+      return
+    }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'body must be a JSON object' })
+      return
+    }
+    let origin = 'user'
+    if (body.origin !== undefined) {
+      if (body.origin !== 'user' && body.origin !== 'restore') {
+        sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'origin must be user or restore' })
+        return
+      }
+      origin = body.origin
+    }
+    const hasSessionKey = Object.prototype.hasOwnProperty.call(body, 'sessionId')
+    let sessionId = ''
+    if (hasSessionKey) {
+      const raw = body.sessionId
+      if (raw !== null && raw !== undefined && typeof raw !== 'string') {
+        sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'sessionId must be a string or null' })
+        return
+      }
+      sessionId = typeof raw === 'string' ? raw.trim() : ''
+      if (sessionId.length > MAX_FOCUS_SESSION_ID || /[\u0000-\u001f]/.test(sessionId)) {
+        sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'sessionId must be a bounded string' })
+        return
+      }
+    }
+    // A marker-only POST announces/refreshes the focus observer capability
+    // without touching the last selection. This is deliberately separate from
+    // the `/events?role=client` SSE attachment.
+    if (body.observer !== undefined) {
+      if (body.observer !== 'v1' || typeof body.capable !== 'boolean') {
+        sendJson(res, 400, { ok: false, error: 'invalid-request', message: 'observer must be v1 with booleans' })
+        return
+      }
+      this.focusObserver = { attachedAt: this.now(), capable: body.capable }
+    }
+    if (!hasSessionKey) {
+      sendJson(res, 200, { ok: true, ...this.focusEnvelope() })
+      return
+    }
+    const sameSession = sessionId === (this.focus?.sessionId ?? '');
+    // A same-id restore (renderer reload) is not a new user action and keeps
+    // its timestamp. A same-id `origin:"user"` POST is a deliberate re-selection
+    // and must refresh updatedAt/seq so it can override a newer P4 choice.
+    if (sameSession && origin !== 'user') {
+      sendJson(res, 200, { ok: true, ...this.focusEnvelope() })
+      return
+    }
+    if (sessionId === '') {
+      this.focus = null
+      this.focusSeq += 1
+    } else {
+      this.focus = {
+        sessionId,
+        updatedAt: this.now(),
+        seq: (this.focusSeq += 1),
+        source: 'dsh-ui',
+        origin,
+      }
+    }
+    sendJson(res, 200, { ok: true, ...this.focusEnvelope() })
+  }
+
+  /**
+   * GET /focus: expose the last DSH UI selection to the PC (id only, no content).
+   * @param {import('node:http').ServerResponse} res - response.
+   * @returns {void}
+   */
+  handleFocusStatus(res) {
+    sendJson(res, 200, { ok: true, ...this.focusEnvelope() })
   }
 
   /**
@@ -583,6 +720,11 @@ class BridgeServer {
     if (path === '/task') {
       if (method === 'POST') return this.handleTask(req, res)
       if (method === 'GET') return this.handleTaskStatus(req, res, url)
+      return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
+    }
+    if (path === '/focus') {
+      if (method === 'POST') return this.handleFocusUpdate(req, res)
+      if (method === 'GET') return this.handleFocusStatus(res)
       return sendJson(res, 405, { ok: false, error: 'method-not-allowed' })
     }
     if (path === '/events') {
@@ -999,6 +1141,8 @@ module.exports = {
   MAX_INJECT_TEXT_CHARS,
   MAX_TASK_TEXT_CHARS,
   MAX_TASK_BODY_BYTES,
+  MAX_FOCUS_SESSION_ID,
+  FOCUS_OBSERVER_TTL_MS,
   EVENT_BUFFER_LIMIT,
   isLoopbackAddress,
   readJsonBody,

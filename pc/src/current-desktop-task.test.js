@@ -13,7 +13,9 @@ test("realtime delegation targets the current editor independently of display-fo
   assert.match(source, /let \(agent, session\) = crate::resolve_usb_inject_target\(&self.board\)/);
   assert.match(source, /self.followed_session = if session.trim\(\).is_empty\(\)/);
   assert.match(source, /if !ctx.supports_default_agent\(\)/);
-  assert.match(rust("realtime_chat.rs"), /with_followed_agent\(\)/);
+  assert.match(rust("realtime_chat.rs"), /with_realtime_target\(/);
+  assert.match(source, /pub fn with_realtime_target/);
+  assert.match(source, /realtime_target_error/);
 });
 
 test("macOS current-task lookup never launches or navigates and freezes editor identity", () => {

@@ -11,7 +11,9 @@ window.__ModuleLoader__.load({
   id: '@hachimodock/dsh-bridge',
   factory(require) {
     const React = require('react')
-    const EVENT_URL = 'http://127.0.0.1:17892/events?role=client'
+    const BRIDGE_ORIGIN = 'http://127.0.0.1:17892'
+    const EVENT_URL = `${BRIDGE_ORIGIN}/events?role=client`
+    const FOCUS_URL = `${BRIDGE_ORIGIN}/focus`
     let composerActions = null
 
     function VoiceDock(props) {
@@ -22,6 +24,164 @@ window.__ModuleLoader__.load({
         }
       }, [props.inputActions])
       return null
+    }
+
+    /**
+     * Extract an opaque main-session id from a DSH selection snapshot.
+     * Never reads titles, prompts, or transcript content.
+     * @param {unknown} value - selection or binding snapshot.
+     * @returns {string|null} trimmed session id, or null for a non-ordinary/empty main.
+     */
+    function focusSessionId(value) {
+      if (typeof value === 'string') return value.trim() || null
+      if (!value || typeof value !== 'object') return null
+      if (Object.prototype.hasOwnProperty.call(value, 'subagentAddress')) return null
+      if (typeof value.sessionId === 'string') return value.sessionId.trim() || null
+      if (typeof value.key === 'string') return value.key.trim() || null
+      return null
+    }
+
+    /**
+     * Fire-and-forget POST to the Host focus endpoint. A failed loopback call
+     * must never affect the DSH UI or approval handling.
+     * @param {object} body - bounded focus/observer fields (opaque id only).
+     * @returns {void}
+     */
+    function postFocus(body) {
+      try {
+        const response = fetch(FOCUS_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'text/plain' },
+          body: JSON.stringify(body),
+          keepalive: true,
+        })
+        if (response && typeof response.catch === 'function') response.catch(() => {})
+      } catch {
+        /* focus sync is best-effort */
+      }
+    }
+
+    /**
+     * Publish one focus change, including the explicit user/restore origin.
+     * @param {string|null} sessionId - opaque id or null to clear.
+     * @param {'user'|'restore'} origin - whether this is a user action.
+     * @returns {void}
+     */
+    function publishFocus(sessionId, origin) {
+      postFocus({ sessionId, origin, observer: 'v1', capable: true })
+    }
+
+    /**
+     * Observe the DSH main-session selection and mirror it to the Host bridge.
+     * Primary source is the Workspace selection store; the Session main-binding
+     * source is a fallback. Both may be absent in a minimal profile, in which
+     * case focus sync stays disabled without affecting the rest of the plugin.
+     * @param {object} ctx - DSH client Cordis context.
+     * @returns {void}
+     */
+    function installFocusSync(ctx) {
+      /** @type {string|null|undefined} undefined means "nothing reported yet". */
+      let lastReported
+      // Workspace is authoritative once it has published a main selection.
+      // The Session binding fallback is ignored afterwards so a stale fallback
+      // can never overwrite the user's current Workspace choice.
+      let workspaceSeen = false
+      let capable = false
+      let observerTimer = null
+      const cleanups = []
+      const announceObserver = () => {
+        postFocus({ observer: 'v1', capable })
+      }
+      const report = (value, kind, origin) => {
+        // `{sessionId: undefined}` is a partially hydrated store, not a
+        // Workspace main selection; do not suppress the uiSession fallback.
+        const explicitWorkspaceSelection = value && typeof value === 'object'
+          && (typeof value.sessionId === 'string'
+            || Object.prototype.hasOwnProperty.call(value, 'subagentAddress'))
+        if (kind === 'workspace' && explicitWorkspaceSelection) workspaceSeen = true
+        if (kind === 'session' && workspaceSeen) return
+        const next = focusSessionId(value)
+        // A fresh client must not clear the Host's last confirmed focus just
+        // because its initial selection is still restoring.
+        if (next === null && lastReported === undefined) return
+        // A user re-selecting the same DSH session must still refresh the Host
+        // timestamp; restore/reload repeats stay idempotent.
+        if (next === lastReported && origin !== 'user') return
+        lastReported = next
+        publishFocus(next, origin)
+      }
+      const attach = (source, kind) => {
+        if (!source || typeof source.getSnapshot !== 'function' || typeof source.subscribe !== 'function') return
+        let active = true
+        let restorePending = true
+        const update = () => {
+          if (!active) return
+          try {
+            const value = source.getSnapshot()
+            const next = focusSessionId(value)
+            const origin = restorePending && next !== null ? 'restore' : 'user'
+            if (next !== null) restorePending = false
+            report(value, kind, origin)
+          } catch {
+            /* a changed selection shape must not break the client */
+          }
+        }
+        let dispose
+        try {
+          dispose = source.subscribe(update)
+        } catch {
+          return
+        }
+        capable = true
+        announceObserver()
+        cleanups.push(() => {
+          active = false
+          try {
+            if (typeof dispose === 'function') dispose()
+          } catch {
+            /* ignore */
+          }
+        })
+        update()
+      }
+      const tryInject = (serviceName, kind, pick) => {
+        try {
+          if (!ctx || typeof ctx.inject !== 'function') return
+          ctx.inject([serviceName], (scope) => {
+            try {
+              const source = pick(scope)
+              if (source) attach(source, kind)
+            } catch {
+              /* unavailable service shape */
+            }
+          })
+        } catch {
+          /* focus sync unavailable in this profile */
+        }
+      }
+      // Announce observer liveness separately from SSE before probing
+      // services: without a source it reports capable:false so the PC can fail
+      // closed rather than assume an SSE-attached but old/cached client can
+      // observe focus. A successful attach immediately announces capable:true.
+      announceObserver()
+      // Workspace selection is authoritative for the main conversation; the
+      // Session main-binding source covers clients that do not load Workspace.
+      tryInject('uiWorkspace', 'workspace', (scope) => scope?.uiWorkspace?.selection)
+      tryInject('uiSession', 'session', (scope) => scope?.uiSession?.adapter?.current)
+      try {
+        observerTimer = setInterval(announceObserver, 5000)
+      } catch {
+        observerTimer = null
+      }
+      try {
+        ctx.effect(() => () => {
+          if (observerTimer !== null) clearInterval(observerTimer)
+          for (const dispose of cleanups.splice(0)) dispose()
+        }, 'hachimodock: DSH focus sync')
+      } catch {
+        if (observerTimer !== null) clearInterval(observerTimer)
+        /* effects unavailable in a test double */
+      }
     }
 
     function findComposer() {
@@ -164,6 +324,7 @@ window.__ModuleLoader__.load({
           // A missing/changed slot must never take down DSH web boot.
           console.warn('[hachimodock] composer dock unavailable', error)
         }
+        installFocusSync(ctx)
         const source = new EventSource(EVENT_URL)
         const onResolved = (event) => {
           try {

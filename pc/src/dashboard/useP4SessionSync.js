@@ -133,6 +133,7 @@ export function useP4SessionSync({
   onDismissSessions,
   formatSessionOption,
   push,
+  onSelectionChange,
 }) {
   const [selection, setSelection] = useState({ sessionId: "auto", selectedAt: 0 });
   const [bindingDebug, setBindingDebug] = useState({
@@ -214,17 +215,28 @@ export function useP4SessionSync({
   const activeSessionIdsSignature = JSON.stringify(activeSessionIds);
   const cardsEnabled = displayEnabled && deviceSessions.length > 0;
 
+  const onSelectionChangeRef = useRef(onSelectionChange);
+  useEffect(() => {
+    onSelectionChangeRef.current = onSelectionChange;
+  }, [onSelectionChange]);
   const onSessionChange = useCallback((nextSessionId) => {
     const value = nextSessionId || "auto";
+    const selectedAt = value === "auto" ? 0 : Date.now();
     setSelection({
       sessionId: value,
-      selectedAt: value === "auto" ? 0 : Date.now(),
+      selectedAt,
     });
+    // Publish synchronously, before the async set_p4_session_binding queue:
+    // realtime chat must hand this exact target to Rust even while the binding
+    // request is still in flight. `selectedAt` is the precedence timestamp
+    // against an externally selected DSH UI session.
+    onSelectionChangeRef.current?.(value, selectedAt);
   }, []);
 
   useEffect(() => {
     setSelection({ sessionId: "auto", selectedAt: 0 });
     pendingNoticeRef.current = null;
+    onSelectionChangeRef.current?.("auto", 0);
   }, [agentId, boardDeviceId]);
 
   useEffect(() => {
@@ -476,6 +488,7 @@ export function useP4SessionSync({
 
   return {
     sessionId,
+    selectedAt: selection.selectedAt,
     sessions: Array.isArray(sessions) ? sessions : [],
     routingSessions: Array.isArray(routingSessions) ? routingSessions : [],
     sessionsLoaded,

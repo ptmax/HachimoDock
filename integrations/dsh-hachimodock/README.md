@@ -69,6 +69,8 @@ rejects any non-loopback peer.
 | `POST` | `/inject` | Deliver a prompt; streams its activity as SSE |
 | `POST` | `/task` | Submit one tracked task to a live DSH agent |
 | `GET` | `/task?taskId=<id>` | Read one tracked task's state/result |
+| `POST` | `/focus` | Client half reports the DSH UI main-session selection (opaque id) |
+| `GET` | `/focus` | Last selection + client-attached flag for the PC voice target |
 | `POST` | `/interrupt` | Cancel the active turn of one live DSH agent |
 | `GET` | `/events?after=<seq>` | SSE feed of approvals and compact session events |
 | `POST` | `/approval/decision` | Apply a one-shot device decision |
@@ -160,6 +162,42 @@ record that the HachimoDock PC bridge can poll.
   `500 followup-failed`.
 - Only a live session is supported: this v0 plugin does not create or resume
   sessions, and tasks are process-local (a plugin restart loses them).
+
+### `POST /focus` / `GET /focus`
+
+The DSH client half mirrors only the **main-session id** selected in the
+Web/Desktop UI; it never sends titles, prompts, or transcript content. The
+selection is held in memory (one value, no disk) and lets HachimoDock choose
+the next realtime voice dispatch target.
+
+```text
+POST /focus   text/plain JSON:
+              {"sessionId":"session-...","origin":"user"|"restore",
+               "observer":"v1","capable":true}
+              {"sessionId":null,"origin":"user"}
+              {"observer":"v1","capable":false}   // heartbeat/capability only
+GET  /focus   -> {"ok":true,"focus":{"sessionId":"...","updatedAt":179...,"seq":7,
+                  "source":"dsh-ui","origin":"user"}|null,
+                  "clientAttached":true,"observerAttached":true,
+                  "observerCapable":true,"instanceId":"..."}
+```
+
+- `sessionId` is trimmed, at most 512 characters, and rejects control
+  characters; `null`/empty clears. `origin:"restore"` is the initial
+  renderer/host restore and is idempotent for the same id; a same-id
+  `origin:"user"` POST is a deliberate re-selection and refreshes
+  `updatedAt`/`seq` so it can override a newer P4 choice.
+- `clientAttached` only means a `role=client` `/events` SSE subscriber exists.
+  `observerAttached`/`observerCapable` are a separate focus-observer marker
+  announced by the client half (heartbeat within 15 s). An SSE-attached but
+  old/cached client has `observerAttached:false`; the PC must fail closed for
+  an auto P4 target rather than use the current session.
+- `instanceId` changes when the bridge restarts so the PC can drop a cached
+  focus. `updatedAt`/`seq` are bounded metadata for last-event-wins precedence;
+  no session content is exposed. A restored focus never overrides a newer
+  explicit P4 selection.
+- Old bridges answer `404 not-found`; the PC then keeps its existing P4/auto
+  behavior.
 
 ### `GET /task?taskId=<id>`
 
@@ -394,7 +432,7 @@ headless/acp profile the bridge's answerer is the only approval channel; keep
 
 ```bash
 cd integrations/dsh-hachimodock
-node --test            # 73 tests, no DSH process and no profile changes
+node --test            # 86 tests, no DSH process and no profile changes
 
 # or mount a bridge with fake services (useful when wiring the PC adapter):
 node -e "
@@ -407,7 +445,7 @@ curl -s http://127.0.0.1:17892/health
 
 ## Verified vs. unverified
 
-Verified in this checkout (Node 26, `node --test`, 73 tests):
+Verified in this checkout (Node 26, `node --test`, 86 tests):
 
 - HTTP contract: health, sessions, inject SSE (`token`/`tool`/`done`/`error`),
   tracked task accept/status/idempotency (`accepted`/`queued`/`done`/`stopped`/
