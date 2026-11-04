@@ -240,7 +240,7 @@ data: {"seq":1,"type":"approval","requestId":"req-...","agentId":"deepseek-harne
 |---|---|---|
 | `approval` | `approval` | Permission prompt pending a `/approval/decision` |
 | `approval-asked` | `approval-asked` | DSH audit edge (`approval/asked`), includes `approvalId` |
-| `approval-resolved` | `approval-resolved` | Outcome known; includes `approvalId`, `outcome`, and `requestId` when correlated |
+| `approval-resolved` | `approval-resolved` | Outcome known; includes `sessionId`, `approvalId`, `outcome`, and `requestId` when correlated |
 | `turn` | `turn` | `turn/start` / `turn/end` (`phase`, `turn`) |
 | `tool` | `tool` | `tool/call` / `tool/result` (`phase`, `name`, `callId`, `ok`) |
 | `session` | `session` | Session summary on create/status change, or `{"id":..., "removed":true}` on disposal |
@@ -298,21 +298,23 @@ The vocabulary, one-shot semantics, and fail-closed default come from
 
 > ### ⚠️ Coexistence with the resident DSH approval UI
 >
-> DSH's Waterfall stops at the first listener that returns an outcome. A
-> bridge listener registered at plugin mount precedes answerers that the
-> Desktop/Web UI registers later through the Remote event channel, so while
-> this plugin is mounted it acts as the **terminal** approval answerer: the
-> in-app approval panel is not consulted. That is the intended R5 behavior
-> when HachimoDock is the approval screen, but it means:
+> DSH's `approval/request` is a waterfall. A bridge listener registered at
+> plugin mount precedes answerers that the Desktop/Web UI registers later
+> through the Remote event channel. By default (`HACHIMODOCK_DSH_MIRROR_NATIVE`
+> not `0`) the bridge starts those remaining answerers with `next()` and races
+> them against the device, so either the device or the resident panel can
+> answer. When the device wins, the client half settles the native
+> `uiSession.sessionStatus` pending approval for that exact session — including
+> a session that is not currently focused — so the panel cannot remain behind
+> after a focus switch. The visible-button DOM click is only a fallback for
+> older clients without that projection.
 >
-> - if no HachimoDock bridge is connected, prompts fail closed after the
->   timeout instead of reaching the desktop panel (default contract behavior);
-> - the desktop panel is bypassed for every prompt while the plugin is loaded.
->
-> Set `HACHIMODOCK_DSH_APPROVAL_FALLBACK=delegate` (or bundle config
+> Set `HACHIMODOCK_DSH_MIRROR_NATIVE=0` to make the bridge the terminal
+> answerer and bypass the native panel even while a device is attached. Set
+> `HACHIMODOCK_DSH_APPROVAL_FALLBACK=delegate` (or bundle config
 > `approvalFallback: delegate`) to call `next()` instead of answering when no
-> `/events` subscriber is attached. Connected HachimoDock still answers
-> terminals, so the device remains authoritative while attached. **Verify the
+> `/events` subscriber is attached. With no subscriber and the default
+> `unavailable` fallback, prompts fail closed after the timeout. **Verify the
 > desired policy on a real DSH Desktop profile before shipping** (see
 > [Verified vs. unverified](#verified-vs-unverified)).
 
@@ -432,7 +434,7 @@ headless/acp profile the bridge's answerer is the only approval channel; keep
 
 ```bash
 cd integrations/dsh-hachimodock
-node --test            # 86 tests, no DSH process and no profile changes
+node --test            # 95 tests, no DSH process and no profile changes
 
 # or mount a bridge with fake services (useful when wiring the PC adapter):
 node -e "
@@ -445,7 +447,7 @@ curl -s http://127.0.0.1:17892/health
 
 ## Verified vs. unverified
 
-Verified in this checkout (Node 26, `node --test`, 86 tests):
+Verified in this checkout (Node 26, `node --test`, 95 tests):
 
 - HTTP contract: health, sessions, inject SSE (`token`/`tool`/`done`/`error`),
   tracked task accept/status/idempotency (`accepted`/`queued`/`done`/`stopped`/

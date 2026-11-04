@@ -2,10 +2,14 @@
  * DSH Client half: close the native approval composer when the HachimoDock
  * device answers first.
  *
- * The Host bridge answers /events on loopback. The native DSH approval UI has
- * no host-side withdrawal API, but its visible buttons are the only active
- * approval controls, so the client plugin clicks the matching button after the
- * device decision is audited. This module is a browser module-loader factory.
+ * The Host bridge answers /events on loopback. The native DSH approval UI keeps
+ * its pending request in `uiSession.sessionStatus` even when the user focuses a
+ * different session, so a DOM click on the visible buttons is not enough: the
+ * background approval must be settled through that projection. The client
+ * plugin therefore resolves the matching `PendingApproval` after the device
+ * decision is audited, and only falls back to the DOM click when this DSH
+ * version does not expose the projection. This module is a browser
+ * module-loader factory.
  */
 window.__ModuleLoader__.load({
   id: '@hachimodock/dsh-bridge',
@@ -277,6 +281,63 @@ window.__ModuleLoader__.load({
       return true
     }
 
+    /** DSH `uiSession` service, when this profile loads the client session UI. */
+    let uiSessionService = null
+
+    /**
+     * Read the native DSH approval projection for one session.
+     *
+     * `dsh-client-ui-session` publishes every process-local pending interaction
+     * in `uiSession.sessionStatus`, including sessions that are not currently
+     * focused. The approval projection exposes `kind`, `sessionId`,
+     * `answerable`, `answer(outcome)`, and `abort(reason)`.
+     *
+     * @param {string} sessionId - opaque DSH session id from the bridge event.
+     * @returns {object|null} the pending approval, or null when absent/settled.
+     */
+    function nativePendingApproval(sessionId) {
+      if (!uiSessionService || typeof sessionId !== 'string' || sessionId === '') return null
+      try {
+        const snapshot = uiSessionService.sessionStatus?.getSnapshot?.()
+        const entry = snapshot?.get?.(sessionId)
+        const pending = entry?.pendingInteraction
+        if (!pending || pending.kind !== 'approval' || pending.sessionId !== sessionId) return null
+        if (pending.answerable === false) return null
+        return pending
+      } catch {
+        return null
+      }
+    }
+
+    /**
+     * Settle the native DSH approval projection after the device decided.
+     *
+     * This works for a background session whose approval panel is not mounted,
+     * which is the stale-modal case the DOM fallback cannot reach. It is
+     * best-effort: a changed DSH client projection must never break the bridge.
+     *
+     * @param {string} sessionId - opaque DSH session id.
+     * @param {string} outcome - `allowed-once` / `rejected` / other device outcome.
+     * @returns {boolean} whether a pending native approval was settled.
+     */
+    function settleNativeApproval(sessionId, outcome) {
+      const pending = nativePendingApproval(sessionId)
+      if (!pending) return false
+      try {
+        if (outcome === 'allowed-once' || outcome === 'rejected') {
+          const result = pending.answer(outcome)
+          if (result && typeof result.catch === 'function') result.catch(() => {})
+        } else if (typeof pending.abort === 'function') {
+          pending.abort(new Error('device approval resolved without a native decision'))
+        } else {
+          return false
+        }
+        return true
+      } catch {
+        return false
+      }
+    }
+
     function dismissNativeApproval() {
       // Timeout/abort has no native cancel API. Prefer the visible reject
       // control; fall back to Escape so a stale composer cannot stay open.
@@ -325,12 +386,27 @@ window.__ModuleLoader__.load({
           console.warn('[hachimodock] composer dock unavailable', error)
         }
         installFocusSync(ctx)
+        try {
+          ctx.inject(['uiSession'], (scope) => {
+            uiSessionService = scope?.uiSession ?? null
+          })
+        } catch {
+          uiSessionService = null
+        }
         const source = new EventSource(EVENT_URL)
         const onResolved = (event) => {
           try {
             const payload = JSON.parse(event.data)
-            if (payload && (payload.outcome === 'allowed-once' || payload.outcome === 'rejected')) {
-              clickApproval(payload.outcome)
+            if (!payload) return
+            const outcome = payload.outcome
+            // Settle the DSH-owned projection first: it reaches a background
+            // session whose approval panel is not mounted. Only clients without
+            // the projection fall back to clicking the visible button.
+            const canProject = typeof uiSessionService?.sessionStatus?.getSnapshot === 'function'
+            const settled = canProject && settleNativeApproval(payload.sessionId, outcome)
+            if (settled || canProject) return
+            if (outcome === 'allowed-once' || outcome === 'rejected') {
+              clickApproval(outcome)
             }
           } catch {
             /* malformed events must not break the client */

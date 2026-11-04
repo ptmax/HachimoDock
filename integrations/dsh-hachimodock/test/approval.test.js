@@ -274,3 +274,43 @@ test('native cancel/deny carries the decision outcome for the device cue', async
   assert.equal(cancelled.data.outcome, 'rejected')
   assert.equal(await outcome, 'unavailable')
 })
+
+test('device decision returns while the native answerer is still pending; approval-resolved carries the close key', async (t) => {
+  const { ctx, session, sse, url } = await fixtures(t)
+  let delegated = 0
+  let settleNative
+  const nativeOutcome = new Promise((resolve) => {
+    settleNative = resolve
+  })
+  const outcome = answer(ctx, createApprovalRequest(session), () => {
+    delegated += 1
+    return nativeOutcome
+  })
+  const prompt = await sse.next()
+  const decided = await postJson(`${url}/approval/decision`, {
+    requestId: prompt.data.requestId,
+    decision: 'allow',
+  })
+  assert.equal(decided.status, 200)
+  assert.deepEqual(decided.body, { ok: true, requestId: prompt.data.requestId, accepted: true })
+  assert.equal(await outcome, 'allowed-once')
+  assert.equal(delegated, 1)
+  assert.equal(
+    await Promise.race([nativeOutcome.then(() => 'settled'), Promise.resolve('pending')]),
+    'pending',
+    'the host waterfall cannot withdraw the native answerer itself',
+  )
+
+  // DSH appends approval/decided after decide(); the bridge then publishes the
+  // session-scoped event the client uses to settle that native projection.
+  ctx.dispatchSync('session/event', session, {
+    type: 'approval/decided',
+    time: Date.now(),
+    data: { id: 'dsh-approval-device', outcome: 'allowed-once' },
+  })
+  const resolved = await sse.next()
+  assert.equal(resolved.event, 'approval-resolved')
+  assert.equal(resolved.data.sessionId, 'session-approval')
+  assert.equal(resolved.data.outcome, 'allowed-once')
+  settleNative('rejected')
+})
