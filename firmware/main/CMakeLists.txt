@@ -102,7 +102,7 @@ file(SHA256 "${CMAKE_CURRENT_LIST_DIR}/../../pc/public/terrier-clips/waiting_use
 if(NOT PET_ERROR_CUE_SHA STREQUAL PET_WAIT_CUE_SHA)
   message(FATAL_ERROR "Shared waiting/error cue changed: restore separate embedding before shipping")
 endif()
-foreach(cue done error)
+foreach(cue done error session_failed)
   set(cue_input "${CMAKE_CURRENT_LIST_DIR}/../../pc/public/terrier-clips/${cue}.wav")
   target_add_binary_data(${COMPONENT_LIB} "${cue_input}" BINARY)
 endforeach()

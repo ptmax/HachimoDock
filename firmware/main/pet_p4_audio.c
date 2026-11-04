@@ -84,6 +84,8 @@ static unsigned long long g_playback_session_revision;
 #define PET_P4_AUDIO_STREAM_START_BYTES 6400          /* 200 ms 起播水位 */
 #define PET_P4_AUDIO_STREAM_WRITE_BYTES 640           /* 20 ms; AEC reference follows codec cadence */
 #define PET_P4_AUDIO_HALF_DUPLEX_TAIL_MS 250ULL
+/* Upper bound for the capture-stop settle barrier (one codec frame is ~32 ms). */
+#define PET_P4_AUDIO_CAPTURE_STOP_SETTLE_MS 100
 static atomic_bool g_conversation;
 static atomic_bool g_conversation_half_duplex;
 static atomic_bool g_conversation_starting;
@@ -123,6 +125,8 @@ static atomic_bool g_stream_playing;
 static atomic_uint g_stream_played_bytes;
 static atomic_bool g_music;
 static atomic_bool g_music_paused;
+static uint64_t g_last_event_cue_ms;
+static char g_last_event_cue_family[32];
 static atomic_bool g_music_pause_requested;
 static atomic_uint g_music_volume = 65;
 static atomic_uint g_output_volume = 70;
@@ -181,6 +185,31 @@ static bool playback_gates_capture(uint64_t now_ms) {
   }
   uint64_t last = atomic_load_explicit(&g_stream_last_play_ms, memory_order_acquire);
   return last != 0 && now_ms - last < PET_P4_AUDIO_HALF_DUPLEX_TAIL_MS;
+}
+
+/* The microphone capture task leaves esp_codec_dev_read asynchronously. While
+ * it still owns the codec (requested or active), the playback/status path must
+ * not start or enqueue cues: hardware 2026-11-03 showed P4 resets after SW1
+ * voice ended, when the App's fast ASR/state updates race the capture
+ * teardown. This predicate is the single owner test for both the status-cue
+ * producer and the cue player, so no speaker write can overlap mic capture. */
+static bool capture_owns_microphone(void) {
+  return atomic_load_explicit(&g_capture_requested, memory_order_acquire)
+      || atomic_load_explicit(&g_capture_active, memory_order_acquire);
+}
+
+/* Bounded settle barrier used by every capture-stop caller: the audio task
+ * runs at a higher priority and exits within one codec frame, so waiting for at
+ * most PET_P4_AUDIO_CAPTURE_STOP_SETTLE_MS prevents the next caller (approval
+ * cue, control reply, status cue selection) from racing the codec teardown.
+ * Never unbounded, never in a critical section. */
+static void wait_capture_quiesced(void) {
+  for (int waited = 0;
+       waited < PET_P4_AUDIO_CAPTURE_STOP_SETTLE_MS
+         && atomic_load_explicit(&g_capture_active, memory_order_acquire);
+       waited += 1) {
+    vTaskDelay(1);
+  }
 }
 
 static uint64_t fnv1a64_update(uint64_t checksum, const uint8_t *data, size_t len) {
@@ -612,7 +641,7 @@ static void playback_task(void *arg) {
       continue;
     }
     if (atomic_load(&g_fruit_enabled) || atomic_load(&g_instrument_enabled) || atomic_load(&g_music) || atomic_load_explicit(&g_stream_active, memory_order_acquire)
-        || pet_p4_audio_conversation_active()) {
+        || pet_p4_audio_conversation_active() || capture_owns_microphone()) {
       /* 实时对话播放中：状态音效让路，不打断形象说话 */
       continue;
     }
@@ -915,7 +944,8 @@ void pet_p4_audio_process(
   /* Listening/working animation changes must not play status WAVs into the microphone.
    * Those cues also gate half-duplex capture and can suppress an entire user utterance. */
   if (atomic_load(&g_instrument_enabled) || pet_p4_audio_conversation_active()
-      || atomic_load_explicit(&g_stream_active, memory_order_acquire)) return;
+      || atomic_load_explicit(&g_stream_active, memory_order_acquire)
+      || capture_owns_microphone()) return;
   /* Never replace an event cue (for example session_terminated) with an
    * inferred lifecycle cue while the event cue is still playing. */
   if (pet_p4_audio_playback_active()) return;
@@ -976,9 +1006,43 @@ void pet_p4_audio_process(
   xQueueOverwrite(g_playback_queue, &request);
 }
 
+/* Event cues (permission sounds, session-ended) are audible UI feedback and
+ * must never touch the cue queue while the realtime audio pipeline owns the
+ * codec/queue generation. During a realtime conversation the pet already
+ * speaks permission notices through the streamed TTS path, and a cue request
+ * would only race the stream/mic state (hardware 2026-11-03: approval during
+ * an active realtime conversation preceded a P4 reset). Suppress the cue in
+ * those states; callers keep the decision/ack path unchanged and ignore the
+ * returned error. Outside realtime/capture/playback the cue is unchanged. */
+static bool event_cue_allowed(void) {
+  if (atomic_load_explicit(&g_conversation, memory_order_acquire)) return false;
+  if (atomic_load_explicit(&g_stream_active, memory_order_acquire)) return false;
+  if (atomic_load_explicit(&g_capture_active, memory_order_acquire)) return false;
+  if (atomic_load_explicit(&g_capture_requested, memory_order_acquire)) return false;
+  if (atomic_load(&g_music)) return false;
+  if (atomic_load(&g_instrument_enabled)) return false;
+  if (atomic_load(&g_fruit_enabled)) return false;
+  return true;
+}
+
 esp_err_t pet_p4_audio_play_event_cue(const char *family) {
   if (!family || !pet_p4_system_cue_family(family)) return ESP_ERR_INVALID_ARG;
   if (!pet_p4_audio_playback_ready() || !g_playback_queue) return ESP_ERR_INVALID_STATE;
+  if (!event_cue_allowed()) return ESP_ERR_INVALID_STATE;
+  uint64_t now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
+  bool stop = !strcmp(family, "session_terminated");
+  /* A DSH approval prompt often arrives together with a stopped-session cue.
+   * The prompt owns the audio feedback; do not add a second cue on top of it.
+   * When the stop cue was already queued, the new generation cancels/overwrites
+   * it so the prompt is not played after the stop sound. */
+  if (stop && g_last_event_cue_ms > 0
+      && now_ms >= g_last_event_cue_ms
+      && now_ms - g_last_event_cue_ms < 1200
+      && !strncmp(g_last_event_cue_family, "permission_", 11)) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  snprintf(g_last_event_cue_family, sizeof(g_last_event_cue_family), "%s", family);
+  g_last_event_cue_ms = now_ms;
   pet_p4_audio_playback_request_t request;
   memset(&request, 0, sizeof(request));
   snprintf(request.family, sizeof(request.family), "%s", family);
@@ -1029,12 +1093,18 @@ esp_err_t pet_p4_audio_capture_stop_owned(const char *owner){
   portENTER_CRITICAL(&g_conversation_lock);
   bool matches=!strcmp(owner,g_capture_owner)&&!atomic_load(&g_conversation);
   if(matches)atomic_store_explicit(&g_capture_requested,false,memory_order_release);
-  portEXIT_CRITICAL(&g_conversation_lock);return matches?ESP_OK:ESP_ERR_INVALID_STATE;
+  portEXIT_CRITICAL(&g_conversation_lock);
+  if(matches)wait_capture_quiesced();
+  return matches?ESP_OK:ESP_ERR_INVALID_STATE;
 }
 
 esp_err_t pet_p4_audio_capture_stop(void) {
   if (!pet_p4_audio_ready()) return ESP_ERR_INVALID_STATE;
   atomic_store_explicit(&g_capture_requested, false, memory_order_release);
+  /* Callers immediately clear overlays, send approval replies or let the App
+   * start ASR; none of them may resume playback/status audio until the capture
+   * task has actually left the codec. Bounded by one codec frame. */
+  wait_capture_quiesced();
   return ESP_OK;
 }
 

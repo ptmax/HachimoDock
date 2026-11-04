@@ -11,8 +11,8 @@ def test_identical_default_cues_are_embedded_only_once():
     assert (clips / "error.wav").read_bytes() == (clips / "waiting_user.wav").read_bytes()
     cmake = (ROOT / "main/CMakeLists.txt").read_text()
     assert "PET_ERROR_CUE_SHA STREQUAL PET_WAIT_CUE_SHA" in cmake
-    assert "foreach(cue done error)" in cmake
-    assert "foreach(cue permission_request permission_approved permission_denied permission_expired)" in cmake
+    assert "foreach(cue done error session_failed)" in cmake
+    assert "foreach(cue permission_request permission_approved permission_denied permission_expired session_terminated)" in cmake
     assert "../pc/public/terrier-clips/waiting_user.wav" not in (ROOT / "platformio.ini").read_text()
     source = (ROOT / "main/pet_p4_system_cues.c").read_text()
     assert "_binary_waiting_user_wav" not in source
@@ -30,6 +30,8 @@ const unsigned char d0[1] __asm__("_binary_done_wav_start") = {0};
 const unsigned char d1[1] __asm__("_binary_done_wav_end") = {0};
 const unsigned char e0[1] __asm__("_binary_error_wav_start") = {0};
 const unsigned char e1[1] __asm__("_binary_error_wav_end") = {0};
+const unsigned char sf0[1] __asm__("_binary_session_failed_wav_start") = {0};
+const unsigned char sf1[1] __asm__("_binary_session_failed_wav_end") = {0};
 const unsigned char w0[1] __asm__("_binary_waiting_user_wav_start") = {0};
 const unsigned char w1[1] __asm__("_binary_waiting_user_wav_end") = {0};
 const unsigned char pr0[1] __asm__("_binary_permission_request_wav_start") = {0};
@@ -38,8 +40,12 @@ const unsigned char pa0[1] __asm__("_binary_permission_approved_wav_start") = {0
 const unsigned char pa1[1] __asm__("_binary_permission_approved_wav_end") = {0};
 const unsigned char pd0[1] __asm__("_binary_permission_denied_wav_start") = {0};
 const unsigned char pd1[1] __asm__("_binary_permission_denied_wav_end") = {0};
+const unsigned char pe0[1] __asm__("_binary_permission_expired_wav_start") = {0};
+const unsigned char pe1[1] __asm__("_binary_permission_expired_wav_end") = {0};
+const unsigned char st0[1] __asm__("_binary_session_terminated_wav_start") = {0};
+const unsigned char st1[1] __asm__("_binary_session_terminated_wav_end") = {0};
 int main(int argc, char **argv) {
-  assert(argc==8);
+  assert(argc==10);
   for (int i=1;i<argc;i++) {
     FILE *f=fopen(argv[i],"rb"); assert(f);
     fseek(f,0,SEEK_END); size_t size=(size_t)ftell(f); rewind(f);
@@ -57,6 +63,7 @@ int main(int argc, char **argv) {
   assert(pet_p4_system_cue_family("permission_approved"));
   assert(pet_p4_system_cue_family("permission_denied"));
   assert(pet_p4_system_cue_family("permission_expired"));
+  assert(pet_p4_system_cue_family("session_terminated"));
   assert(!pet_p4_system_cue_family("working"));
   assert(pet_p4_system_cue_legacy("done",UINT64_C(0x392e208e77b6a2a4)));
   assert(pet_p4_system_cue_legacy("done",UINT64_C(0x3800fd80e9e2461f)));
@@ -74,7 +81,7 @@ int main(int argc, char **argv) {
         subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "main"),
                         str(ROOT / "main/pet_p4_system_cues.c"), str(source), "-o", str(binary)], check=True)
         subprocess.run([str(binary), *[str(ROOT.parent / "pc/public/terrier-clips" / (n + ".wav"))
-                        for n in ("done", "error", "waiting_user", "permission_request", "permission_approved", "permission_denied", "permission_expired")]], check=True)
+                        for n in ("done", "error", "session_failed", "waiting_user", "permission_request", "permission_approved", "permission_denied", "permission_expired", "session_terminated")]], check=True)
 
 
 def test_playback_is_not_conditioned_on_matching_animation():
@@ -94,6 +101,61 @@ def test_permission_cues_are_event_driven_on_approval():
     audio = (ROOT / "main/pet_p4_audio.c").read_text()
     assert 'pet_p4_audio_play_event_cue("permission_request")' in protocol
     assert 'pet_p4_audio_play_event_cue("permission_expired")' in protocol
-    assert 'pet_p4_audio_play_event_cue("permission_approved")' in inp
-    assert 'pet_p4_audio_play_event_cue("permission_denied")' in inp
+    # The decision cue is selected inline by the approved/denied boolean.
+    assert "pet_p4_audio_play_event_cue(" in inp
+    assert 'allow ? "permission_approved" : "permission_denied"' in inp
     assert "pet_p4_audio_play_event_cue(const char *family)" in audio
+
+
+def test_permission_cues_cannot_race_the_realtime_audio_pipeline():
+    """Hardware 2026-11-03: an approval decision during an active realtime
+    conversation preceded a P4 reset. The event cue must be suppressed while the
+    realtime pipeline owns the codec/queue, but the decision/ACK path stays."""
+    audio = (ROOT / "main/pet_p4_audio.c").read_text()
+    guarded = audio.split("static bool event_cue_allowed(", 1)[1].split(
+        "esp_err_t pet_p4_audio_set_enabled", 1
+    )[0]
+    for owner in (
+        "g_conversation",
+        "g_stream_active",
+        "g_capture_active",
+        "g_capture_requested",
+        "g_music",
+        "g_instrument_enabled",
+        "g_fruit_enabled",
+    ):
+        assert owner in guarded
+    cue = guarded[guarded.index("esp_err_t pet_p4_audio_play_event_cue("):]
+    guard_call = cue.index("event_cue_allowed()")
+    assert guard_call < cue.index("xQueueOverwrite(")
+    assert guard_call < cue.index("atomic_fetch_add_explicit(")
+    assert "return ESP_ERR_INVALID_STATE" in cue[guard_call:guard_call + 80]
+
+    # The approval decision send and modal clearing are unchanged and still
+    # happen before the (now guarded) cue.
+    inp = (ROOT / "main/pet_p4_input.c").read_text()
+    decision = inp[inp.index("static bool handle_approval_input("):inp.index(
+        "static bool apply_local_action("
+    )]
+    decision_send = decision.index("send_approval_decision(")
+    assert decision_send < decision.index(
+        "pet_p4_audio_play_event_cue(", decision_send
+    )
+    assert "state->last_update_ms = event->ts_ms" in decision
+
+    # The App-driven approval/cancel path uses the same guarded API, so it
+    # cannot double-cue or race the realtime pipeline either.
+    protocol = (ROOT / "main/pet_p4_protocol.c").read_text()
+    cancel = protocol[protocol.index('strcmp(topic, "approval/cancel")'):]
+    cancel = cancel.split('} else if (strncmp(topic, "state/"', 1)[0]
+    assert "pet_p4_audio_play_event_cue(" in cancel
+    assert "pet_p4_state_clear_approval(state)" in cancel
+
+
+def test_permission_cue_wins_over_a_close_stop_cue():
+    audio = (ROOT / "main/pet_p4_audio.c").read_text()
+    cue = audio.split("esp_err_t pet_p4_audio_play_event_cue(", 1)[1]
+    assert "g_last_event_cue_ms" in cue
+    assert "strncmp(g_last_event_cue_family, \"permission_\", 11)" in cue
+    assert "session_terminated" in cue
+    assert "return ESP_ERR_INVALID_STATE" in cue

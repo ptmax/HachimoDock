@@ -5,6 +5,8 @@ extern const uint8_t done_start[] __asm__("_binary_done_wav_start");
 extern const uint8_t done_end[] __asm__("_binary_done_wav_end");
 extern const uint8_t error_start[] __asm__("_binary_error_wav_start");
 extern const uint8_t error_end[] __asm__("_binary_error_wav_end");
+extern const uint8_t session_failed_start[] __asm__("_binary_session_failed_wav_start");
+extern const uint8_t session_failed_end[] __asm__("_binary_session_failed_wav_end");
 extern const uint8_t permission_request_start[] __asm__("_binary_permission_request_wav_start");
 extern const uint8_t permission_request_end[] __asm__("_binary_permission_request_wav_end");
 extern const uint8_t permission_approved_start[] __asm__("_binary_permission_approved_wav_start");
@@ -66,6 +68,7 @@ bool pet_p4_system_cue_pcm(const char *family, const uint8_t **pcm, size_t *size
   const uint8_t *start, *end;
   if (!pet_p4_system_cue_family(family)) return false;
   if (!strcmp(family,"done")) { start=done_start; end=done_end; }
+  else if (!strcmp(family,"error")) { start=session_failed_start; end=session_failed_end; }
   else if (!strcmp(family,"permission_request")) { start=permission_request_start; end=permission_request_end; }
   else if (!strcmp(family,"permission_approved")) { start=permission_approved_start; end=permission_approved_end; }
   else if (!strcmp(family,"permission_denied")) { start=permission_denied_start; end=permission_denied_end; }
