@@ -946,6 +946,20 @@ void pet_p4_audio_process(
   unsigned long long now_ms
 ) {
   if (!state || !pet_p4_audio_playback_ready() || !g_playback_queue) return;
+  /* Status cues (notably waiting_user) are injected here, not through
+   * pet_p4_audio_play_event_cue(), so they need the same approval gate.
+   * Real-device cue order proved permission_request -> waiting_user ->
+   * permission_approved; the modal owns the feedback window. */
+  {
+    uint32_t now = (uint32_t) (esp_timer_get_time() / 1000ULL);
+    uint32_t approval_until = atomic_load_explicit(
+      &g_approval_cue_block_until_ms, memory_order_acquire
+    );
+    if (atomic_load_explicit(&g_approval_pending, memory_order_acquire)
+        || (approval_until != 0 && (int32_t) (approval_until - now) > 0)) {
+      return;
+    }
+  }
   /* Listening/working animation changes must not play status WAVs into the microphone.
    * Those cues also gate half-duplex capture and can suppress an entire user utterance. */
   if (atomic_load(&g_instrument_enabled) || pet_p4_audio_conversation_active()
