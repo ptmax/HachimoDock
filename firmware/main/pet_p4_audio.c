@@ -1081,7 +1081,13 @@ void pet_p4_audio_set_approval_pending(bool pending) {
      * any stop cue that has not started yet. The approval cue is enqueued
      * immediately afterwards. */
     if (g_playback_queue
-        && !strcmp(g_last_event_cue_family, "session_terminated")) {
+        && (atomic_load_explicit(&g_playback_active, memory_order_acquire)
+            || !strcmp(g_last_event_cue_family, "session_terminated"))) {
+      /* Cancel whatever cue is actually on the speaker, not just the last
+       * enqueued family. Subagent/session traffic can enqueue another cue
+       * after the stop cue started, which previously hid the pause cue from
+       * this cancellation check. The approval cue is enqueued immediately
+       * after this setter. */
       atomic_fetch_add_explicit(&g_playback_generation, 1U, memory_order_acq_rel);
       xQueueReset(g_playback_queue);
     }
