@@ -125,7 +125,9 @@ pub enum StreamingSpeechEvent {
     Error(String),
 }
 
-enum StreamingSpeechCommand {
+// Crate-visible for realtime barge tests, which assert that a Final transcript
+// is only requested after `finish()`.
+pub(crate) enum StreamingSpeechCommand {
     Pcm(Vec<u8>),
     Finish,
     Cancel,
@@ -157,7 +159,7 @@ pub struct StreamingSpeechRecognizer {
 impl StreamingSpeechRecognizer {
     /// Offline orchestration tests retain the receiver; no keys, socket or device.
     #[cfg(test)]
-    pub(crate) fn test_sink() -> (Self, impl Sized) {
+    pub(crate) fn test_sink() -> (Self, mpsc::UnboundedReceiver<StreamingSpeechCommand>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         (Self { sender, cancelled: Arc::new(AtomicBool::new(false)),
             finished: Arc::new(AtomicBool::new(false)) }, receiver)
