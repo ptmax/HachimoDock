@@ -89,7 +89,7 @@ test("provider and custom endpoint switches restore only their own saved masks",
 });
 
 test("chat model names are editable for presets and provider changes use their own defaults", () => {
-  assert.deepEqual(LLM_PRESETS.map(({ model }) => model), ["deepseek-flash", "doubao-seed-2-1-lite-260915", "mimo-v2.6-flash"]);
+  assert.deepEqual(LLM_PRESETS.map(({ model }) => model), ["deepseek-flash", "doubao-seed-2-1-lite-260915", "mimo-v2.6-flash", "deepseek-v4.1-flash"]);
   const current = { llmProvider: "deepseek", llmModel: "my-deepseek-model", llmBaseUrl: "old", llmApiKey: "" };
   assert.equal(selectLlmProvider(current, "deepseek"), current);
   for (const preset of LLM_PRESETS.slice(1)) {

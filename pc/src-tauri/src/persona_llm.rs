@@ -606,17 +606,11 @@ where F: FnMut(&str) {
     stream_response_logged(cfg, body, None, on_delta).await
 }
 
-fn opencode_product_plan(cfg: &LlmConfig) -> Option<&'static str> {
+fn is_opencode_go_endpoint(cfg: &LlmConfig) -> bool {
     let base = cfg.base_url.trim().to_ascii_lowercase();
-    let model = cfg.model.trim().to_ascii_lowercase();
-    if !base.contains("opencode") { return None; }
-    // Only infer the Go plan for OpenCode endpoints/models that name it.
-    if base.contains("/go") || model.contains("go") || model == "opencode-go" {
-        Some("go")
-    } else {
-        None
-    }
+    base.contains("opencode.ai/zen/go") || base.contains("opencode.ai/zen/go/v1")
 }
+
 
 async fn stream_response_logged<F>(cfg: &LlmConfig, body: Value, session: Option<&str>, mut on_delta: F) -> Result<(String,Vec<Value>), String>
 where F: FnMut(&str) {
@@ -631,13 +625,11 @@ where F: FnMut(&str) {
     let mut request = client
         .post(cfg.completions_url())
         .bearer_auth(cfg.api_key.trim());
-    // OpenCode's Go subscription gateway selects the plan from this header.
-    // Without it the gateway defaults to the generic "product" plan and
-    // rejects a Go-subscription key with 402 Account.InsufficientFunds.
-    // Only send it for OpenCode endpoints; other OpenAI-compatible providers
-    // must not receive an extra vendor header.
-    if opencode_product_plan(cfg).is_some() {
-        request = request.header("x-opencode-product", "go");
+    // OpenCode Go routes each conversation using x-opencode-session. This is
+    // the same header DSH's @earendil-works/pi-ai provider sends. Other
+    // providers must not receive OpenCode-specific headers.
+    if is_opencode_go_endpoint(cfg) {
+        request = request.header("x-opencode-session", uuid::Uuid::new_v4().to_string());
     }
     let response = request
         .json(&body)
@@ -1406,12 +1398,12 @@ mod tests {
         assert_eq!(history[0].content, "16");
     }
     #[test]
-    fn opencode_go_header_is_scoped_to_opencode_endpoints() {
-        let mk = |base: &str, model: &str| LlmConfig { web_search:false, base_url:base.into(), model:model.into(), api_key:"k".into() };
-        assert_eq!(opencode_product_plan(&mk("https://opencode.ai/zen/go/v1", "opencode-go")), Some("go"));
-        assert_eq!(opencode_product_plan(&mk("https://opencode.ai/zen/v1", "opencode-go")), Some("go"));
-        assert_eq!(opencode_product_plan(&mk("https://api.deepseek.com", "deepseek-flash")), None);
-        assert_eq!(opencode_product_plan(&mk("https://custom.example/v1", "go-model")), None);
+    fn opencode_go_session_header_is_scoped_to_the_go_endpoint() {
+        let mk = |base: &str| LlmConfig { web_search:false, base_url:base.into(), model:"deepseek-v4.1-flash".into(), api_key:"k".into() };
+        assert!(is_opencode_go_endpoint(&mk("https://opencode.ai/zen/go/v1")));
+        assert!(!is_opencode_go_endpoint(&mk("https://opencode.ai/zen/v1")));
+        assert!(!is_opencode_go_endpoint(&mk("https://api.deepseek.com")));
+        assert!(!is_opencode_go_endpoint(&mk("https://custom.example/v1")));
     }
 
 }

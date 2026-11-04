@@ -413,6 +413,21 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
   );
 
   const realtimeTargetRef = useRef({ appearance: null, boardDeviceId: "" });
+  // P4 session selection snapshot. The dashboard updates this synchronously on
+  // every selection change so realtime chat can carry the exact target even
+  // while set_p4_session_binding is still queued.
+  const p4RealtimeTargetRef = useRef({
+    agentId: "", sessionId: "auto", boardDeviceId: "", updatedAt: 0,
+  });
+  const setP4RealtimeTarget = useCallback((target = {}) => {
+    const updatedAt = Number(target.updatedAt);
+    p4RealtimeTargetRef.current = {
+      agentId: String(target.agentId || "").trim(),
+      sessionId: String(target.sessionId || "auto").trim() || "auto",
+      boardDeviceId: String(target.boardDeviceId || "").trim(),
+      updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : 0,
+    };
+  }, []);
   const componentVoiceSync = useRef(null);
   if (!componentVoiceSync.current) componentVoiceSync.current = createComponentVoiceSync(invoke);
   useEffect(() => {
@@ -452,8 +467,15 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
       throw new Error(`「${appearance.name}」还没有设置人设与声音，先在画廊卡片右下角设置`);
     }
     if (!boardDeviceId) throw new Error("设备未通过 USB 连接");
+    const storedTarget = p4RealtimeTargetRef.current;
+    // Never borrow a selection from a previous board's session feed.
+    const sessionTarget = !storedTarget.boardDeviceId || storedTarget.boardDeviceId === boardDeviceId
+      ? storedTarget
+      : { agentId: "", sessionId: "auto", boardDeviceId, updatedAt: 0 };
     realtimeReconcilerRef.current?.invalidate();
-    const status = await invoke("realtime_chat_start", { input: buildRealtimeChatStartInput(appearance, boardDeviceId) });
+    const status = await invoke("realtime_chat_start", {
+      input: buildRealtimeChatStartInput(appearance, boardDeviceId, sessionTarget),
+    });
     realtimeReconcilerRef.current?.invalidate();
     setRealtimeChat((current) => mergeStatus(current, { ...status, error: "" }));
     return status;
@@ -527,6 +549,7 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
       realtimeChat,
       usageHelp,
       setUsageHelp,
+      setP4RealtimeTarget,
       startRealtimeChat,
       stopRealtimeChat,
       applyDesktopPet,
@@ -556,6 +579,7 @@ export function DeviceContextProvider({ binding: bindingProp, onBindingChange, c
       appearanceSync,
       realtimeChat,
       usageHelp,
+      setP4RealtimeTarget,
       startRealtimeChat,
       stopRealtimeChat,
       applyDesktopPet,

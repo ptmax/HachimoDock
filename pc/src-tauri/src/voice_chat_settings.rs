@@ -95,6 +95,7 @@ pub const LLM_PRESETS: &[LlmPreset] = &[
     LlmPreset { id: "deepseek", label: "DeepSeek", base_url: "https://api.deepseek.com", model: "deepseek-flash" },
     LlmPreset { id: "doubao", label: "豆包（火山方舟）", base_url: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-2-1-lite-260915" },
     LlmPreset { id: "mimo", label: "Xiaomi MiMo", base_url: "https://api.xiaomimimo.com/v1", model: "mimo-v2.6-flash" },
+    LlmPreset { id: "opencode-go", label: "OpenCode Go", base_url: "https://opencode.ai/zen/go/v1", model: "deepseek-v4.1-flash" },
 ];
 pub const DEFAULT_LLM_PROVIDER: &str = "doubao";
 
@@ -713,7 +714,10 @@ mod tests {
         let preset = llm_preset("mimo").unwrap();
         assert_eq!(preset.base_url, "https://api.xiaomimimo.com/v1");
         assert_eq!(preset.model, "mimo-v2.6-flash");
-        assert_eq!(LLM_PRESETS.len(), 3);
+        let go = llm_preset("opencode-go").unwrap();
+        assert_eq!(go.base_url, "https://opencode.ai/zen/go/v1");
+        assert_eq!(go.model, "deepseek-v4.1-flash");
+        assert_eq!(LLM_PRESETS.len(), 4);
     }
 
     #[test]

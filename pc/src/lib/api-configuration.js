@@ -14,6 +14,7 @@ export const LLM_PRESETS = [
   { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com", model: "deepseek-flash" },
   { id: "doubao", label: "豆包", baseUrl: "https://ark.cn-beijing.volces.com/api/v3", model: DEFAULT_LITE_MODEL },
   { id: "mimo", label: "MiMo", baseUrl: "https://api.xiaomimimo.com/v1", model: "mimo-v2.6-flash" },
+  { id: "opencode-go", label: "OpenCode Go", baseUrl: "https://opencode.ai/zen/go/v1", model: "deepseek-v4.1-flash" },
 ];
 
 export const DEFAULT_TTS_RESOURCE_ID = "seed-tts-2.0";
