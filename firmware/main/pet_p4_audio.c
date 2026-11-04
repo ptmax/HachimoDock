@@ -1036,15 +1036,22 @@ esp_err_t pet_p4_audio_play_event_cue(const char *family) {
   if (!event_cue_allowed()) return ESP_ERR_INVALID_STATE;
   uint32_t now_ms = (uint32_t) (esp_timer_get_time() / 1000ULL);
   bool stop = !strcmp(family, "session_terminated");
-  /* The approval modal owns the whole feedback window. This is stronger than
-   * the recent-permission heuristic: a stop snapshot may arrive after the
-   * approval state was cleared, so keep blocking the stop cue for a short
-   * tail after the decision as well. */
+  bool permission = !strncmp(family, "permission_", 11);
+  bool approval_pending_now = atomic_load_explicit(
+    &g_approval_pending, memory_order_acquire
+  );
   uint32_t approval_until = atomic_load_explicit(
     &g_approval_cue_block_until_ms, memory_order_acquire
   );
-  if (stop && (atomic_load_explicit(&g_approval_pending, memory_order_acquire)
-      || (approval_until != 0 && (int32_t) (approval_until - now_ms) > 0))) {
+  /* The approval modal owns the feedback window. Real-device cue order showed
+   * `permission_request -> waiting_user -> permission_approved`; waiting_user
+   * is the old 3.8 s cue users perceived as a pause sound. While approval is
+   * pending only permission_* may play. After the decision keep suppressing
+   * the stop/pause families for the short tail. */
+  if (approval_pending_now && !permission) return ESP_ERR_INVALID_STATE;
+  if ((stop || !strcmp(family, "waiting_user"))
+      && approval_until != 0
+      && (int32_t) (approval_until - now_ms) > 0) {
     return ESP_ERR_INVALID_STATE;
   }
   /* A DSH approval prompt often arrives together with a stopped-session cue.
