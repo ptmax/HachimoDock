@@ -58,7 +58,7 @@ impl NoTranscriptEvidence {
 // fallback below only restores the interrupt for that exact failure mode; it
 // never replaces a transcript and never applies to long speech or to tasks
 // that are still thinking.
-pub const NO_TRANSCRIPT_MIN_VOICED_FRAMES: usize = 8; // 160 ms, same as the barge gate
+pub const NO_TRANSCRIPT_MIN_VOICED_FRAMES: usize = 14; // 280 ms; 160 ms admitted speaker echo
 pub const NO_TRANSCRIPT_MAX_VOICED_FRAMES: usize = 60; // 1.2 s; "等等" often exceeds 680 ms
 // The real "停" trace shows 12/20 periodic frames (60%) because the plosive
 // onset is noisy while the vowel body remains periodic. Keep at least six
@@ -80,7 +80,7 @@ pub const NO_TRANSCRIPT_MAX_PEAK_RMS: f32 = 12_000.0;
 /// - the cloud returned no meaningful text and never emitted a textual Partial:
 ///   if ASR heard *anything*, even a rejected fragment, the transcript path
 ///   owns the decision and this fallback stays closed;
-/// - the candidate is short once voiced (8–60 frames) and at least half of the
+/// - the candidate is short once voiced (14–60 frames) and at least half of the
 ///   voiced frames are periodic near-end speech with a bounded peak level.
 pub fn no_transcript_short_command(
     phase: &str,
@@ -272,22 +272,22 @@ mod tests {
     #[test]
     fn empty_final_stop_needs_a_finalized_short_voiced_utterance_during_playback() {
         let evidence = short_command_evidence();
-        assert!(no_transcript_short_command("speaking", false, true, false, "", 12, evidence));
-        assert!(no_transcript_short_command("speaking", false, true, false, "  ……！", 12, evidence));
+        assert!(no_transcript_short_command("speaking", false, true, false, "", 14, evidence));
+        assert!(no_transcript_short_command("speaking", false, true, false, "  ……！", 14, evidence));
         // A real transcript is handled by the ASR-confirmed path, never here.
-        assert!(!no_transcript_short_command("speaking", false, true, false, "停", 12, evidence));
-        assert!(!no_transcript_short_command("speaking", false, true, false, "嗯", 12, evidence));
+        assert!(!no_transcript_short_command("speaking", false, true, false, "停", 14, evidence));
+        assert!(!no_transcript_short_command("speaking", false, true, false, "嗯", 14, evidence));
         // If the cloud emitted any textual Partial, it heard something; the
         // transcript path owns that decision even when its Final is empty.
-        assert!(!no_transcript_short_command("speaking", false, true, true, "", 12, evidence));
+        assert!(!no_transcript_short_command("speaking", false, true, true, "", 14, evidence));
         // The ASR must have been asked for its Final; an unsolicited empty
         // event is not evidence that the short command was fully submitted.
-        assert!(!no_transcript_short_command("speaking", false, false, false, "", 12, evidence));
+        assert!(!no_transcript_short_command("speaking", false, false, false, "", 14, evidence));
         // Never cancel an agent task that is still thinking or executing.
-        assert!(!no_transcript_short_command("thinking", false, true, false, "", 12, evidence));
-        assert!(!no_transcript_short_command("listening", false, true, false, "", 12, evidence));
+        assert!(!no_transcript_short_command("thinking", false, true, false, "", 14, evidence));
+        assert!(!no_transcript_short_command("listening", false, true, false, "", 14, evidence));
         // Once playback finished there is nothing left to interrupt.
-        assert!(!no_transcript_short_command("speaking", true, true, false, "", 12, evidence));
+        assert!(!no_transcript_short_command("speaking", true, true, false, "", 14, evidence));
     }
 
     #[test]
@@ -312,10 +312,10 @@ mod tests {
         assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, mixed));
         // Real "停" trace: 12 periodic / 20 voiced (60%) must pass.
         assert!(no_transcript_short_command("speaking", false, true, false, "", 20, short_command_evidence()));
-        // Plosive onset tolerance: the minimum candidate needs six periodic frames.
-        let minimum_ok = NoTranscriptEvidence { periodic_frames: 6, peak_rms: 900.0 };
-        assert!(no_transcript_short_command("speaking", false, true, false, "", 8, minimum_ok));
-        let minimum_low = NoTranscriptEvidence { periodic_frames: 5, peak_rms: 900.0 };
-        assert!(!no_transcript_short_command("speaking", false, true, false, "", 8, minimum_low));
+        // The minimum candidate still needs half its voiced frames to be periodic.
+        let minimum_ok = NoTranscriptEvidence { periodic_frames: 7, peak_rms: 900.0 };
+        assert!(no_transcript_short_command("speaking", false, true, false, "", 14, minimum_ok));
+        let minimum_low = NoTranscriptEvidence { periodic_frames: 6, peak_rms: 900.0 };
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", 14, minimum_low));
     }
 }
