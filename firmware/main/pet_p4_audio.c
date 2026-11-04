@@ -127,7 +127,11 @@ static atomic_bool g_music;
 static atomic_bool g_music_paused;
 static uint64_t g_last_event_cue_ms;
 static char g_last_event_cue_family[32];
-static uint64_t g_approval_cue_block_until_ms;
+/* 32-bit monotonic milliseconds are enough for the short approval tail and
+ * are atomic on the 32-bit target. Keep "approval is active" separate from
+ * the tail deadline so clear_approval cannot re-arm the window accidentally. */
+static atomic_bool g_approval_pending;
+static atomic_uint_least32_t g_approval_cue_block_until_ms;
 static atomic_bool g_music_pause_requested;
 static atomic_uint g_music_volume = 65;
 static atomic_uint g_output_volume = 70;
@@ -1030,15 +1034,17 @@ esp_err_t pet_p4_audio_play_event_cue(const char *family) {
   if (!family || !pet_p4_system_cue_family(family)) return ESP_ERR_INVALID_ARG;
   if (!pet_p4_audio_playback_ready() || !g_playback_queue) return ESP_ERR_INVALID_STATE;
   if (!event_cue_allowed()) return ESP_ERR_INVALID_STATE;
-  uint64_t now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
+  uint32_t now_ms = (uint32_t) (esp_timer_get_time() / 1000ULL);
   bool stop = !strcmp(family, "session_terminated");
   /* The approval modal owns the whole feedback window. This is stronger than
    * the recent-permission heuristic: a stop snapshot may arrive after the
    * approval state was cleared, so keep blocking the stop cue for a short
    * tail after the decision as well. */
-  if (stop && g_approval_cue_block_until_ms != 0
-      && (g_approval_cue_block_until_ms == UINT64_MAX
-          || now_ms < g_approval_cue_block_until_ms)) {
+  uint32_t approval_until = atomic_load_explicit(
+    &g_approval_cue_block_until_ms, memory_order_acquire
+  );
+  if (stop && (atomic_load_explicit(&g_approval_pending, memory_order_acquire)
+      || (approval_until != 0 && (int32_t) (approval_until - now_ms) > 0))) {
     return ESP_ERR_INVALID_STATE;
   }
   /* A DSH approval prompt often arrives together with a stopped-session cue.
@@ -1046,8 +1052,8 @@ esp_err_t pet_p4_audio_play_event_cue(const char *family) {
    * When the stop cue was already queued, the new generation cancels/overwrites
    * it so the prompt is not played after the stop sound. */
   if (stop && g_last_event_cue_ms > 0
-      && now_ms >= g_last_event_cue_ms
-      && now_ms - g_last_event_cue_ms < 1200
+      && now_ms >= (uint32_t) g_last_event_cue_ms
+      && now_ms - (uint32_t) g_last_event_cue_ms < 1200
       && !strncmp(g_last_event_cue_family, "permission_", 11)) {
     return ESP_ERR_INVALID_STATE;
   }
@@ -1065,9 +1071,10 @@ esp_err_t pet_p4_audio_play_event_cue(const char *family) {
 }
 
 void pet_p4_audio_set_approval_pending(bool pending) {
-  uint64_t now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
+  uint32_t now_ms = (uint32_t) (esp_timer_get_time() / 1000ULL);
   if (pending) {
-    g_approval_cue_block_until_ms = UINT64_MAX;
+    atomic_store_explicit(&g_approval_pending, true, memory_order_release);
+    atomic_store_explicit(&g_approval_cue_block_until_ms, 0, memory_order_release);
     /* If the stop cue started just before the approval request arrived, cut
      * it now. Incrementing the generation makes the playback loop abandon
      * its current WAV at the next chunk; clearing the one-slot queue removes
@@ -1078,8 +1085,13 @@ void pet_p4_audio_set_approval_pending(bool pending) {
       atomic_fetch_add_explicit(&g_playback_generation, 1U, memory_order_acq_rel);
       xQueueReset(g_playback_queue);
     }
-  } else if (g_approval_cue_block_until_ms != 0) {
-    g_approval_cue_block_until_ms = now_ms + 1500ULL;
+  } else if (atomic_exchange_explicit(
+      &g_approval_pending, false, memory_order_acq_rel)) {
+    atomic_store_explicit(
+      &g_approval_cue_block_until_ms,
+      now_ms + 1500U,
+      memory_order_release
+    );
   }
 }
 
