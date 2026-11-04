@@ -2418,7 +2418,10 @@ static void handle_session_current(pet_p4_runtime_state_t *state, const cJSON *p
         }
       } else if (lifecycle_is_terminal(candidate.state)) {
         bool stopped_transition = lifecycle_is(candidate.state, "stopped");
-        if (stopped_transition
+        /* A DSH approval prompt is the active feedback surface. Do not add a
+         * pause/stop cue on top of it; other agents and normal stops keep the
+         * existing behavior. */
+        if (stopped_transition && !state->approval_active
             && (!previous || !lifecycle_is(previous->state, "stopped"))) {
           bool already_played = g_last_stopped_cue_revision == candidate.transition_revision
             && strcmp(g_last_stopped_cue_session, candidate.id) == 0;

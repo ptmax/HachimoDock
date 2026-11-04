@@ -225,9 +225,15 @@ test('aborted and failed turn endings are not reported as done', async (t) => {
 })
 
 test('interrupt cancels the running task and marks it stopped', async (t) => {
-  const { bridge, url, session, agent } = await makeBridge(t)
+  const { bridge, url, session, agent, ctx } = await makeBridge(t)
+  agent.status = 'running'
   await postJson(`${url}/task`, { taskId: TASK_ID, sessionId: 'auto', text: '长任务' })
-  assert.equal(agent.status, 'running')
+  ctx.dispatchSync('agent/inbox/claimed', {
+    message: agent.followups[0],
+    turn: 4,
+    agent: { session },
+  })
+  assert.equal(bridge.tasks.get(TASK_ID).state, 'working')
   const response = await postJson(`${url}/interrupt`, { sessionId: session.id })
   assert.equal(response.status, 200)
   assert.equal(response.body.interrupted, true)
@@ -308,16 +314,19 @@ test('a discarded inbox message marks its task cancelled', async (t) => {
   assert.equal(task.body.task.reason, 'discarded')
 })
 
-test('interrupt with no running turn still stops accepted task records', async (t) => {
+test('interrupt preserves accepted/queued task records while idle', async (t) => {
   const { url, session, agent } = await makeBridge(t)
+  agent.status = 'running'
   await postJson(`${url}/task`, { taskId: TASK_ID, sessionId: 'auto', text: '尚未开始的任务' })
+  const before = await requestJson(`${url}/task?taskId=${TASK_ID}`)
+  assert.equal(before.body.task.state, 'queued')
   agent.status = 'idle'
   const response = await postJson(`${url}/interrupt`, { sessionId: session.id })
   assert.equal(response.status, 200)
   assert.equal(response.body.interrupted, false)
   const task = await requestJson(`${url}/task?taskId=${TASK_ID}`)
-  assert.equal(task.body.task.state, 'stopped')
-  assert.equal(task.body.task.reason, 'user')
+  assert.equal(task.body.task.state, before.body.task.state)
+  assert.notEqual(task.body.task.state, 'stopped')
 })
 
 test('an approval marks the bound task waiting_user and clears after a decision', async (t) => {

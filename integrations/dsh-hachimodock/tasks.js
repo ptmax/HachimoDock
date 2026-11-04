@@ -322,6 +322,11 @@ class DshTaskRegistry {
     if (typeof sessionId !== 'string' || sessionId === '') return
     for (const task of this.tasks.values()) {
       if (task.sessionId !== sessionId || !ACTIVE_STATES.has(task.state)) continue
+      // A device stop applies to the turn that is actually executing. Do not
+      // erase accepted/queued follow-up messages; they belong to the user and
+      // must remain available for the next turn. Explicit task cancellation
+      // (discard/cancel) handles those separately.
+      if (task.state === 'queued') continue
       task.state = 'stopped'
       task.reason = 'user'
       this.touch(task)
