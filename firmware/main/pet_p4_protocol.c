@@ -1507,6 +1507,7 @@ void pet_p4_state_init(pet_p4_runtime_state_t *state, const char *board_device_i
 void pet_p4_state_clear_approval(pet_p4_runtime_state_t *state) {
   if (!state) return;
   state->approval_active = false;
+  (void) pet_p4_audio_set_approval_pending(false);
   state->approval_request_id[0] = '\0';
   state->approval_agent[0] = '\0';
   state->approval_tool[0] = '\0';
@@ -1541,6 +1542,7 @@ bool pet_p4_state_begin_approval(
   copy_text(state->approval_reason, sizeof(state->approval_reason), reason);
   state->approval_expires_ms = expires_ms;
   state->approval_active = true;
+  (void) pet_p4_audio_set_approval_pending(true);
   return true;
 }
 

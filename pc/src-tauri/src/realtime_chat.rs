@@ -66,6 +66,12 @@ const PROCESSED_VAD_ABS_MIN: f32 = 160.0;
 const PROCESSED_SPEECH_START_FRAMES: usize = 8; // 160 ms; reject brief AEC onset transients
 const BARGE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
 const BARGE_CONFIRM_MAX_FRAMES: usize = 150; // bounded even when Windows delivers queued frames in a burst
+// Short commands ("停", "等等") end well before the reply-level VAD declares End
+// and before the frame cap. Once the barge has voice evidence, a short
+// no-new-voiced window is enough to ask ASR for its Final transcript instead of
+// polling a stream that was never finalized until the confirmation deadline.
+const BARGE_FINISH_MIN_VOICED_FRAMES: usize = 8; // same voice evidence as the barge gate
+const BARGE_FINISH_SILENCE_FRAMES: usize = 40; // 800 ms of 20 ms frames without new voiced audio
 const LISTENING_VAD_ABS_MIN: f32 = 96.0;
 const LISTENING_SPEECH_START_FRAMES: usize = 5; // 100 ms; reject isolated low-energy hints
 const PREVIEW_MAX_SECONDS: u64 = 20;
@@ -99,6 +105,21 @@ pub struct RealtimeChatStartInput {
     pub greeting: String,
     #[serde(default)]
     pub voice: VoiceSpec,
+    /// P4 session-selection snapshot captured when realtime chat starts. The
+    /// UI publishes this synchronously with the selection, before the
+    /// asynchronous `set_p4_session_binding` commit, so a dispatch cannot race
+    /// back to the previous/current session.
+    #[serde(default)]
+    pub target_agent_id: String,
+    #[serde(default)]
+    pub target_session_id: String,
+    /// When the P4 target was selected (epoch ms); 0 means auto/no P4 action.
+    #[serde(default)]
+    pub target_updated_at: u64,
+    /// Set when a DSH-following realtime start could not confirm any target;
+    /// dispatch must fail closed instead of using the current session.
+    #[serde(default)]
+    pub target_unconfirmed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +184,9 @@ struct Session {
     completed_playback: Mutex<String>,
     pending_persona: Mutex<Option<RealtimeChatStartInput>>,
     playback_volume: AtomicU32,
+    target_agent_id: String,
+    target_session_id: String,
+    target_unconfirmed: bool,
 }
 
 impl Session {
@@ -498,6 +522,9 @@ pub fn start(app: &AppHandle, mut input: RealtimeChatStartInput) -> Result<Realt
         completed_playback: Mutex::new(String::new()),
         pending_persona: Mutex::new(None),
         playback_volume: AtomicU32::new(input.voice.volume().to_bits()),
+        target_agent_id: input.target_agent_id.trim().to_string(),
+        target_session_id: input.target_session_id.trim().to_string(),
+        target_unconfirmed: input.target_unconfirmed,
         status: Mutex::new(RealtimeChatStatus {
             active: true,
             state: "preparing".to_string(),
@@ -1359,6 +1386,19 @@ fn has_barge_in_text(text: &str) -> bool {
     }
 }
 
+/// Why a barge probe should be finalized now, if at all. The silence window is
+/// the short-command path; VAD End remains the bound for longer speech. The
+/// frame cap is applied by the caller next to `BARGE_CONFIRM_MAX_FRAMES`.
+/// It only opens after the same eight voiced frames the barge policy requires,
+/// so noise cannot force an early Final.
+fn barge_finish_reason(voiced_frames: usize, unvoiced_run: usize, vad_end: bool) -> Option<&'static str> {
+    if vad_end { return Some("vad_end"); }
+    if voiced_frames >= BARGE_FINISH_MIN_VOICED_FRAMES && unvoiced_run >= BARGE_FINISH_SILENCE_FRAMES {
+        return Some("silence_window");
+    }
+    None
+}
+
 fn start_barge_probe(frames: Vec<Vec<u8>>) -> Result<VerifiedSpeech, String> {
     let (tx, events) = mpsc::unbounded_channel();
     let recognizer = StreamingSpeechRecognizer::start(move |event| { let _ = tx.send(event); })?;
@@ -1407,6 +1447,7 @@ where F: std::future::Future<Output=Result<(), String>>,
         tokio::pin!(deadline);
         let mut added_frames = 0;
         let mut voiced_frames = vad.speech_run;
+        let mut unvoiced_run = 0usize;
         let mut confirmation = barge_policy::Confirmation::default();
         let mut input_finished = false;
         let mut rejection = "no_transcript";
@@ -1456,6 +1497,18 @@ where F: std::future::Future<Output=Result<(), String>>,
                     result?;
                     probe.reply_completed = true;
                     vad.reply_tail_until = Some(Instant::now() + POST_SPEAK_GUARD);
+                    // A barge candidate that is still active when the reply ends
+                    // must still get a Final request. Only finalize here when the
+                    // bounded policy already allows it; otherwise keep polling
+                    // until the silence window, so a late confirmed Partial is
+                    // not discarded just because playback finished first.
+                    if !input_finished {
+                        if let Some(reason) = barge_finish_reason(voiced_frames, unvoiced_run, false) {
+                            if probe.recognizer.finish().is_err() { rejection="asr_error"; break; }
+                            input_finished = true;
+                            diagnostics::record(&vad.diagnostic_session,"barge_probe_finish",json!({"reason":reason,"frames":probe.stats.frames,"elapsedMs":started.elapsed().as_millis()}));
+                        }
+                    }
                 }
                 incoming = async { if !input_finished && !deferred.is_empty() { deferred.pop_front() } else { rx.recv().await } } => {
                     let Some(Input::Pcm(pcm, speech)) = incoming else { return Err("设备收音通道关闭".into()); };
@@ -1471,12 +1524,21 @@ where F: std::future::Future<Output=Result<(), String>>,
                     }
                     probe.stats.observe(&pcm);
                     added_frames += 1;
-                    if speech == Some(true) && Vad::rms(&pcm) >= PROCESSED_VAD_ABS_MIN { voiced_frames += 1; }
+                    if speech == Some(true) && Vad::rms(&pcm) >= PROCESSED_VAD_ABS_MIN {
+                        voiced_frames += 1; unvoiced_run = 0;
+                    } else {
+                        unvoiced_run += 1;
+                    }
                     // Keep feeding silence to streaming ASR; an empty VAD end is
-                    // never itself permission to cancel the reply.
-                    if matches!(vad.step_with_hint(&pcm, speech),VadStep::End) || added_frames >= BARGE_CONFIRM_MAX_FRAMES {
+                    // never itself permission to cancel the reply. The explicit
+                    // finish policy is the only place that asks for the Final.
+                    let vad_end = matches!(vad.step_with_hint(&pcm, speech), VadStep::End);
+                    let finish_reason = barge_finish_reason(voiced_frames, unvoiced_run, vad_end)
+                        .or_else(|| (added_frames >= BARGE_CONFIRM_MAX_FRAMES).then_some("frame_cap"));
+                    if let Some(reason) = finish_reason {
                         if probe.recognizer.finish().is_err() { rejection="asr_error"; break; }
-                        input_finished=true;
+                        input_finished = true;
+                        diagnostics::record(&vad.diagnostic_session,"barge_probe_finish",json!({"reason":reason,"frames":probe.stats.frames,"elapsedMs":started.elapsed().as_millis()}));
                     }
                 }
             }
@@ -1679,7 +1741,9 @@ async fn answer_turn(
     let log_session = session.id.clone();
     let desktop_context=crate::desktop_agent::Context::new(&session.id,&board,
         session.status.lock().map(|s|s.turns).unwrap_or(0),user_text)
-        .with_conversation(desktop_conversation).with_followed_agent();
+        .with_conversation(desktop_conversation)
+        .with_realtime_target(&session.target_agent_id,&session.target_session_id)
+        .with_target_unconfirmed(session.target_unconfirmed);
     // Retain the user turn even if the reply future is interrupted or fails.
     desktop_conversation.push("user", user_text);
     diagnostics::record(&session.id, "llm_started", json!({}));
@@ -1879,8 +1943,261 @@ pub async fn preview(input: PersonaVoicePreviewInput) -> Result<(), String> {
 
 // ---- tauri commands --------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct CachedDshFocus {
+    instance_id: String,
+    focus: Option<crate::dsh_task::FocusSnapshot>,
+}
+
+fn dsh_focus_cache() -> &'static Mutex<Option<CachedDshFocus>> {
+    static CACHE: OnceLock<Mutex<Option<CachedDshFocus>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn dsh_focus_sample_override() -> &'static Mutex<Option<crate::dsh_task::FocusSample>> {
+    static OVERRIDE: OnceLock<Mutex<Option<crate::dsh_task::FocusSample>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_focus_sample_override(sample: Option<crate::dsh_task::FocusSample>) {
+    if let Ok(mut slot) = dsh_focus_sample_override().lock() {
+        *slot = sample;
+    }
+}
+
+async fn sample_dsh_focus() -> crate::dsh_task::FocusSample {
+    #[cfg(test)]
+    if let Ok(slot) = dsh_focus_sample_override().lock() {
+        if let Some(sample) = slot.clone() {
+            return sample;
+        }
+    }
+    crate::dsh_task::focus().await
+}
+
+/// Whether a DSH UI focus selection is newer than the P4 voice target.
+/// An explicit P4 choice wins ties and missing timestamps; an auto P4 target
+/// has no user-selected session, so any confirmed focus wins.
+fn focus_precedes_p4(
+    p4_session_id: &str,
+    p4_updated_at: u64,
+    focus_updated_at: u64,
+    focus_origin: &str,
+) -> bool {
+    let p4_explicit = !p4_session_id.trim().is_empty()
+        && !p4_session_id.trim().eq_ignore_ascii_case("auto");
+    if !p4_explicit {
+        return true;
+    }
+    // A renderer-restored selection is not a fresh user action and must never
+    // override an explicit P4 choice after a DSH restart.
+    if focus_origin == "restore" {
+        return false;
+    }
+    p4_updated_at > 0 && focus_updated_at > p4_updated_at
+}
+
+fn focus_status_label(status: crate::dsh_task::FocusSampleStatus) -> &'static str {
+    match status {
+        crate::dsh_task::FocusSampleStatus::Ok => "ok",
+        crate::dsh_task::FocusSampleStatus::Unsupported => "unsupported",
+        crate::dsh_task::FocusSampleStatus::Unavailable => "unavailable",
+    }
+}
+
+fn follows_dsh_target(requested_agent: &str, fallback_agent: &str) -> bool {
+    let requested = requested_agent.trim();
+    requested == "deepseek-harness"
+        || (requested.is_empty() && fallback_agent == "deepseek-harness")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FocusDecision {
+    KeepP4,
+    UseFocus {
+        focus: crate::dsh_task::FocusSnapshot,
+        cached: bool,
+    },
+    Unconfirmed,
+}
+
+/// Pure DSH focus vs P4 target decision. `cached` is only consulted when the
+/// sampled result cannot provide an attached-client selection. Explicit P4
+/// choices win ties and missing timestamps; an auto P4 target loses to any
+/// confirmed DSH focus.
+fn decide_focus_target(
+    p4_session_id: &str,
+    p4_updated_at: u64,
+    status: crate::dsh_task::FocusSampleStatus,
+    observer_attached: bool,
+    observer_capable: bool,
+    focus: Option<&crate::dsh_task::FocusSnapshot>,
+    bridge_reachable: bool,
+    cached: Option<&crate::dsh_task::FocusSnapshot>,
+) -> FocusDecision {
+    let p4_explicit = !p4_session_id.trim().is_empty()
+        && !p4_session_id.trim().eq_ignore_ascii_case("auto");
+    let usable_focus = focus.filter(|focus| !focus.session_id.trim().is_empty());
+    let usable_cached = cached.filter(|focus| !focus.session_id.trim().is_empty());
+    match status {
+        crate::dsh_task::FocusSampleStatus::Ok => {
+            if let Some(focus) = usable_focus {
+                if focus_precedes_p4(
+                    p4_session_id,
+                    p4_updated_at,
+                    focus.updated_at,
+                    &focus.origin,
+                ) {
+                    FocusDecision::UseFocus { focus: focus.clone(), cached: false }
+                } else {
+                    FocusDecision::KeepP4
+                }
+            } else if observer_attached && observer_capable {
+                // The focus observer is installed and has no ordinary main
+                // session: explicit no-selection; keep the P4 target.
+                FocusDecision::KeepP4
+            } else if let Some(cached) = usable_cached {
+                if focus_precedes_p4(
+                    p4_session_id,
+                    p4_updated_at,
+                    cached.updated_at,
+                    &cached.origin,
+                ) {
+                    FocusDecision::UseFocus { focus: cached.clone(), cached: true }
+                } else {
+                    FocusDecision::KeepP4
+                }
+            } else if !p4_explicit {
+                FocusDecision::Unconfirmed
+            } else {
+                FocusDecision::KeepP4
+            }
+        }
+        crate::dsh_task::FocusSampleStatus::Unsupported => FocusDecision::KeepP4,
+        crate::dsh_task::FocusSampleStatus::Unavailable => {
+            if let Some(cached) = usable_cached {
+                if focus_precedes_p4(
+                    p4_session_id,
+                    p4_updated_at,
+                    cached.updated_at,
+                    &cached.origin,
+                ) {
+                    FocusDecision::UseFocus { focus: cached.clone(), cached: true }
+                } else {
+                    FocusDecision::KeepP4
+                }
+            } else if !p4_explicit && bridge_reachable {
+                FocusDecision::Unconfirmed
+            } else {
+                FocusDecision::KeepP4
+            }
+        }
+    }
+}
+
+/// Merge the DSH Web/Desktop main-session selection into the realtime start
+/// target. Runs before the session is created; the chosen target is then
+/// pinned by the t15 mechanism for the whole conversation. Never silently
+/// falls back to the current session when a focus was known but unreadable.
+async fn resolve_dsh_focus_target(input: &mut RealtimeChatStartInput) {
+    let requested_agent = input.target_agent_id.trim().to_string();
+    let fallback_agent = if requested_agent.is_empty() {
+        crate::resolve_usb_inject_agent_id()
+    } else {
+        String::new()
+    };
+    if !follows_dsh_target(&requested_agent, &fallback_agent) {
+        input.target_unconfirmed = false;
+        return;
+    }
+    if requested_agent.is_empty() {
+        input.target_agent_id = "deepseek-harness".to_string();
+    }
+    let sample = sample_dsh_focus().await;
+    let p4_session = input.target_session_id.trim().to_string();
+    let p4_updated_at = input.target_updated_at;
+    let p4_explicit = !p4_session.is_empty() && !p4_session.eq_ignore_ascii_case("auto");
+
+    // A different bridge instance invalidates the previous cache.
+    if sample.status == crate::dsh_task::FocusSampleStatus::Ok {
+        if let Ok(mut cache) = dsh_focus_cache().lock() {
+            if cache.as_ref().is_some_and(|cached| {
+                !sample.instance_id.is_empty()
+                    && !cached.instance_id.is_empty()
+                    && cached.instance_id != sample.instance_id
+            }) {
+                *cache = None;
+            }
+        }
+    }
+    // Only an observer that is installed and capable can explicitly clear the
+    // last confirmed focus. An SSE-only/old client must not erase it.
+    if sample.status == crate::dsh_task::FocusSampleStatus::Ok
+        && ((sample.observer_attached && sample.observer_capable) || sample.focus.is_some())
+    {
+        if let Ok(mut cache) = dsh_focus_cache().lock() {
+            *cache = Some(CachedDshFocus {
+                instance_id: sample.instance_id.clone(),
+                focus: sample.focus.clone().filter(|focus| !focus.session_id.trim().is_empty()),
+            });
+        }
+    }
+    if sample.status == crate::dsh_task::FocusSampleStatus::Unsupported {
+        if let Ok(mut cache) = dsh_focus_cache().lock() {
+            *cache = None;
+        }
+    }
+    let cached = dsh_focus_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.clone())
+        .and_then(|cache| cache.focus);
+    let decision = decide_focus_target(
+        &p4_session,
+        p4_updated_at,
+        sample.status,
+        sample.observer_attached,
+        sample.observer_capable,
+        sample.focus.as_ref(),
+        sample.bridge_reachable,
+        cached.as_ref(),
+    );
+    let mut source = "p4";
+    let mut cached_used = false;
+    let mut unconfirmed = false;
+    match decision {
+        FocusDecision::KeepP4 => {}
+        FocusDecision::UseFocus { focus, cached } => {
+            input.target_agent_id = "deepseek-harness".to_string();
+            input.target_session_id = focus.session_id;
+            input.target_updated_at = focus.updated_at;
+            source = if cached { "dsh-ui-cached" } else { "dsh-ui" };
+            cached_used = cached;
+        }
+        FocusDecision::Unconfirmed => {
+            unconfirmed = true;
+        }
+    }
+    input.target_unconfirmed = unconfirmed;
+    crate::realtime_chat_log::record("", "dsh_focus_target", json!({
+        "status": focus_status_label(sample.status),
+        "clientAttached": sample.client_attached,
+        "observerAttached": sample.observer_attached,
+        "observerCapable": sample.observer_capable,
+        "bridgeReachable": sample.bridge_reachable,
+        "p4Explicit": p4_explicit,
+        "cachedUsed": cached_used,
+        "chosen": source,
+        "unconfirmed": unconfirmed,
+        "ok": !unconfirmed,
+    }));
+}
+
 #[tauri::command]
-pub async fn realtime_chat_start(app: AppHandle, input: RealtimeChatStartInput) -> Result<RealtimeChatStatus, String> {
+pub async fn realtime_chat_start(app: AppHandle, mut input: RealtimeChatStartInput) -> Result<RealtimeChatStatus, String> {
+    resolve_dsh_focus_target(&mut input).await;
     start(&app, input)
 }
 
@@ -1950,7 +2267,8 @@ mod tests {
         // An unrelated persona save must not restore its legacy per-pet gain.
         let update = RealtimeChatStartInput { board_device_id:"board".into(),appearance_id:"".into(),
             display_name:"pet".into(),system_prompt:"prompt".into(),greeting:"".into(),
-            voice:VoiceSpec {volume:1.5,..Default::default()} };
+            voice:VoiceSpec {volume:1.5,..Default::default()}, target_agent_id:String::new(), target_session_id:String::new(),
+            target_updated_at:0, target_unconfirmed:false };
         queue_persona_update(&session,update).unwrap();
         assert_eq!(session.playback_volume(),1.0);
     }
@@ -1962,7 +2280,7 @@ mod tests {
             capture_armed:AtomicBool::new(false), capture_ready:AtomicBool::new(false),
             stop_notify:tokio::sync::Notify::new(), input,
             status:Mutex::new(RealtimeChatStatus {active:true, ..Default::default()}),
-            completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), playback_volume:AtomicU32::new(1.0f32.to_bits()) }, rx)
+            completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), target_agent_id:String::new(), target_session_id:String::new(), target_unconfirmed:false, playback_volume:AtomicU32::new(1.0f32.to_bits()) }, rx)
     }
 
     #[test]
@@ -2053,6 +2371,7 @@ mod tests {
         update_search(&mut status,crate::web_search::Event::Started); assert!(status.search_error.is_empty());
     }
     use super::*;
+    use crate::volcengine_asr::StreamingSpeechCommand;
 
     fn fake_barge_probe(frames: Vec<Vec<u8>>, texts: &[&str], keep_events_open: bool) -> (VerifiedSpeech, impl Sized) {
         let (recognizer, sink) = StreamingSpeechRecognizer::test_sink();
@@ -2064,6 +2383,98 @@ mod tests {
         for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
         (VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false },
             (sink, if keep_events_open { Some(tx) } else { None }))
+    }
+
+    /// Fake streaming ASR that emits nothing until `finish()` is requested, then
+    /// returns exactly one Final. This is the hardware failure mode: a short
+    /// command's transcript is never requested, so no Final can arrive before
+    /// the confirmation deadline.
+    fn fake_finish_driven_probe(frames: Vec<Vec<u8>>, final_text: &'static str) -> VerifiedSpeech {
+        let (recognizer, mut sink) = StreamingSpeechRecognizer::test_sink();
+        let (tx, events) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = sink.recv().await {
+                if matches!(command, StreamingSpeechCommand::Finish) {
+                    let _ = tx.send(StreamingSpeechEvent::Final { revision: 1, text: final_text.into(), confidence: None });
+                    break;
+                }
+            }
+        });
+        let mut stats = AsrCaptureStats::default();
+        for frame in frames { recognizer.push_pcm(&frame).unwrap(); stats.observe(&frame); }
+        VerifiedSpeech { recognizer, events, stats, text: String::new(), reply_completed: false, terminal: false }
+    }
+
+    /// Candidate speech followed by a known amount of trailing silence. The
+    /// replay VAD needs 700 ms for its own End, so 400 ms exercises the new
+    /// silence-window finish instead of the old VAD End path.
+    fn short_barge_deferred(silence_frames: usize) -> VecDeque<Input> {
+        (0..PROCESSED_SPEECH_START_FRAMES).map(|_| Input::Pcm(frame(180), Some(true)))
+            .chain((0..silence_frames).map(|_| Input::Pcm(frame(0), Some(false))))
+            .collect()
+    }
+
+    fn speaking_barge_session() -> Arc<Session> {
+        let (session, _) = routing_session();
+        {
+            let mut status = session.status.lock().unwrap();
+            status.state = "speaking".into();
+            status.reply = "正在播放音乐".into();
+        }
+        Arc::new(session)
+    }
+
+    #[test]
+    fn barge_finish_policy_requires_voice_evidence_and_bounds_silence() {
+        assert_eq!(barge_finish_reason(BARGE_FINISH_MIN_VOICED_FRAMES, BARGE_FINISH_SILENCE_FRAMES-1, false), None);
+        assert_eq!(barge_finish_reason(BARGE_FINISH_MIN_VOICED_FRAMES, BARGE_FINISH_SILENCE_FRAMES, false), Some("silence_window"));
+        assert_eq!(barge_finish_reason(BARGE_FINISH_MIN_VOICED_FRAMES-1, BARGE_FINISH_SILENCE_FRAMES, false), None);
+        assert_eq!(barge_finish_reason(0, 0, true), Some("vad_end"));
+        // The frame cap remains a separate caller-or term; windows_style_audio_burst... covers it.
+    }
+
+    #[test]
+    fn short_explicit_barge_finalizes_after_silence_and_confirms() {
+        tauri::async_runtime::block_on(async {
+            for (text, final_text) in [("停", "停"), ("等等", "等等")] {
+                let (_tx, mut rx) = mpsc::channel(8);
+                let mut deferred = short_barge_deferred(BARGE_FINISH_SILENCE_FRAMES);
+                let mut vad = Vad::new();
+                vad.session = Some(speaking_barge_session());
+                let reply = std::future::pending::<Result<(),String>>();
+                let speech = timeout(Duration::from_secs(2), verify_barge_in_with(reply, &mut rx, &mut deferred, &mut vad, true, |frames| {
+                    Ok(fake_finish_driven_probe(frames, final_text))
+                })).await.expect("short barge must not wait for the 3 s deadline").unwrap()
+                    .expect("short command must confirm after its Final transcript");
+                assert_eq!(speech.text, final_text, "{text}");
+                assert!(speech.terminal, "{text}");
+                assert!(!speech.reply_completed, "{text}");
+            }
+        });
+    }
+
+    #[test]
+    fn finalized_barge_noise_and_single_character_transcripts_still_reject() {
+        tauri::async_runtime::block_on(async {
+            for final_text in ["", "嗯"] {
+                let (_tx, mut rx) = mpsc::channel(8);
+                let mut deferred = short_barge_deferred(BARGE_FINISH_SILENCE_FRAMES);
+                let mut vad = Vad::new();
+                vad.session = Some(speaking_barge_session());
+                let completed = Arc::new(AtomicBool::new(false));
+                let flag = completed.clone();
+                let reply = async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                };
+                let result = timeout(Duration::from_secs(2), verify_barge_in_with(reply, &mut rx, &mut deferred, &mut vad, true, |frames| {
+                    Ok(fake_finish_driven_probe(frames, final_text))
+                })).await.expect("rejection path must stay bounded").unwrap();
+                assert!(result.is_none(), "{final_text}");
+                assert!(completed.load(Ordering::SeqCst), "{final_text}");
+            }
+        });
     }
 
     #[test]
@@ -2197,6 +2608,272 @@ mod tests {
             }).await.unwrap();
             assert!(result.is_none()); assert!(completed.load(Ordering::SeqCst));
         });
+    }
+
+    fn focus_fixture_with_origin(
+        session_id: &str,
+        updated_at: u64,
+        origin: &str,
+    ) -> crate::dsh_task::FocusSnapshot {
+        crate::dsh_task::FocusSnapshot {
+            session_id: session_id.into(),
+            updated_at,
+            seq: 1,
+            source: "dsh-ui".into(),
+            origin: origin.into(),
+        }
+    }
+
+    fn focus_fixture(session_id: &str, updated_at: u64) -> crate::dsh_task::FocusSnapshot {
+        focus_fixture_with_origin(session_id, updated_at, "user")
+    }
+
+    #[test]
+    fn dsh_focus_selection_drives_auto_target_but_respects_explicit_p4_precedence() {
+        use crate::dsh_task::FocusSampleStatus;
+        let focus = focus_fixture("session-dsh", 100);
+        // Auto P4 target: a capable DSH UI observer selection wins.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Ok, true, true, Some(&focus), true, None),
+            FocusDecision::UseFocus { focus: focus.clone(), cached: false }
+        );
+        // Explicit P4 newer/equal: P4 wins.
+        assert_eq!(
+            decide_focus_target("session-p4", 200, FocusSampleStatus::Ok, true, true, Some(&focus), true, None),
+            FocusDecision::KeepP4
+        );
+        assert_eq!(
+            decide_focus_target("session-p4", 100, FocusSampleStatus::Ok, true, true, Some(&focus), true, None),
+            FocusDecision::KeepP4
+        );
+        // DSH UI newer: focus wins.
+        assert_eq!(
+            decide_focus_target("session-p4", 99, FocusSampleStatus::Ok, true, true, Some(&focus), true, None),
+            FocusDecision::UseFocus { focus: focus.clone(), cached: false }
+        );
+        // Explicit P4 without a timestamp is never silently overridden.
+        assert_eq!(
+            decide_focus_target("session-p4", 0, FocusSampleStatus::Ok, true, true, Some(&focus), true, None),
+            FocusDecision::KeepP4
+        );
+        // Capable observer with no main session is an explicit no-selection.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Ok, true, true, None, true, None),
+            FocusDecision::KeepP4
+        );
+    }
+
+    #[test]
+    fn dsh_focus_observer_capability_fails_closed_when_unavailable() {
+        use crate::dsh_task::FocusSampleStatus;
+        // F1: SSE-only/old client, or a new client with no usable services, is
+        // not evidence that the focus observer can observe anything.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Ok, false, false, None, true, None),
+            FocusDecision::Unconfirmed
+        );
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Ok, true, false, None, true, None),
+            FocusDecision::Unconfirmed
+        );
+        // Explicit P4 choice still wins; observer capability is irrelevant.
+        assert_eq!(
+            decide_focus_target("session-p4", 100, FocusSampleStatus::Ok, false, false, None, true, None),
+            FocusDecision::KeepP4
+        );
+        // A last-confirmed selection avoids falling back to current.
+        let cached = focus_fixture("session-cached", 50);
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Ok, false, false, None, true, Some(&cached)),
+            FocusDecision::UseFocus { focus: cached.clone(), cached: true }
+        );
+    }
+
+    #[test]
+    fn restored_focus_does_not_override_an_explicit_p4_selection() {
+        use crate::dsh_task::FocusSampleStatus;
+        let restored = focus_fixture_with_origin("session-restored", 500, "restore");
+        // F3: renderer restore has a fresh timestamp but is not a user action.
+        assert_eq!(
+            decide_focus_target("session-p4", 100, FocusSampleStatus::Ok, true, true, Some(&restored), true, None),
+            FocusDecision::KeepP4
+        );
+        // With no explicit P4 choice, the restored selection is still usable.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Ok, true, true, Some(&restored), true, None),
+            FocusDecision::UseFocus { focus: restored.clone(), cached: false }
+        );
+        let user = focus_fixture_with_origin("session-restored", 500, "user");
+        assert_eq!(
+            decide_focus_target("session-p4", 100, FocusSampleStatus::Ok, true, true, Some(&user), true, None),
+            FocusDecision::UseFocus { focus: user.clone(), cached: false }
+        );
+    }
+
+    #[test]
+    fn dsh_focus_unavailable_or_stale_state_fails_closed_not_current() {
+        use crate::dsh_task::FocusSampleStatus;
+        let cached = focus_fixture("session-cached", 50);
+        // Focus service unreachable, no cache, auto P4 and reachable bridge:
+        // dispatch must fail closed rather than use the current session.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Unavailable, false, false, None, true, None),
+            FocusDecision::Unconfirmed
+        );
+        // Explicit P4 selection is still a valid user choice.
+        assert_eq!(
+            decide_focus_target("session-p4", 100, FocusSampleStatus::Unavailable, false, false, None, true, None),
+            FocusDecision::KeepP4
+        );
+        // Bridge unreachable: dispatch will report bridge unavailable explicitly.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Unavailable, false, false, None, false, None),
+            FocusDecision::KeepP4
+        );
+        // Last confirmed focus is used if it still wins over P4.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Unavailable, false, false, None, true, Some(&cached)),
+            FocusDecision::UseFocus { focus: cached.clone(), cached: true }
+        );
+        // Older plugin without /focus preserves the historical P4/auto path.
+        assert_eq!(
+            decide_focus_target("auto", 0, FocusSampleStatus::Unsupported, false, false, None, true, None),
+            FocusDecision::KeepP4
+        );
+    }
+
+    #[test]
+    fn focus_sync_is_scoped_to_the_dsh_agent_only() {
+        assert!(follows_dsh_target("deepseek-harness", ""));
+        assert!(follows_dsh_target("", "deepseek-harness"));
+        assert!(!follows_dsh_target("codex", "deepseek-harness"));
+        assert!(!follows_dsh_target("workbuddy", "deepseek-harness"));
+        assert!(!follows_dsh_target("", "codex"));
+    }
+
+    #[test]
+    fn dsh_focus_precedence_keeps_explicit_p4_newer_or_tied_selection() {
+        // Auto/empty P4 target: any confirmed user DSH UI focus wins.
+        assert!(focus_precedes_p4("auto", 0, 100, "user"));
+        assert!(focus_precedes_p4("", 0, 100, "user"));
+        assert!(focus_precedes_p4("", 0, 100, "restore"));
+        // Explicit P4 target: DSH focus must be strictly newer and user-origin.
+        assert!(focus_precedes_p4("session-p4", 100, 101, "user"));
+        assert!(!focus_precedes_p4("session-p4", 100, 100, "user"));
+        assert!(!focus_precedes_p4("session-p4", 100, 99, "user"));
+        assert!(!focus_precedes_p4("session-p4", 100, 999, "restore"));
+        // An explicit P4 target without a timestamp is never silently overridden.
+        assert!(!focus_precedes_p4("session-p4", 0, 100, "user"));
+    }
+
+    #[test]
+    fn resolve_focus_handles_cache_and_bridge_instance_changes() {
+        use crate::dsh_task::{FocusSample, FocusSampleStatus, FocusSnapshot};
+        let sample = |status, focus: Option<FocusSnapshot>, observer, instance: &str| FocusSample {
+            status,
+            focus,
+            client_attached: observer,
+            observer_attached: observer,
+            observer_capable: observer,
+            instance_id: instance.into(),
+            bridge_reachable: true,
+        };
+        let focus = FocusSnapshot {
+            session_id: "session-focus".into(),
+            updated_at: 200,
+            seq: 3,
+            source: "dsh-ui".into(),
+            origin: "user".into(),
+        };
+        let mut input: RealtimeChatStartInput = serde_json::from_value(serde_json::json!({
+            "boardDeviceId":"board",
+            "appearanceId":"pet-a",
+            "displayName":"小西",
+            "systemPrompt":"prompt",
+            "targetAgentId":"deepseek-harness",
+            "targetSessionId":"auto",
+            "targetUpdatedAt": 0
+        }))
+        .unwrap();
+        tauri::async_runtime::block_on(async {
+            set_focus_sample_override(Some(sample(
+                FocusSampleStatus::Ok,
+                Some(focus.clone()),
+                true,
+                "bridge-a",
+            )));
+            resolve_dsh_focus_target(&mut input).await;
+            assert_eq!(input.target_session_id, "session-focus");
+            assert_eq!(input.target_updated_at, 200);
+            assert!(!input.target_unconfirmed);
+
+            // Focus becomes unreadable: the last confirmed cache is used.
+            input.target_session_id = "auto".into();
+            input.target_updated_at = 0;
+            set_focus_sample_override(Some(sample(
+                FocusSampleStatus::Unavailable,
+                None,
+                false,
+                "bridge-a",
+            )));
+            resolve_dsh_focus_target(&mut input).await;
+            assert_eq!(input.target_session_id, "session-focus");
+            assert!(!input.target_unconfirmed);
+
+            // A new bridge instance with an attached, capable observer and no
+            // selection invalidates the old cache and keeps P4/auto.
+            input.target_session_id = "auto".into();
+            input.target_updated_at = 0;
+            set_focus_sample_override(Some(sample(
+                FocusSampleStatus::Ok,
+                None,
+                true,
+                "bridge-b",
+            )));
+            resolve_dsh_focus_target(&mut input).await;
+            assert_eq!(input.target_session_id, "auto");
+            assert!(!input.target_unconfirmed);
+
+            // No observer capability and no cache: fail closed for auto P4.
+            input.target_session_id = "auto".into();
+            input.target_updated_at = 0;
+            set_focus_sample_override(Some(FocusSample {
+                status: FocusSampleStatus::Ok,
+                focus: None,
+                client_attached: true,
+                observer_attached: false,
+                observer_capable: false,
+                instance_id: "bridge-b".into(),
+                bridge_reachable: true,
+            }));
+            resolve_dsh_focus_target(&mut input).await;
+            assert!(input.target_unconfirmed);
+            set_focus_sample_override(None);
+        });
+    }
+
+    #[test]
+    fn realtime_start_payload_accepts_the_p4_target_snapshot() {
+        let input: RealtimeChatStartInput = serde_json::from_value(serde_json::json!({
+            "boardDeviceId":"board",
+            "appearanceId":"pet-a",
+            "displayName":"小西",
+            "systemPrompt":"prompt",
+            "targetAgentId":"deepseek-harness",
+            "targetSessionId":"session-selected"
+        }))
+        .unwrap();
+        assert_eq!(input.target_agent_id, "deepseek-harness");
+        assert_eq!(input.target_session_id, "session-selected");
+        let legacy: RealtimeChatStartInput = serde_json::from_value(serde_json::json!({
+            "boardDeviceId":"board",
+            "appearanceId":"pet-a",
+            "displayName":"小西",
+            "systemPrompt":"prompt"
+        }))
+        .unwrap();
+        assert!(legacy.target_agent_id.is_empty());
+        assert!(legacy.target_session_id.is_empty());
     }
 
     #[test]
@@ -2558,9 +3235,10 @@ mod tests {
                 capture_armed:AtomicBool::new(false), capture_ready:AtomicBool::new(false),
                 stop_notify:tokio::sync::Notify::new(), input:tx,
                 status:Mutex::new(RealtimeChatStatus { active:true, appearance_id:"pet-a".into(), ..Default::default() }),
-                completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), playback_volume:AtomicU32::new(1.0f32.to_bits()) };
+                completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), target_agent_id:String::new(), target_session_id:String::new(), target_unconfirmed:false, playback_volume:AtomicU32::new(1.0f32.to_bits()) };
             let mut current = RealtimeChatStartInput { board_device_id:"board".into(), appearance_id:"pet-a".into(),
-                display_name:"old".into(), system_prompt:"old prompt".into(), greeting:"hello".into(), voice:VoiceSpec::default() };
+                display_name:"old".into(), system_prompt:"old prompt".into(), greeting:"hello".into(), voice:VoiceSpec::default(),
+                target_agent_id:String::new(), target_session_id:String::new(), target_updated_at:0, target_unconfirmed:false };
             let mut next = current.clone(); next.appearance_id = "pet-b".into();
             assert!(!queue_persona_update(&session, next.clone()).unwrap());
             next.appearance_id = "pet-a".into(); next.display_name = "new".into();
@@ -2608,7 +3286,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
         let session = Session { id:"rtc-test".into(), board_device_id:"test".into(), cancelled:AtomicBool::new(false), duplex:AtomicBool::new(false),
             capture_armed:AtomicBool::new(false), capture_ready:AtomicBool::new(false),
-            stop_notify:tokio::sync::Notify::new(), input:tx, status:Mutex::new(RealtimeChatStatus::default()), completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), playback_volume:AtomicU32::new(1.0f32.to_bits()) };
+            stop_notify:tokio::sync::Notify::new(), input:tx, status:Mutex::new(RealtimeChatStatus::default()), completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), target_agent_id:String::new(), target_session_id:String::new(), target_unconfirmed:false, playback_volume:AtomicU32::new(1.0f32.to_bits()) };
         session.input.try_send(Input::Pcm(vec![0; FRAME_BYTES], None)).unwrap();
         request_stop(&session, "key");
         drain_pending(&mut rx);
@@ -2871,7 +3549,7 @@ mod tests {
         let (input, _) = mpsc::channel(128);
         let session = Arc::new(Session { id:id.clone(), board_device_id:board.clone(), cancelled:AtomicBool::new(false), duplex:AtomicBool::new(true),
             capture_armed:AtomicBool::new(true), capture_ready:AtomicBool::new(false),
-            stop_notify:tokio::sync::Notify::new(), input, status:Mutex::new(RealtimeChatStatus::default()), completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), playback_volume:AtomicU32::new(1.0f32.to_bits()) });
+            stop_notify:tokio::sync::Notify::new(), input, status:Mutex::new(RealtimeChatStatus::default()), completed_playback:Mutex::new(String::new()), pending_persona:Mutex::new(None), target_agent_id:String::new(), target_session_id:String::new(), target_unconfirmed:false, playback_volume:AtomicU32::new(1.0f32.to_bits()) });
         let player = spawn_player(usb.clone(), board.clone(), session.clone());
         usb.send_to_board(&board,"audio/conversation",&json!({"enabled":true,"halfDuplex":false,"sessionId":id})).unwrap();
         // Match begin_capture: playback must not race DSP handle recreation.
@@ -3030,7 +3708,7 @@ mod tests {
         let session=Arc::new(Session{id:id.clone(),board_device_id:board.clone(),cancelled:AtomicBool::new(false),
             duplex:AtomicBool::new(true),capture_armed:AtomicBool::new(false),capture_ready:AtomicBool::new(false),
             stop_notify:tokio::sync::Notify::new(),input,status:Mutex::new(Default::default()),
-            completed_playback:Mutex::new(String::new()),pending_persona:Mutex::new(None), playback_volume:AtomicU32::new(1.0f32.to_bits())});
+            completed_playback:Mutex::new(String::new()),pending_persona:Mutex::new(None), target_agent_id:String::new(), target_session_id:String::new(), target_unconfirmed:false, playback_volume:AtomicU32::new(1.0f32.to_bits())});
         let frames=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let faults=Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let usb=UsbSerialManager::new();
@@ -3127,7 +3805,7 @@ mod tests {
         impl Drop for Cleanup {fn drop(&mut self){let _=self.0.send_to_board(&self.1,"audio/play_flush",&json!({})); let _=self.0.send_to_board(&self.1,"audio/conversation",&json!({"enabled":false}));self.0.disconnect();}}
         let _cleanup=Cleanup(usb.clone(),board.clone());
         let id=format!("rtc-echo-{}",now_ms()); let (input,_)=mpsc::channel(128);
-        let session=Arc::new(Session{id:id.clone(),board_device_id:board.clone(),cancelled:AtomicBool::new(false),duplex:AtomicBool::new(true),capture_armed:AtomicBool::new(true),capture_ready:AtomicBool::new(false),stop_notify:tokio::sync::Notify::new(),input,status:Mutex::new(Default::default()),completed_playback:Mutex::new(String::new()),pending_persona:Mutex::new(None), playback_volume:AtomicU32::new(1.0f32.to_bits())});
+        let session=Arc::new(Session{id:id.clone(),board_device_id:board.clone(),cancelled:AtomicBool::new(false),duplex:AtomicBool::new(true),capture_armed:AtomicBool::new(true),capture_ready:AtomicBool::new(false),stop_notify:tokio::sync::Notify::new(),input,status:Mutex::new(Default::default()),completed_playback:Mutex::new(String::new()),pending_persona:Mutex::new(None), target_agent_id:String::new(), target_session_id:String::new(), target_unconfirmed:false, playback_volume:AtomicU32::new(1.0f32.to_bits())});
         let player=spawn_player(usb.clone(),board.clone(),session.clone());
         let raw_calibration=std::env::var("P4_ECHO_RAW").as_deref()==Ok("1");
         if raw_calibration {

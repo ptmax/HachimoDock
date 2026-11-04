@@ -238,6 +238,7 @@ test('interrupt cancels the running task and marks it stopped', async (t) => {
   assert.equal(response.status, 200)
   assert.equal(response.body.interrupted, true)
   assert.deepEqual(agent.cancelled, { kind: 'user' })
+    assert.deepEqual(agent.cancelOptions, { keepInbox: true })
   const task = await requestJson(`${url}/task?taskId=${TASK_ID}`)
   assert.equal(task.body.task.state, 'stopped')
   assert.equal(task.body.task.reason, 'user')

@@ -24,6 +24,7 @@ test('interrupt cancels the running DSH agent', async (t) => {
   assert.equal(response.body.ok, true)
   assert.equal(response.body.interrupted, true)
   assert.deepEqual(agent.cancelled, { kind: 'user' })
+    assert.deepEqual(agent.cancelOptions, { keepInbox: true })
 })
 
 test('interrupting an idle agent reports no active turn', async (t) => {

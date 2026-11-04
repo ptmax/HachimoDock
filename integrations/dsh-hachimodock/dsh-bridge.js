@@ -822,11 +822,11 @@ async function interruptSession(bridge, args = {}) {
   if (!agent) return { ok: false, error: 'agent-not-live' }
   const running = agent.status === 'running' || agent.running === true
   if (typeof agent.cancel !== 'function') return { ok: false, error: 'agent-unsupported' }
-  // Accepted/queued task records can exist before the agent flips its status;
-  // always stop them when the caller asks to interrupt this session.
+  // Stop only the executing turn. Accepted/queued follow-up messages must
+  // survive a device stop; cancelSession deliberately preserves them.
   bridge.tasks.cancelSession(target.id)
   if (!running) return { ok: true, sessionId: target.id, interrupted: false, state: 'idle' }
-  agent.cancel({ kind: 'user' })
+  agent.cancel({ kind: 'user' }, { keepInbox: true })
   return { ok: true, sessionId: target.id, interrupted: true, state: 'cancelled' }
 }
 

@@ -127,6 +127,7 @@ static atomic_bool g_music;
 static atomic_bool g_music_paused;
 static uint64_t g_last_event_cue_ms;
 static char g_last_event_cue_family[32];
+static uint64_t g_approval_cue_block_until_ms;
 static atomic_bool g_music_pause_requested;
 static atomic_uint g_music_volume = 65;
 static atomic_uint g_output_volume = 70;
@@ -1031,6 +1032,15 @@ esp_err_t pet_p4_audio_play_event_cue(const char *family) {
   if (!event_cue_allowed()) return ESP_ERR_INVALID_STATE;
   uint64_t now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
   bool stop = !strcmp(family, "session_terminated");
+  /* The approval modal owns the whole feedback window. This is stronger than
+   * the recent-permission heuristic: a stop snapshot may arrive after the
+   * approval state was cleared, so keep blocking the stop cue for a short
+   * tail after the decision as well. */
+  if (stop && g_approval_cue_block_until_ms != 0
+      && (g_approval_cue_block_until_ms == UINT64_MAX
+          || now_ms < g_approval_cue_block_until_ms)) {
+    return ESP_ERR_INVALID_STATE;
+  }
   /* A DSH approval prompt often arrives together with a stopped-session cue.
    * The prompt owns the audio feedback; do not add a second cue on top of it.
    * When the stop cue was already queued, the new generation cancels/overwrites
@@ -1052,6 +1062,15 @@ esp_err_t pet_p4_audio_play_event_cue(const char *family) {
   ) + 1U;
   xQueueOverwrite(g_playback_queue, &request);
   return ESP_OK;
+}
+
+void pet_p4_audio_set_approval_pending(bool pending) {
+  uint64_t now_ms = (uint64_t) (esp_timer_get_time() / 1000ULL);
+  if (pending) {
+    g_approval_cue_block_until_ms = UINT64_MAX;
+  } else if (g_approval_cue_block_until_ms != 0) {
+    g_approval_cue_block_until_ms = now_ms + 1500ULL;
+  }
 }
 
 esp_err_t pet_p4_audio_set_enabled(bool enabled) {

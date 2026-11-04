@@ -241,13 +241,15 @@ function createFakeAgent(session) {
     followups: [],
     idle: null,
     cancelled: null,
+    cancelOptions: null,
     followup(message) {
       this.followups.push(message)
       this.status = 'running'
       this.idle = Promise.withResolvers()
     },
-    cancel(cause) {
+    cancel(cause, options) {
       this.cancelled = cause
+      this.cancelOptions = options ?? null
       this.status = 'idle'
       if (this.idle !== null) {
         this.idle.resolve()

@@ -65,6 +65,23 @@ test("start payload carries the assembled system prompt, greeting and camelCase 
   assert.deepEqual(Object.keys(input.voice).sort(), ["cloneSpeakerId", "speaker", "speed", "volume"]);
   assert.equal(voiceSpecFor({ voice: { clone_speaker_id: " S_x " } }).cloneSpeakerId, "S_x");
   assert.equal(previewTextFor({ greeting: "汪！" }), "汪！");
+  const untargeted = buildRealtimeChatStartInput({ id: "a1", name: "Torti" }, "p4-board");
+  assert.equal(untargeted.targetAgentId, "");
+  assert.equal(untargeted.targetSessionId, "auto");
+  const targeted = buildRealtimeChatStartInput(
+    { id: "a1", name: "Torti" },
+    "p4-board",
+    { agentId: "deepseek-harness", sessionId: "session-selected" },
+  );
+  assert.equal(targeted.targetAgentId, "deepseek-harness");
+  assert.equal(targeted.targetSessionId, "session-selected");
+  const timestamped = buildRealtimeChatStartInput(
+    { id: "a1", name: "Torti" },
+    "p4-board",
+    { agentId: "deepseek-harness", sessionId: "session-selected", updatedAt: 1790000000000 },
+  );
+  assert.equal(timestamped.targetUpdatedAt, 1790000000000);
+  assert.equal(untargeted.targetUpdatedAt, 0);
 });
 
 test("Rust owns the conversation loop and exposes the commands the UI calls", () => {
@@ -96,7 +113,7 @@ test("DeviceContext resolves the board key into the current appearance and mirro
   const context = read("pc/src/shell/DeviceContext.jsx");
   assert.match(context, /listen\("realtime-chat-request"/);
   assert.match(context, /listen\("realtime-chat-state"/);
-  assert.match(context, /invoke\("realtime_chat_start", \{ input: buildRealtimeChatStartInput\(appearance, boardDeviceId\) \}\)/);
+  assert.match(context, /invoke\("realtime_chat_start", \{\s*input: buildRealtimeChatStartInput\(appearance, boardDeviceId, sessionTarget\),\s*\}\)/);
   assert.match(context, /还没有设置人设与声音/);
   assert.match(context, /startRealtimeChat,\n\s+stopRealtimeChat,/);
 });
@@ -214,4 +231,53 @@ test("live captions are isolated from Agent state and follow PCM playback", () =
   const renderer = read("firmware/main/pet_p4_renderer.c");
   assert.match(renderer, /show_session_queue = !realtime/);
   assert.match(renderer, /if \(!realtime\) draw_session_queue/);
+});
+
+test("realtime start carries the P4 selection before the async binding commit", () => {
+  const sync = read("pc/src/dashboard/useP4SessionSync.js");
+  const dashboard = read("pc/src/DeviceDashboard.jsx");
+  const context = read("pc/src/shell/DeviceContext.jsx");
+  const rtc = read("pc/src-tauri/src/realtime_chat.rs");
+  const desktop = read("pc/src-tauri/src/desktop_agent.rs");
+
+  // Selection state is published synchronously from the device event handler,
+  // not only after the queued set_p4_session_binding call resolves.
+  assert.match(sync, /const onSessionChange = useCallback/);
+  assert.match(sync, /onSelectionChangeRef\.current\?\.\(value, selectedAt\)/);
+  assert.match(sync, /onSelectionChangeRef\.current\?\.\("auto", 0\)/);
+
+  // Dashboard snapshots that selection together with the followed agent and board.
+  assert.match(dashboard, /const onP4SelectionChange = useCallback/);
+  assert.match(dashboard, /onSelectionChange: onP4SelectionChange/);
+  assert.match(dashboard, /setP4RealtimeTarget\(\{[\s\S]*?sessionId: sessionId \|\| "auto"/);
+  assert.match(dashboard, /updatedAt: Number\.isFinite\(Number\(selectedAt\)\)/);
+
+  // DeviceContext stores it in a ref and passes it into the start payload.
+  assert.match(context, /p4RealtimeTargetRef/);
+  assert.match(context, /const updatedAt = Number\(target\.updatedAt\)/);
+  assert.match(context, /buildRealtimeChatStartInput\(appearance, boardDeviceId, sessionTarget\)/);
+  assert.match(read("pc/src/lib/persona-voice.js"), /targetUpdatedAt/);
+
+  // Rust pins the explicit target for every turn; an unconfirmable target is
+  // rejected instead of falling back to the current session.
+  assert.match(rtc, /target_agent_id: String/);
+  assert.match(rtc, /target_session_id: String/);
+  assert.match(rtc, /with_realtime_target\(&session\.target_agent_id,&session\.target_session_id\)/);
+  assert.match(desktop, /pub fn with_realtime_target/);
+  assert.match(desktop, /target_error/);
+  assert.match(desktop, /无法确认设备选择的派发目标/);
+
+  // DSH UI focus sampling is resolved in the Rust start command, before the
+  // t15 pinned target is stored. Focus never applies to non-DSH agents.
+  assert.match(rtc, /resolve_dsh_focus_target/);
+  assert.match(rtc, /focus_precedes_p4/);
+  assert.match(rtc, /with_target_unconfirmed/);
+  const dshTask = read("pc/src-tauri/src/dsh_task.rs");
+  assert.match(dshTask, /struct FocusSnapshot/);
+  assert.match(dshTask, /async fn focus_at/);
+  const pluginServer = read("integrations/dsh-hachimodock/server.js");
+  assert.match(pluginServer, /path === '\/focus'/);
+  const pluginClient = read("integrations/dsh-hachimodock/client.js");
+  assert.match(pluginClient, /installFocusSync/);
+  assert.match(pluginClient, /uiWorkspace/);
 });
