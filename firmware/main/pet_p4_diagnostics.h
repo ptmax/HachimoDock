@@ -14,6 +14,8 @@ extern "C" {
 #endif
 
 esp_err_t pet_p4_diagnostics_init(void);
+/* Print the persisted boot/reset record once the console transport is ready. */
+void pet_p4_diagnostics_log_boot_record(void);
 bool pet_p4_diagnostics_handle_topic(
   const char *topic,
   const cJSON *payload,

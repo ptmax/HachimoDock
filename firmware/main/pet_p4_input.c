@@ -1141,6 +1141,10 @@ static bool handle_approval_input(
     return true;
   }
   send_approval_decision(send_line, ctx, request_id, allow);
+  /* Decision/ACK and the cleared modal come first; the cue is optional feedback.
+   * It is suppressed by the audio layer while the realtime pipeline owns
+   * playback/capture. A mirrored approval/cancel from the PC cannot match this
+   * already-cleared requestId, so only one cue path can fire per decision. */
   (void) pet_p4_audio_play_event_cue(
     allow ? "permission_approved" : "permission_denied"
   );

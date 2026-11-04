@@ -742,6 +742,8 @@ void app_main(void) {
   pet_p4_load_asset_manifest(&g_state);
   ESP_ERROR_CHECK(init_usb());
   ESP_ERROR_CHECK(init_uart());
+  /* Both consoles are up now: emit the reset reason for post-mortem captures. */
+  pet_p4_diagnostics_log_boot_record();
   pet_p4_wifi_callbacks_t wifi_callbacks = {
     .on_bytes = wifi_rx_bytes,
     .on_client_connected = wifi_client_connected,

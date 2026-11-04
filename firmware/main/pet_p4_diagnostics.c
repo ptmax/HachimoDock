@@ -14,6 +14,7 @@
 
 #include "esp_app_desc.h"
 #include "esp_chip_info.h"
+#include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_ota_ops.h"
 #include "esp_spiffs.h"
@@ -44,6 +45,7 @@ typedef struct {
   uint32_t last_reset_reason;
 } pet_p4_boot_record_t;
 
+static const char *TAG = "pet-diag";
 static pet_p4_boot_record_t g_boot_record;
 static unsigned long long g_reboot_at_ms;
 static atomic_bool g_reboot_pending;
@@ -345,6 +347,22 @@ esp_err_t pet_p4_diagnostics_init(void) {
   if (err == ESP_OK) err = nvs_commit(handle);
   nvs_close(handle);
   return err;
+}
+
+/* One compact line per boot so a UART/USB console capture shows every reset
+ * reason without requiring a diagnostics query after the fact. Called from
+ * app_main only after the USB Serial/JTAG driver is installed; this is a log
+ * line, not a protocol frame, and the PC ignores non-JSON serial lines. */
+void pet_p4_diagnostics_log_boot_record(void) {
+  ESP_LOGI(
+    TAG,
+    "boot=%lu reset=%s(%u) fault=%lu last_fault=%d",
+    (unsigned long) g_boot_record.boot_count,
+    reset_reason_name((esp_reset_reason_t) g_boot_record.last_reset_reason),
+    (unsigned) g_boot_record.last_reset_reason,
+    (unsigned long) g_boot_record.fault_reset_count,
+    reset_reason_is_fault((esp_reset_reason_t) g_boot_record.last_reset_reason) ? 1 : 0
+  );
 }
 
 bool pet_p4_diagnostics_handle_topic(

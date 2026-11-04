@@ -664,6 +664,10 @@ P4 → PC：
   `memory` additionally separates `freeInternalBytes`, `minimumFreeInternalBytes`,
   `largestInternalBlockBytes`, `freeDmaBytes`, `largestDmaBlockBytes` and
   `largestPsramBlockBytes`: free PSRAM is not interchangeable with internal/DMA RAM.
+  Each boot also logs the same record once to the UART/USB console
+  (`pet-diag: boot=… reset=… fault=… last_fault=…`) after both console
+  transports are installed, so a raw serial capture retains the reset reason
+  for power/brownout post-mortems; the line is not JSON and is ignored by the PC.
 - `system/reset-inputs`: restores the safe SW1/SW2/SW3/encoder defaults and
   replies on `diagnostics/action`. It does not erase appearance assets.
 - `system/reboot`: acknowledges on `diagnostics/action`, then performs a delayed
