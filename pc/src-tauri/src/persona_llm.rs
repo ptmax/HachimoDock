@@ -606,6 +606,18 @@ where F: FnMut(&str) {
     stream_response_logged(cfg, body, None, on_delta).await
 }
 
+fn opencode_product_plan(cfg: &LlmConfig) -> Option<&'static str> {
+    let base = cfg.base_url.trim().to_ascii_lowercase();
+    let model = cfg.model.trim().to_ascii_lowercase();
+    if !base.contains("opencode") { return None; }
+    // Only infer the Go plan for OpenCode endpoints/models that name it.
+    if base.contains("/go") || model.contains("go") || model == "opencode-go" {
+        Some("go")
+    } else {
+        None
+    }
+}
+
 async fn stream_response_logged<F>(cfg: &LlmConfig, body: Value, session: Option<&str>, mut on_delta: F) -> Result<(String,Vec<Value>), String>
 where F: FnMut(&str) {
     if cfg.api_key.trim().is_empty() { return Err("对话大模型未配置 API Key".into()); }
@@ -616,9 +628,18 @@ where F: FnMut(&str) {
         "chars":body["messages"].as_array().map_or(0,|messages|messages.iter().map(|m|m["content"].as_str().map_or(0,|s|s.chars().count())).sum::<usize>()),
         "state":if body["thinking"]["type"]=="disabled" {"thinking_disabled"} else {"provider_default"}}));
     let client = crate::llm_network::client(REQUEST_TIMEOUT)?;
-    let response = client
+    let mut request = client
         .post(cfg.completions_url())
-        .bearer_auth(cfg.api_key.trim())
+        .bearer_auth(cfg.api_key.trim());
+    // OpenCode's Go subscription gateway selects the plan from this header.
+    // Without it the gateway defaults to the generic "product" plan and
+    // rejects a Go-subscription key with 402 Account.InsufficientFunds.
+    // Only send it for OpenCode endpoints; other OpenAI-compatible providers
+    // must not receive an extra vendor header.
+    if opencode_product_plan(cfg).is_some() {
+        request = request.header("x-opencode-product", "go");
+    }
+    let response = request
         .json(&body)
         .send()
         .await
@@ -1384,4 +1405,13 @@ mod tests {
         assert_eq!(history.len(), MAX_HISTORY_TURNS * 2);
         assert_eq!(history[0].content, "16");
     }
+    #[test]
+    fn opencode_go_header_is_scoped_to_opencode_endpoints() {
+        let mk = |base: &str, model: &str| LlmConfig { web_search:false, base_url:base.into(), model:model.into(), api_key:"k".into() };
+        assert_eq!(opencode_product_plan(&mk("https://opencode.ai/zen/go/v1", "opencode-go")), Some("go"));
+        assert_eq!(opencode_product_plan(&mk("https://opencode.ai/zen/v1", "opencode-go")), Some("go"));
+        assert_eq!(opencode_product_plan(&mk("https://api.deepseek.com", "deepseek-flash")), None);
+        assert_eq!(opencode_product_plan(&mk("https://custom.example/v1", "go-model")), None);
+    }
+
 }
