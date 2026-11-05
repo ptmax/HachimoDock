@@ -10912,8 +10912,8 @@ static APP_NAP_GUARD: std::sync::Mutex<Option<std::process::Child>> =
     std::sync::Mutex::new(None);
 
 #[cfg(target_os = "macos")]
-fn caffeinate_flag(block_sleep: bool) -> &'static str {
-    if block_sleep { "-imsu" } else { "-u" }
+fn caffeinate_flag(block_sleep: bool) -> Option<&'static str> {
+    if block_sleep { Some("-imsu") } else { None }
 }
 
 #[cfg(target_os = "macos")]
@@ -10926,8 +10926,11 @@ fn restart_app_nap_guard(block_sleep: bool) {
         let _ = child.kill();
         let _ = child.wait();
     }
+    // OFF must not launch anything: `caffeinate -u` is still a UserIsActive
+    // assertion and prevents idle system sleep, which made a closed-lid Mac
+    // stay awake and reconnect the P4.
+    let Some(flag) = caffeinate_flag(block_sleep) else { return; };
     let pid = std::process::id().to_string();
-    let flag = caffeinate_flag(block_sleep);
     match std::process::Command::new("/usr/bin/caffeinate")
         .args([flag, "-w", &pid])
         .stdin(std::process::Stdio::null())
@@ -14344,9 +14347,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn keep_awake_off_does_not_block_system_sleep() {
-        // OFF: only the user-activity assertion; ON: the existing blocking mode.
-        assert_eq!(caffeinate_flag(false), "-u");
-        assert_eq!(caffeinate_flag(true), "-imsu");
+        // OFF: no caffeinate process (a -u assertion still blocks idle sleep);
+        // ON: the explicit blocking mode.
+        assert_eq!(caffeinate_flag(false), None);
+        assert_eq!(caffeinate_flag(true), Some("-imsu"));
         // The process-lifetime NSProcessInfo activity is separate from
         // caffeinate and must never request PreventSystemSleep (idle system or
         // display sleep disabled).
