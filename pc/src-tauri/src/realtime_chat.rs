@@ -2710,7 +2710,7 @@ mod tests {
     #[test]
     fn empty_final_short_command_interrupts_playback_without_a_transcript() {
         tauri::async_runtime::block_on(async {
-            for voiced_frames in [14usize, 24] {
+            for voiced_frames in [12usize, 24] {
                 let (_tx, mut rx) = mpsc::channel(8);
                 let mut deferred = periodic_barge_deferred(voiced_frames);
                 let mut vad = Vad::new();

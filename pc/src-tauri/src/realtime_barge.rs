@@ -58,7 +58,7 @@ impl NoTranscriptEvidence {
 // fallback below only restores the interrupt for that exact failure mode; it
 // never replaces a transcript and never applies to long speech or to tasks
 // that are still thinking.
-pub const NO_TRANSCRIPT_MIN_VOICED_FRAMES: usize = 14; // 280 ms; 160 ms admitted speaker echo
+pub const NO_TRANSCRIPT_MIN_VOICED_FRAMES: usize = 12; // 240 ms; 160 ms admitted speaker echo
 pub const NO_TRANSCRIPT_MAX_VOICED_FRAMES: usize = 60; // 1.2 s; "等等" often exceeds 680 ms
 // The real "停" trace shows 12/20 periodic frames (60%) because the plosive
 // onset is noisy while the vowel body remains periodic. Keep at least six
@@ -80,7 +80,7 @@ pub const NO_TRANSCRIPT_MAX_PEAK_RMS: f32 = 12_000.0;
 /// - the cloud returned no meaningful text and never emitted a textual Partial:
 ///   if ASR heard *anything*, even a rejected fragment, the transcript path
 ///   owns the decision and this fallback stays closed;
-/// - the candidate is short once voiced (14–60 frames) and at least half of the
+/// - the candidate is short once voiced (12–60 frames) and at least 40% of the
 ///   voiced frames are periodic near-end speech with a bounded peak level.
 pub fn no_transcript_short_command(
     phase: &str,
@@ -98,7 +98,9 @@ pub fn no_transcript_short_command(
         return false;
     }
     if evidence.periodic_frames < NO_TRANSCRIPT_MIN_PERIODIC_FRAMES { return false; }
-    if evidence.periodic_frames * 2 < voiced_frames { return false; }
+    // Plosive onsets and short Chinese commands can dip below 50% periodicity;
+    // require 40% so "等等" survives without admitting the 8-frame echo case.
+    if evidence.periodic_frames * 5 < voiced_frames * 2 { return false; }
     (NO_TRANSCRIPT_MIN_PEAK_RMS..=NO_TRANSCRIPT_MAX_PEAK_RMS).contains(&evidence.peak_rms)
 }
 
@@ -272,7 +274,7 @@ mod tests {
     #[test]
     fn empty_final_stop_needs_a_finalized_short_voiced_utterance_during_playback() {
         let evidence = short_command_evidence();
-        assert!(no_transcript_short_command("speaking", false, true, false, "", 14, evidence));
+        assert!(no_transcript_short_command("speaking", false, true, false, "", 12, evidence));
         assert!(no_transcript_short_command("speaking", false, true, false, "  ……！", 14, evidence));
         // A real transcript is handled by the ASR-confirmed path, never here.
         assert!(!no_transcript_short_command("speaking", false, true, false, "停", 14, evidence));
@@ -313,9 +315,9 @@ mod tests {
         // Real "停" trace: 12 periodic / 20 voiced (60%) must pass.
         assert!(no_transcript_short_command("speaking", false, true, false, "", 20, short_command_evidence()));
         // The minimum candidate still needs half its voiced frames to be periodic.
-        let minimum_ok = NoTranscriptEvidence { periodic_frames: 7, peak_rms: 900.0 };
-        assert!(no_transcript_short_command("speaking", false, true, false, "", 14, minimum_ok));
-        let minimum_low = NoTranscriptEvidence { periodic_frames: 6, peak_rms: 900.0 };
-        assert!(!no_transcript_short_command("speaking", false, true, false, "", 14, minimum_low));
+        let minimum_ok = NoTranscriptEvidence { periodic_frames: 6, peak_rms: 900.0 };
+        assert!(no_transcript_short_command("speaking", false, true, false, "", 12, minimum_ok));
+        let minimum_low = NoTranscriptEvidence { periodic_frames: 5, peak_rms: 900.0 };
+        assert!(!no_transcript_short_command("speaking", false, true, false, "", 12, minimum_low));
     }
 }
