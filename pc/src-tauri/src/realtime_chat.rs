@@ -52,7 +52,7 @@ const ASR_FINAL_TIMEOUT: Duration = Duration::from_secs(8);
 const FINAL_CAPTURE_LIMIT: usize = 576; // > 8 s final wait + existing 128-frame ingress
 const POST_SPEAK_GUARD: Duration = Duration::from_millis(250);
 const PLAYBACK_LEAD_MS: u64 = 1200;
-const PLAY_CHUNK_BYTES: usize = 3200; // 100 ms
+const PLAY_CHUNK_BYTES: usize = 1600; // 50 ms; smaller tty writes avoid the long-reply stall
 // Bounded recovery for the diagnosed long-reply USB CDC stall: a tty write can
 // time out for a few hundred ms while the board stays alive, so a late 100 ms
 // chunk is dropped and the session continues. Each frame already has a bounded
